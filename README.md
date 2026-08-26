@@ -62,7 +62,22 @@ docs.add(
 results = docs.search(
     query_embedding,
     top_k=5,
-    filter={"tenant": "A", "category": {"$in": ["faq", "product"]}},
+    tenant="A",
+    category__in=["faq", "product"],
+)
+```
+
+Filtering is Django-QuerySet-style: plain keyword arguments AND together for
+the common case (`tenant="A"`, `price__gte=100`), and a composable `Q` object
+handles OR/NOT/nesting when you need it:
+
+```python
+from zenar import Q
+
+results = docs.search(
+    query_embedding,
+    top_k=5,
+    filter=Q(category="faq") | Q(category="product"),
 )
 ```
 
@@ -73,15 +88,16 @@ yet, and the core add/search path isn't wired up. Not ready for use.
 
 ## License
 
-Licensed under either of:
+Zenar is dual-licensed under the MIT license
+([LICENSE-MIT](LICENSE-MIT)) and the Apache License, Version 2.0
+([LICENSE-APACHE](LICENSE-APACHE)). Anyone using Zenar may choose to comply
+with either one.
 
-- MIT license ([LICENSE-MIT](LICENSE-MIT))
-- Apache License, Version 2.0 ([LICENSE-APACHE](LICENSE-APACHE))
-
-at your option.
-
-TurboVec is MIT-licensed; Stoolap is Apache-2.0-licensed. Zenar is not
-affiliated with either project.
+Zenar's compiled distribution statically links [TurboVec](https://github.com/RyanCodrai/turbovec)
+(MIT) and [Stoolap](https://github.com/stoolap/stoolap) (Apache-2.0). Their
+full license texts are reproduced in [THIRD_PARTY_NOTICES](THIRD_PARTY_NOTICES),
+as required by their own license terms. Zenar is not affiliated with either
+project.
 
 ## Contributing
 
