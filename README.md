@@ -50,7 +50,7 @@ from zenar import VectorDB
 
 db = VectorDB("./my_vectors")
 
-docs = db.create_collection("documents", dimension=1536)
+docs = db.create_collection("documents")  # dimension inferred from your first add()
 
 docs.add(
     id=1,
@@ -59,25 +59,24 @@ docs.add(
     metadata={"tenant": "A", "category": "faq"},
 )
 
-results = docs.search(
-    query_embedding,
-    top_k=5,
-    tenant="A",
-    category__in=["faq", "product"],
-)
+results = docs.search(query_embedding, top_k=5, tenant="A")
 ```
 
-Filtering is Django-QuerySet-style: plain keyword arguments AND together for
-the common case (`tenant="A"`, `price__gte=100`), and a composable `Q` object
-handles OR/NOT/nesting when you need it:
+No dimension to look up or configure — `create_collection` learns it from
+whatever your first `add()` stores. Pass `dimension=1536` explicitly if you'd
+rather have that locked in upfront.
+
+Filtering has two layers: plain keyword arguments for simple equality (no
+import needed, as above), and `field` objects with real Python operators for
+anything else — comparisons, OR, NOT:
 
 ```python
-from zenar import Q
+from zenar import field as f
 
 results = docs.search(
     query_embedding,
     top_k=5,
-    filter=Q(category="faq") | Q(category="product"),
+    filter=(f.price >= 100) & ((f.category == "faq") | (f.category == "product")),
 )
 ```
 
