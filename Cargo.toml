@@ -1,0 +1,6 @@
+[workspace]
+members = [
+    "crates/zenar-core",
+    "crates/zenar-python",
+]
+resolver = "2"

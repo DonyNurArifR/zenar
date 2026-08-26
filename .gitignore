@@ -1,0 +1,36 @@
+# Rust
+/target/
+**/*.rs.bk
+*.pdb
+
+# Python / maturin
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+wheels/
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Zenar runtime data (created by running examples/tests locally, not source)
+*.tv
+*.tvim
+*.db
+/data/
+
+# Markdown — ignore all except README.md
+*.md
+!README.md
+
+# IDE / OS
+.DS_Store
+.idea/
+.vscode/
+
+# Claude Code local settings — must never be committed (see global CLAUDE.md)
+.claude/
