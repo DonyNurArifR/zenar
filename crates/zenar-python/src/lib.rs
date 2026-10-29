@@ -439,6 +439,16 @@ impl PyCollection {
         guarded(py, move || inner.delete(id))
     }
 
+    /// Deletes many ids atomically: either all exist and are deleted, or none is.
+    fn delete_many(&self, py: Python<'_>, ids: &Bound<'_, PyAny>) -> PyResult<usize> {
+        let ids = ids
+            .try_iter()?
+            .map(|id| py_u64(&id?, "id"))
+            .collect::<PyResult<Vec<u64>>>()?;
+        let inner = Arc::clone(&self.inner);
+        guarded(py, move || inner.delete_many(&ids))
+    }
+
     fn count(&self, py: Python<'_>) -> PyResult<usize> {
         let inner = Arc::clone(&self.inner);
         guarded(py, move || inner.count())
@@ -546,8 +556,8 @@ impl PyVectorDB {
 
 #[pymethods]
 impl PyVectorDB {
-    /// `durable=True` fsyncs every metadata commit (slower ingest). The default is
-    /// faster. `flush()` makes everything before it durable, including on power loss.
+    /// `durable=True` syncs the index and the document log on every add: power-safe per add, at a
+    /// much lower ingest rate. The default syncs at sync boundaries. `flush()` makes everything before it durable.
     #[new]
     #[pyo3(signature = (path, durable=false))]
     fn new(py: Python<'_>, path: &str, durable: bool) -> PyResult<Self> {
@@ -638,7 +648,7 @@ impl PyVectorDB {
         Ok(d)
     }
 
-    /// Makes every add so far durable.
+    /// Makes every add so far durable: the index and the document log are synced.
     fn flush(&self, py: Python<'_>) -> PyResult<()> {
         let db = Arc::clone(self.db()?);
         guarded(py, move || db.flush())
@@ -671,8 +681,6 @@ impl PyVectorDB {
 
 fn report_to_py<'py>(py: Python<'py>, r: core::RecoveryReport) -> PyResult<Bound<'py, PyDict>> {
     let d = PyDict::new(py);
-    d.set_item("rolled_back_pending", r.rolled_back_pending)?;
-    d.set_item("finished_deletes", r.finished_deletes)?;
     d.set_item("orphaned_rows_removed", r.orphaned_rows_removed)?;
     d.set_item("orphaned_vectors_removed", r.orphaned_vectors_removed)?;
     Ok(d)

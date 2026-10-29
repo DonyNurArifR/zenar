@@ -4,8 +4,8 @@ use crate::value::{FieldKind, MetaValue};
 /// Maximum nesting depth of And/Or/Not (spec section 69).
 pub const MAX_FILTER_DEPTH: usize = 16;
 
-/// Typed filter AST (spec section 10). Python's `field` expressions and
-/// kwargs both compile to this before reaching the core.
+/// Typed filter AST (spec section 10). Python's `field` expressions and kwargs both
+/// compile to this. It is evaluated by `docstore`, which never builds SQL from it.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Filter {
     Eq {
@@ -45,32 +45,12 @@ pub enum Filter {
     Not(Box<Filter>),
 }
 
-/// A filter translated to parameterized SQL. `sql` contains only `$n`
-/// placeholders for values; field names are validated against the schema
-/// before they are written into it.
-#[derive(Debug)]
-pub struct CompiledFilter {
-    pub sql: String,
-    pub params: Vec<rusqlite::types::Value>,
-}
-
-/// Validates a filter against a collection's locked metadata schema and
-/// compiles it to SQL. Anything that does not map to a fully specified
-/// `Filter` variant is rejected rather than dropped (spec section 81).
-pub fn compile(
-    filter: &Filter,
-    schema: &[(String, FieldKind)],
-) -> Result<CompiledFilter, ZenarError> {
+/// Checks a filter against a collection's metadata schema. Unknown fields, values of the
+/// wrong type, ordering on booleans, and nesting beyond `MAX_FILTER_DEPTH` are rejected.
+/// Integer and float values may be compared with each other.
+pub fn validate(filter: &Filter, schema: &[(String, FieldKind)]) -> Result<(), ZenarError> {
     check_depth(filter, 1)?;
-    let mut compiler = Compiler {
-        schema,
-        params: Vec::new(),
-    };
-    let sql = compiler.node(filter)?;
-    Ok(CompiledFilter {
-        sql,
-        params: compiler.params,
-    })
+    check(filter, schema)
 }
 
 fn check_depth(filter: &Filter, depth: usize) -> Result<(), ZenarError> {
@@ -88,121 +68,58 @@ fn check_depth(filter: &Filter, depth: usize) -> Result<(), ZenarError> {
     }
 }
 
-struct Compiler<'a> {
-    schema: &'a [(String, FieldKind)],
-    params: Vec<rusqlite::types::Value>,
+fn check(filter: &Filter, schema: &[(String, FieldKind)]) -> Result<(), ZenarError> {
+    match filter {
+        Filter::Eq { field, value } | Filter::Ne { field, value } => {
+            check_value(field, value, schema, false)
+        }
+        Filter::Gt { field, value }
+        | Filter::Gte { field, value }
+        | Filter::Lt { field, value }
+        | Filter::Lte { field, value } => check_value(field, value, schema, true),
+        Filter::In { field, values } | Filter::Nin { field, values } => {
+            values
+                .iter()
+                .try_for_each(|v| check_value(field, v, schema, false))?;
+            kind_of(field, schema).map(|_| ())
+        }
+        Filter::And(children) | Filter::Or(children) => {
+            children.iter().try_for_each(|c| check(c, schema))
+        }
+        Filter::Not(child) => check(child, schema),
+    }
 }
 
-impl Compiler<'_> {
-    fn bind(&mut self, value: &MetaValue) -> String {
-        self.params.push(value.to_sql());
-        format!("${}", self.params.len())
-    }
+fn kind_of(field: &str, schema: &[(String, FieldKind)]) -> Result<FieldKind, ZenarError> {
+    schema
+        .iter()
+        .find(|(name, _)| name == field)
+        .map(|(_, kind)| *kind)
+        .ok_or_else(|| ZenarError::InvalidFilter(format!("unknown metadata field {field:?}")))
+}
 
-    fn field_kind(&self, field: &str) -> Result<FieldKind, ZenarError> {
-        self.schema
-            .iter()
-            .find(|(name, _)| name == field)
-            .map(|(_, kind)| *kind)
-            .ok_or_else(|| ZenarError::InvalidFilter(format!("unknown metadata field {field:?}")))
+fn check_value(
+    field: &str,
+    value: &MetaValue,
+    schema: &[(String, FieldKind)],
+    ordered: bool,
+) -> Result<(), ZenarError> {
+    let kind = kind_of(field, schema)?;
+    let value_kind = FieldKind::of(value);
+    let comparable = value_kind == kind || (kind.is_numeric() && value_kind.is_numeric());
+    if !comparable {
+        return Err(ZenarError::InvalidFilter(format!(
+            "field {field:?} is {}, filter value is {}",
+            kind.as_str(),
+            value_kind.as_str()
+        )));
     }
-
-    /// Checks that a filter value can be compared against a column.
-    /// Integer and Float are mutually comparable; everything else must match.
-    fn check_comparable(field: &str, kind: FieldKind, value: &MetaValue) -> Result<(), ZenarError> {
-        let value_kind = FieldKind::of(value);
-        let ok = value_kind == kind || (kind.is_numeric() && value_kind.is_numeric());
-        if ok {
-            Ok(())
-        } else {
-            Err(ZenarError::InvalidFilter(format!(
-                "field {field:?} is {}, filter value is {}",
-                kind.as_str(),
-                value_kind.as_str()
-            )))
-        }
+    if ordered && kind == FieldKind::Boolean {
+        return Err(ZenarError::InvalidFilter(format!(
+            "ordering comparison is not supported on boolean field {field:?}"
+        )));
     }
-
-    fn check_ordering(field: &str, kind: FieldKind) -> Result<(), ZenarError> {
-        match kind {
-            FieldKind::Boolean => Err(ZenarError::InvalidFilter(format!(
-                "ordering comparison is not supported on boolean field {field:?}"
-            ))),
-            _ => Ok(()),
-        }
-    }
-
-    fn comparison(
-        &mut self,
-        field: &str,
-        op: &str,
-        value: &MetaValue,
-        ordered: bool,
-    ) -> Result<String, ZenarError> {
-        let kind = self.field_kind(field)?;
-        Self::check_comparable(field, kind, value)?;
-        if ordered {
-            Self::check_ordering(field, kind)?;
-        }
-        let placeholder = self.bind(value);
-        Ok(format!("\"{field}\" {op} {placeholder}"))
-    }
-
-    fn membership(
-        &mut self,
-        field: &str,
-        values: &[MetaValue],
-        negated: bool,
-    ) -> Result<String, ZenarError> {
-        let kind = self.field_kind(field)?;
-        values
-            .iter()
-            .try_for_each(|v| Self::check_comparable(field, kind, v))?;
-        if values.is_empty() {
-            // Empty IN matches nothing. Empty NOT IN excludes only NULL rows,
-            // matching the non-empty case (NULL rows never match, spec section 68).
-            return Ok(if negated {
-                format!("\"{field}\" IS NOT NULL")
-            } else {
-                "1 = 0".to_string()
-            });
-        }
-        let placeholders: Vec<String> = values.iter().map(|v| self.bind(v)).collect();
-        let op = if negated { "NOT IN" } else { "IN" };
-        Ok(format!("\"{field}\" {op} ({})", placeholders.join(", ")))
-    }
-
-    fn node(&mut self, filter: &Filter) -> Result<String, ZenarError> {
-        match filter {
-            Filter::Eq { field, value } => self.comparison(field, "=", value, false),
-            Filter::Ne { field, value } => self.comparison(field, "<>", value, false),
-            Filter::Gt { field, value } => self.comparison(field, ">", value, true),
-            Filter::Gte { field, value } => self.comparison(field, ">=", value, true),
-            Filter::Lt { field, value } => self.comparison(field, "<", value, true),
-            Filter::Lte { field, value } => self.comparison(field, "<=", value, true),
-            Filter::In { field, values } => self.membership(field, values, false),
-            Filter::Nin { field, values } => self.membership(field, values, true),
-            Filter::And(children) => self.junction(children, "AND", "1 = 1"),
-            Filter::Or(children) => self.junction(children, "OR", "1 = 0"),
-            Filter::Not(child) => Ok(format!("NOT ({})", self.node(child)?)),
-        }
-    }
-
-    fn junction(
-        &mut self,
-        children: &[Filter],
-        op: &str,
-        empty: &str,
-    ) -> Result<String, ZenarError> {
-        if children.is_empty() {
-            return Ok(empty.to_string());
-        }
-        let parts: Vec<String> = children
-            .iter()
-            .map(|c| self.node(c).map(|s| format!("({s})")))
-            .collect::<Result<_, _>>()?;
-        Ok(parts.join(&format!(" {op} ")))
-    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -217,25 +134,37 @@ mod tests {
         ]
     }
 
+    fn text(s: &str) -> MetaValue {
+        MetaValue::Text(s.into())
+    }
+
     #[test]
-    fn eq_compiles_to_parameter() {
-        let f = Filter::Eq {
-            field: "tenant".into(),
-            value: MetaValue::Text("A".into()),
-        };
-        let c = compile(&f, &schema()).unwrap();
-        assert_eq!(c.sql, "\"tenant\" = $1");
-        assert_eq!(c.params.len(), 1);
+    fn valid_filters_pass() {
+        let f = Filter::And(vec![
+            Filter::Eq {
+                field: "tenant".into(),
+                value: text("A"),
+            },
+            Filter::Gte {
+                field: "price".into(),
+                value: MetaValue::Integer(100),
+            },
+            Filter::Not(Box::new(Filter::Eq {
+                field: "active".into(),
+                value: MetaValue::Boolean(true),
+            })),
+        ]);
+        assert!(validate(&f, &schema()).is_ok());
     }
 
     #[test]
     fn unknown_field_rejected() {
         let f = Filter::Eq {
             field: "nope".into(),
-            value: MetaValue::Integer(1),
+            value: text("x"),
         };
         assert!(matches!(
-            compile(&f, &schema()),
+            validate(&f, &schema()),
             Err(ZenarError::InvalidFilter(_))
         ));
     }
@@ -247,18 +176,9 @@ mod tests {
             value: MetaValue::Integer(1),
         };
         assert!(matches!(
-            compile(&f, &schema()),
+            validate(&f, &schema()),
             Err(ZenarError::InvalidFilter(_))
         ));
-    }
-
-    #[test]
-    fn integer_value_on_float_field_is_allowed() {
-        let f = Filter::Gte {
-            field: "price".into(),
-            value: MetaValue::Integer(100),
-        };
-        assert!(compile(&f, &schema()).is_ok());
     }
 
     #[test]
@@ -267,70 +187,49 @@ mod tests {
             field: "active".into(),
             value: MetaValue::Boolean(true),
         };
-        assert!(compile(&f, &schema()).is_err());
+        assert!(matches!(
+            validate(&f, &schema()),
+            Err(ZenarError::InvalidFilter(_))
+        ));
     }
 
     #[test]
-    fn empty_in_matches_nothing() {
-        let f = Filter::In {
-            field: "tenant".into(),
-            values: vec![],
-        };
-        assert_eq!(compile(&f, &schema()).unwrap().sql, "1 = 0");
-    }
-
-    #[test]
-    fn empty_and_or_are_identity_elements() {
-        assert_eq!(
-            compile(&Filter::And(vec![]), &schema()).unwrap().sql,
-            "1 = 1"
+    fn empty_in_is_valid_for_a_known_field() {
+        assert!(
+            validate(
+                &Filter::In {
+                    field: "tenant".into(),
+                    values: vec![]
+                },
+                &schema()
+            )
+            .is_ok()
         );
-        assert_eq!(
-            compile(&Filter::Or(vec![]), &schema()).unwrap().sql,
-            "1 = 0"
+        assert!(
+            validate(
+                &Filter::In {
+                    field: "nope".into(),
+                    values: vec![]
+                },
+                &schema()
+            )
+            .is_err()
         );
-    }
-
-    #[test]
-    fn nested_and_or_not_compile() {
-        let f = Filter::And(vec![
-            Filter::Eq {
-                field: "tenant".into(),
-                value: MetaValue::Text("A".into()),
-            },
-            Filter::Not(Box::new(Filter::Or(vec![Filter::Eq {
-                field: "tenant".into(),
-                value: MetaValue::Text("B".into()),
-            }]))),
-        ]);
-        let c = compile(&f, &schema()).unwrap();
-        assert_eq!(c.sql, "(\"tenant\" = $1) AND (NOT ((\"tenant\" = $2)))");
-        assert_eq!(c.params.len(), 2);
     }
 
     #[test]
     fn depth_cap_rejected() {
         let mut f = Filter::Eq {
             field: "tenant".into(),
-            value: MetaValue::Text("A".into()),
+            value: text("A"),
         };
         for _ in 0..MAX_FILTER_DEPTH {
             f = Filter::Not(Box::new(f));
         }
         assert!(matches!(
-            compile(&f, &schema()),
+            validate(&f, &schema()),
             Err(ZenarError::InvalidFilter(_))
         ));
-    }
-
-    #[test]
-    fn injection_text_is_only_a_parameter() {
-        let f = Filter::Eq {
-            field: "tenant".into(),
-            value: MetaValue::Text("x' OR 1=1 --".into()),
-        };
-        let c = compile(&f, &schema()).unwrap();
-        assert!(!c.sql.contains("OR 1=1"));
     }
 
     /// Deterministic xorshift, so failures reproduce.
@@ -357,17 +256,13 @@ mod tests {
         }
     }
 
-    /// Builds a random filter over the schema. Some field names are unknown, so
-    /// the compiler's rejection path is exercised too.
     fn random_filter(rng: &mut Rng, depth: usize, schema: &[(String, FieldKind)]) -> Filter {
-        let leaf = depth >= 4 || rng.below(3) == 0;
-        if leaf {
-            let (name, kind) = if rng.below(10) == 0 {
+        if depth >= 4 || rng.below(3) == 0 {
+            let (field, kind) = if rng.below(10) == 0 {
                 ("unknown_field".to_string(), FieldKind::Text)
             } else {
                 schema[rng.below(schema.len() as u64) as usize].clone()
             };
-            let field = name;
             return match rng.below(8) {
                 0 => Filter::Eq {
                     field,
@@ -418,37 +313,15 @@ mod tests {
         }
     }
 
-    /// Fuzz (spec Phase 7): random trees never panic, never inline a value into the
-    /// SQL text, and always bind exactly one parameter per placeholder.
+    /// Random trees validate or fail with InvalidFilter, and never panic.
     #[test]
-    fn random_filters_never_panic_and_stay_parameterized() {
-        let schema = vec![
-            ("tenant".to_string(), FieldKind::Text),
-            ("price".to_string(), FieldKind::Float),
-            ("qty".to_string(), FieldKind::Integer),
-            ("active".to_string(), FieldKind::Boolean),
-        ];
+    fn random_filters_validate_without_panicking() {
         let mut rng = Rng(0x9E37_79B9_7F4A_7C15);
         let mut accepted = 0;
         for _ in 0..5_000 {
-            let f = random_filter(&mut rng, 0, &schema);
-            match compile(&f, &schema) {
-                Ok(c) => {
-                    accepted += 1;
-                    assert!(!c.sql.contains('\''), "value leaked into SQL: {}", c.sql);
-                    assert!(
-                        !c.sql.contains("DROP"),
-                        "payload leaked into SQL: {}",
-                        c.sql
-                    );
-                    let placeholders = c.sql.matches('$').count();
-                    assert_eq!(
-                        placeholders,
-                        c.params.len(),
-                        "placeholder/param mismatch in {}",
-                        c.sql
-                    );
-                }
+            let f = random_filter(&mut rng, 0, &schema());
+            match validate(&f, &schema()) {
+                Ok(()) => accepted += 1,
                 Err(ZenarError::InvalidFilter(_)) => {}
                 Err(other) => panic!("unexpected error kind: {other:?}"),
             }

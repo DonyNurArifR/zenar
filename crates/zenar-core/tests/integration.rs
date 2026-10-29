@@ -516,3 +516,211 @@ fn add_many_rejects_schema_conflict_and_leaves_schema_unchanged() {
     ));
     fs::remove_dir_all(&dir).ok();
 }
+
+/// Deleting most documents triggers log compaction. Search and a reopen must still agree
+/// with the surviving documents.
+#[test]
+fn compaction_after_mass_delete_keeps_survivors_searchable_and_durable() {
+    let dir = temp_dir("compact-e2e");
+    {
+        let db = VectorDB::open(&dir).unwrap();
+        let c = db.create_collection("cp", Some(8), 4).unwrap();
+        let batch: Vec<_> = (0..6000u64)
+            .map(|id| record(id, if id % 3 == 0 { "A" } else { "B" }))
+            .collect();
+        c.add_many(&batch).unwrap();
+        let doomed: Vec<u64> = (0..5000u64).collect();
+        assert_eq!(c.delete_many(&doomed).unwrap(), 5000);
+        assert_eq!(c.count().unwrap(), 1000);
+        let f = Filter::Eq {
+            field: "tenant".into(),
+            value: text("A"),
+        };
+        let hits = c.search(&batch[5999].vector, 1000, Some(&f)).unwrap();
+        assert!(hits.iter().all(|h| h.id >= 5000 && h.id % 3 == 0));
+        assert_eq!(hits.len(), (5000..6000u64).filter(|id| id % 3 == 0).count());
+        db.flush().unwrap();
+    }
+    let db = VectorDB::open(&dir).unwrap();
+    let c = db.get_collection("cp").unwrap();
+    assert_eq!(c.count().unwrap(), 1000);
+    assert!(c.get(4999).unwrap().is_none());
+    assert_eq!(c.get(5999).unwrap().unwrap().text, "doc 5999");
+    assert!(
+        db.recovery_report().is_clean(),
+        "compaction must not leave orphans behind"
+    );
+    fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn delete_many_is_atomic_and_durable() {
+    let dir = temp_dir("delete-many");
+    {
+        let db = VectorDB::open(&dir).unwrap();
+        let c = db.create_collection("dm", Some(8), 4).unwrap();
+        let batch: Vec<_> = (0..20u64).map(|id| record(id, "A")).collect();
+        c.add_many(&batch).unwrap();
+        // One id is missing: nothing is deleted.
+        assert_eq!(
+            c.delete_many(&[1, 2, 99]),
+            Err(ZenarError::VectorNotFound(99))
+        );
+        assert_eq!(c.count().unwrap(), 20);
+        // A repeated id is rejected up front.
+        assert!(matches!(
+            c.delete_many(&[3, 3]),
+            Err(ZenarError::InvalidArgument(_))
+        ));
+        assert_eq!(c.count().unwrap(), 20);
+        assert_eq!(c.delete_many(&[1, 2, 3]).unwrap(), 3);
+        assert_eq!(c.count().unwrap(), 17);
+    }
+    let db = VectorDB::open(&dir).unwrap();
+    let c = db.get_collection("dm").unwrap();
+    assert_eq!(c.count().unwrap(), 17);
+    assert!(c.get(2).unwrap().is_none());
+    assert!(c.get(4).unwrap().is_some());
+    fs::remove_dir_all(&dir).ok();
+}
+
+/// Model-based test: random adds, batch adds, deletes, batch deletes, flushes and clean reopens,
+/// checked after every step against a plain map. Any divergence fails with the step number.
+#[test]
+fn random_operations_agree_with_a_reference_model_across_reopens() {
+    use std::collections::BTreeMap;
+
+    struct Lcg(u64);
+    impl Lcg {
+        fn next(&mut self) -> u64 {
+            self.0 = self
+                .0
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            self.0 >> 33
+        }
+        fn below(&mut self, n: u64) -> u64 {
+            self.next() % n
+        }
+    }
+
+    let dir = temp_dir("model");
+    let mut rng = Lcg(0xC0FF_EE01);
+    let mut model: BTreeMap<u64, (String, &'static str)> = BTreeMap::new();
+    let mut next_id = 0u64;
+    let mut db = VectorDB::open(&dir).unwrap();
+    db.create_collection("m", Some(8), 4).unwrap();
+
+    for step in 0..400 {
+        let c = db.get_collection("m").unwrap();
+        match rng.below(10) {
+            0 | 1 => {
+                let tenant = if rng.below(2) == 0 { "A" } else { "B" };
+                let id = next_id;
+                next_id += 1;
+                c.add(
+                    id,
+                    &record(id, tenant).vector,
+                    &format!("doc {id}"),
+                    vec![("tenant".into(), text(tenant))],
+                )
+                .unwrap();
+                model.insert(id, (format!("doc {id}"), tenant));
+            }
+            2 | 3 => {
+                let n = 1 + rng.below(40);
+                let mut batch = Vec::new();
+                for _ in 0..n {
+                    let tenant = if rng.below(2) == 0 { "A" } else { "B" };
+                    let id = next_id;
+                    next_id += 1;
+                    batch.push(record(id, tenant));
+                    model.insert(id, (format!("doc {id}"), tenant));
+                }
+                assert_eq!(c.add_many(&batch).unwrap(), n as usize, "step {step}");
+            }
+            4 | 5 => {
+                if let Some(&id) = model
+                    .keys()
+                    .nth(rng.below(model.len().max(1) as u64) as usize)
+                {
+                    c.delete(id)
+                        .unwrap_or_else(|e| panic!("step {step}: delete {id}: {e}"));
+                    model.remove(&id);
+                }
+            }
+            6 => {
+                let victims: Vec<u64> = model
+                    .keys()
+                    .filter(|_| rng.below(5) == 0)
+                    .copied()
+                    .take(30)
+                    .collect();
+                if !victims.is_empty() {
+                    assert_eq!(
+                        c.delete_many(&victims).unwrap(),
+                        victims.len(),
+                        "step {step}"
+                    );
+                    for id in victims {
+                        model.remove(&id);
+                    }
+                }
+            }
+            7 => db.flush().unwrap(),
+            8 => {
+                // Clean close and reopen.
+                drop(c);
+                drop(db);
+                db = VectorDB::open(&dir).unwrap();
+                assert!(
+                    db.recovery_report().is_clean(),
+                    "step {step}: clean reopen repaired something"
+                );
+            }
+            _ => {}
+        }
+
+        let c = db.get_collection("m").unwrap();
+        assert_eq!(
+            c.count().unwrap(),
+            model.len(),
+            "count diverged at step {step}"
+        );
+        for _ in 0..3 {
+            let probe = next_id.saturating_sub(rng.below(next_id.max(1)) + 1);
+            let got = c.get(probe).unwrap();
+            match model.get(&probe) {
+                Some((text_value, _)) => assert_eq!(
+                    got.map(|d| d.text),
+                    Some(text_value.clone()),
+                    "step {step} id {probe}"
+                ),
+                None => assert!(got.is_none(), "step {step}: deleted id {probe} came back"),
+            }
+        }
+        if step % 25 == 0 {
+            let f = Filter::Eq {
+                field: "tenant".into(),
+                value: text("A"),
+            };
+            let hits = c.search(&[1.0; 8], 10_000, Some(&f)).unwrap();
+            let expected = model
+                .values()
+                .filter(|(_, t)| *t == "A")
+                .count()
+                .min(10_000);
+            assert_eq!(
+                hits.len(),
+                expected,
+                "tenant A hits diverged at step {step}"
+            );
+            assert!(
+                hits.iter()
+                    .all(|h| model.get(&h.id).map(|(_, t)| *t) == Some("A"))
+            );
+        }
+    }
+    drop(db);
+    fs::remove_dir_all(&dir).ok();
+}

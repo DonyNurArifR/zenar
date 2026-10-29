@@ -3,107 +3,124 @@
 ## Layout
 
 ```text
-<root>/LOCK                 advisory lock, held while the database is open
-<root>/metadata.db          SQLite (WAL mode): collection config, document text, metadata
-<root>/metadata.db-wal      SQLite write-ahead log (exists while the database is open)
-<root>/vectors/<name>.tvim  TurboVec index for each collection
+<root>/LOCK                  advisory lock, held while the database is open
+<root>/catalog.json          collections: dimension, bit width, metadata schema
+<root>/docs/<name>.log       document log: text and metadata, append-only
+<root>/vectors/<name>.tvim   TurboVec index for each collection
 ```
 
-SQLite is the source of truth for documents and for recovery. TurboVec holds the vectors. SQLite stores
-no vectors, so **a lost index file cannot be rebuilt by Zenar**. Its vectors must be re-added from your
-source data.
+The document log is the source of truth for documents. TurboVec holds the vectors. The log holds no vectors, so
+**a lost index file cannot be rebuilt by Zenar**. Its vectors must be re-added from your source data.
+
+Indexes (per metadata field) live in memory. They are rebuilt from the log on open.
 
 ## Locking
 
-Two layers:
+1. **`LOCK`** (exclusive `flock`) is held for the lifetime of a `VectorDB` handle. A second open, in this process
+   or another, raises `DatabaseLockedError`.
+2. The catalog and logs are only written by the process that holds `LOCK`.
 
-1. **Zenar `LOCK`** (exclusive `flock`) is held for the lifetime of a `VectorDB` handle. A second open,
-   in this process or another, raises `DatabaseLockedError`. This covers the vector files, which SQLite does not
-   protect.
-2. **SQLite's own locking** on `metadata.db`. It serializes writers, and readers in WAL mode do not block the writer.
+## The document log
+
+Each record is a frame: `length (u32 LE)`, `crc32 (u32 LE)`, then the payload. The CRC is IEEE CRC-32, the zlib one.
+
+- **PUT**: id, text, and the metadata fields the document carries. Missing fields are not stored (they are NULL).
+- **DEL**: a tombstone for an id. A later PUT of the same id is a new document.
+
+On open, the log is replayed from the start:
+
+| What is found at the end of the log or in the middle | Result |
+|---|---|
+| A frame cut off by the end of the file (header or payload) | Torn tail. Truncated to the last valid frame. Earlier records are kept. |
+| Zeros from the last valid frame to the end | Torn tail. Truncated. (A file system may extend a file before writing data.) |
+| A bad CRC or undecodable frame followed by more data | `RecoveryError`. The database does not open. Later records are never dropped silently. |
+
+Compaction runs when dead records outnumber live ones and there are more than 4096 dead. It writes the live records to a
+temporary file, syncs it, renames it over the log, and syncs the directory. Any error in compaction poisons the collection
+(see below). The safe course is a reopen, which replays whichever log is on disk.
 
 ## Ingest order
 
-For each `add`:
+### `add`
 
-1. Add the vector to the in-memory index.
-2. At each sync boundary (every 1000 adds), sync the index file. If the sync fails, the vector is removed again.
-3. Insert the document row with status `READY`.
+1. Validate the record. Extend the schema in the catalog if the record introduces fields. The catalog is written first,
+   so a record that uses a new field never reaches the log before the catalog knows the field.
+2. Write the PUT frame to the log (not yet visible to readers).
+3. Add the vector to the in-memory index.
+4. At a sync boundary (every 1000 adds, or every add with `durable=True`), sync the index file and the log. If that
+   fails, the vector is removed and the log is truncated back.
+5. Make the document visible.
 
-The row is written once, after the vector. The order matters for crash recovery. The consequences of a crash
-at each point:
+### `add_many`
 
-- Before step 2's sync: the vector is lost with the process. There is no row. Nothing to repair.
-- After the sync, before step 3: a vector with no row. Recovery removes it.
-- After step 3, before the next sync: a `READY` row with no vector on disk. Recovery removes the row.
+A batch is all-or-nothing:
 
-`PENDING` rows can still appear in an older database. Recovery rolls them back.
+1. Validate every record: ids, vectors, metadata, duplicates within the batch and against stored documents.
+   If the batch introduces metadata fields, the new schema is written to the catalog. No document is written yet.
+2. Write every PUT frame to the log, in one write.
+3. Add every vector to the index.
+4. Sync the index file, then the log.
+5. Make the documents visible.
 
-### Batched adds (`add_many`)
-
-A batch is all-or-nothing as seen by callers. Its steps:
-
-1. Validate every record, then check the schema and duplicates. Nothing is written yet.
-2. Add every vector to the index in memory, then sync the index once.
-3. Extend the metadata schema if the batch introduced fields.
-4. Commit every row in one SQLite transaction.
-
-If step 2, 3 or 4 fails, the vectors are removed from memory and the index is synced again, best effort. A crash
-after the index sync and before the commit leaves stray vectors, which recovery removes. A failed batch can leave
-new metadata fields in the schema, when the failure comes after step 3. Those fields are empty and do no harm.
+If step 2, 3 or 4 fails, the vectors added so far are removed, the index is synced again (best effort), and the log is
+truncated to its length before the batch.
 
 ## Deletes
 
-For each `delete`:
+`delete_many` does the same steps for a batch, with one index sync and one log sync. Every id must exist and be unique,
+or nothing changes.
 
-1. Mark the row `DELETING`.
-2. Remove the vector from the index and **sync the index file before returning**.
-3. Delete the row.
+`delete` (one id):
 
-A deleted vector is therefore never on disk once `delete` returns. This is the compliance guarantee.
+1. Remove the vector from the in-memory index, and sync the index file. A deleted vector is gone from disk before the
+   tombstone is written.
+2. Write a DEL frame to the log.
+3. Sync the log.
+4. Make the deletion visible.
+
+If step 1's sync, step 2 or step 3 fails, the collection is **poisoned**. Its in-memory state is ahead of its durable state,
+and it cannot be fixed safely in place. Every later operation on that collection returns `PersistenceError` until the
+database is reopened. Reopening replays the durable state.
+
+## Reconciliation on open
+
+The index file and the log can disagree after a crash. On open, each collection is reconciled:
+
+| Found | Action | Counted as |
+|---|---|---|
+| A live document with no vector in the index | Write a tombstone for it. Its vector is gone. | `orphaned_rows_removed` |
+| A vector in the index with no live document | Remove it from the index. | `orphaned_vectors_removed` |
+
+Both kinds of repair are durable after reconciliation. `db.recovery_report()` returns the counts. A non-zero count after a
+crash is expected when adds were not flushed. It means the unsynced window was discarded, not that data was corrupted.
 
 ## Durability policy
 
 | Operation | Durability |
 |---|---|
-| `add` | Index synced every `SYNC_INTERVAL` (1000) adds. Adds since the last sync can be lost on crash. |
-| `flush()` | Syncs every index file and runs `PRAGMA wal_checkpoint(FULL)`. Every add made before `flush()` returns survives a process crash **and** a power loss. |
-| `delete` | Index synced before return. Durable against process crash. Power loss: see below. |
-| Metadata commits | `MetadataSync::Normal` (default): `synchronous=NORMAL`. A WAL checkpoint fsyncs. `Full` / `durable=True`: `synchronous=FULL`, fsync per commit. |
+| `add` | Synced every `SYNC_INTERVAL` (1000) adds. Adds since the last sync are lost on crash, and reconciliation removes what is left of them. |
+| `add` with `durable=True` | Every add is synced before it returns. |
+| `add_many` | Synced before it returns. |
+| `delete` | The index sync and the log sync happen before it returns. |
+| `flush()` | Syncs the index file and the log of every collection. Every add made before `flush()` returns survives a process crash **and** a power loss. |
+| Clean close | Unsynced adds are synced when the collection handle is dropped. |
 
-With `Normal`, commits after the last checkpoint can be lost on power failure. Reconciliation still gives a
-consistent state (see below). Acknowledged adds are power-safe after `flush()`. Without `flush()`, use
-`durable=True` if power-loss durability of every add matters.
-
-A delete with `Normal` can also come back after power loss. The index file was synced, so the vector is gone. On
-reopen, the row that survived is a `READY` row with no vector, and recovery removes it. The document does not come
-back.
-
-Measured cost (dim 384, 1M rows, `examples/bench.rs`): `Normal` ingests at 0.053 ms/row on SQLite. Stoolap's per-commit fsync
-made `Full` roughly 600-1100x slower on that backend. See BENCHMARKS.md.
-
-## Recovery on open
-
-Each collection is reconciled against its metadata:
-
-| Found | Action | Counted as |
-|---|---|---|
-| `PENDING` row | Remove row and vector | `rolled_back_pending` |
-| `DELETING` row | Finish the delete | `finished_deletes` |
-| `READY` row, no vector in index | Remove row (its vector is gone) | `orphaned_rows_removed` |
-| Vector in index, no row | Remove vector | `orphaned_vectors_removed` |
-
-`db.recovery_report()` returns these counts. A non-zero `orphaned_rows_removed` after a crash is expected
-when adds were not flushed. It means the window of unsynced adds was discarded, not that data was corrupted.
+`durable=True` makes every add power-safe on return. The default, `Normal`, gives the same guarantee after `flush()`.
 
 ## Crash tests
 
-- `test_kill_minus_9_mid_write_leaves_consistent_database` (Python): SIGKILL during a write stream. Every
-  `READY` row must be searchable after reopen.
+- `test_kill_minus_9_mid_write_leaves_consistent_database` (Python): SIGKILL during a write stream. Every live document
+  must be searchable after reopen.
 - `test_flush_makes_adds_survive_kill_minus_9` (Python): adds covered by a `flush()` survive SIGKILL.
-- Rust unit tests in `collection.rs`: crash before sync, crash mid-delete, READY without vector.
+- `torn_tail_is_truncated_and_earlier_records_survive`, `zero_filled_tail_is_treated_as_torn`,
+  `corruption_in_the_middle_is_an_error_not_a_silent_drop` (Rust, log level).
+- `document_without_vector_is_removed_on_reopen`, `vector_without_document_is_removed_on_reopen` (Rust, collection level).
+- `poisoned_collection_refuses_every_operation` (Rust).
+
+Power loss is not tested here. The `fsync` guarantees come from the platform, and they have not been checked on real
+hardware.
 
 ## Index file format
 
-TurboVec `IdMapIndex` v7 snapshot, written with `sync()` (temp file, `fsync`, atomic rename). The file stores
-the padded dimension. Zenar keeps the logical dimension in the collection record.
+TurboVec `IdMapIndex` v7 snapshot, written with `sync()` (temp file, sync, atomic rename). The file stores the padded
+dimension. Zenar keeps the logical dimension in the catalog.

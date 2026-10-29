@@ -1,19 +1,21 @@
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
-use crate::document::{DocumentRow, MetadataStore, RowRef, Status, is_valid_field_name};
+use crate::catalog::Catalog;
+use crate::docstore::{DocRef, DocStore, DocumentRow};
 use crate::error::ZenarError;
-use crate::filter::{Filter, compile};
-use crate::storage::{VectorStore, validate_vector};
+use crate::filter::{Filter, validate};
+use crate::names::is_valid_field_name;
+use crate::storage::{VectorStore, validate_dimension, validate_vector};
 use crate::value::{FieldKind, MetaValue};
 
-/// Largest id the metadata store can hold (SQL BIGINT).
+/// Largest id the store accepts. Ids are stored as i64 in the index files.
 pub const MAX_ID: u64 = i64::MAX as u64;
 
-/// Adds between index syncs (spec section 86). Syncing on every add made ingest
-/// quadratic: about 20 ms per row at 10K rows. Adds since the last sync may be
-/// lost on a crash. Recovery removes their rows, and `flush()` makes them durable.
+/// Adds between index syncs (spec section 86). Syncing on every add made ingest quadratic.
+/// Adds since the last sync can be lost on a crash. Recovery removes their documents or
+/// vectors, and `flush()` makes them durable on demand.
 pub const SYNC_INTERVAL: usize = 1000;
 
 /// One search result (spec section 18).
@@ -34,16 +36,12 @@ pub struct Record {
     pub metadata: Vec<(String, MetaValue)>,
 }
 
-/// Counts of repairs made when a collection was reconciled on open (spec section 26).
+/// Repairs made when a collection was reconciled on open (spec section 26).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct RecoveryReport {
-    /// PENDING rows whose add never completed: rolled back.
-    pub rolled_back_pending: usize,
-    /// DELETING rows whose delete never completed: finished.
-    pub finished_deletes: usize,
-    /// READY rows with no vector in the index: removed, since the vector is gone.
+    /// Documents with no vector in the index. Removed, since the vector is gone.
     pub orphaned_rows_removed: usize,
-    /// Vectors in the index with no metadata row: removed.
+    /// Vectors in the index with no live document. Removed.
     pub orphaned_vectors_removed: usize,
 }
 
@@ -55,10 +53,13 @@ impl RecoveryReport {
 
 struct State {
     store: VectorStore,
-    /// Metadata schema, locked by the first add that carries metadata.
-    fields: Vec<(String, FieldKind)>,
-    /// Vectors added since the index was last synced to disk.
+    docs: DocStore,
+    /// Vectors added since the index was last synced.
     unsynced: usize,
+    /// Set when an in-memory change could not be made durable or undone. Every
+    /// operation then fails until the database is reopened, which replays the
+    /// durable state.
+    poisoned: Option<String>,
 }
 
 /// A named set of vectors plus their documents and metadata.
@@ -66,9 +67,10 @@ struct State {
 /// Writes are serialized behind one lock. Reads run concurrently with each other.
 pub struct Collection {
     name: String,
-    table: String,
     index_path: PathBuf,
-    meta: Arc<MetadataStore>,
+    catalog: Arc<Catalog>,
+    /// Sync the document log on every commit, not only at sync boundaries.
+    durable: bool,
     state: RwLock<State>,
 }
 
@@ -76,19 +78,21 @@ impl Collection {
     pub(crate) fn new(
         name: &str,
         index_path: PathBuf,
-        meta: Arc<MetadataStore>,
+        catalog: Arc<Catalog>,
         store: VectorStore,
-        fields: Vec<(String, FieldKind)>,
+        docs: DocStore,
+        durable: bool,
     ) -> Self {
         Self {
             name: name.to_string(),
-            table: MetadataStore::table_name(name),
             index_path,
-            meta,
+            catalog,
+            durable,
             state: RwLock::new(State {
                 store,
-                fields,
+                docs,
                 unsynced: 0,
+                poisoned: None,
             }),
         }
     }
@@ -105,9 +109,11 @@ impl Collection {
         self.read_state().map(|s| s.store.bit_width()).unwrap_or(0)
     }
 
-    /// Adds one document. The vector goes into the index, the index is synced at
-    /// each sync boundary, and then the row is written as READY. Crash handling is
-    /// described in STORAGE.md and in `reconcile`.
+    /// Adds one document.
+    ///
+    /// Order: stage the document write, add the vector in memory, and at a sync boundary
+    /// sync the index and the log. Only then make the document visible. A crash before the
+    /// boundary can lose the newest adds, and reconciliation removes the rest (STORAGE.md).
     pub fn add(
         &self,
         id: u64,
@@ -117,42 +123,36 @@ impl Collection {
     ) -> Result<(), ZenarError> {
         check_id(id)?;
         let mut state = self.write_state()?;
+        healthy(&state)?;
         validate_vector(vector, state.store.dim())?;
         let first_vector = state.store.dim().is_none();
-        let (new_fields, values) = resolve_metadata(&state.fields, metadata)?;
-
-        if state.store.contains(id) || self.meta.status_of(&self.table, id)?.is_some() {
+        let (new_fields, values) = resolve_metadata(state.docs.fields(), metadata)?;
+        if state.store.contains(id) || state.docs.contains(id) {
             return Err(ZenarError::DuplicateId(id));
         }
-        if !new_fields.is_empty() {
-            self.meta.add_field_columns(&self.table, &new_fields)?;
-            state.fields.extend(new_fields);
-            self.meta.set_fields(&self.name, &state.fields)?;
-        }
+        self.extend_schema(&mut state, &new_fields)?;
 
-        state.store.add(vector, id)?;
-        if state.unsynced + 1 >= SYNC_INTERVAL {
-            if let Err(e) = state.store.sync(&self.index_path) {
-                state.store.remove(id);
+        let staged = state.docs.stage_puts(&[DocRef {
+            id,
+            text,
+            metadata: &values,
+        }])?;
+        if let Err(e) = state.store.add(vector, id) {
+            state.docs.undo(staged)?;
+            return Err(e);
+        }
+        if self.durable || state.unsynced + 1 >= SYNC_INTERVAL {
+            if let Err(e) = self.sync_both(&mut state) {
+                let _ = state.store.remove(id);
+                let _ = state.docs.undo(staged);
                 return Err(e);
             }
-            state.unsynced = 0;
         } else {
             state.unsynced += 1;
         }
-        // The row is written once, after the vector is in the index, so there is no
-        // UPDATE per add. A crash before the row exists leaves a stray vector, and
-        // recovery removes it. A crash after the row exists but before the next index
-        // sync leaves a READY row with no vector, and recovery removes that too.
-        if let Err(e) = self
-            .meta
-            .insert_document(&self.table, id, text, Status::Ready, &values)
-        {
-            state.store.remove(id);
-            return Err(e);
-        }
-        if first_vector && let Some(dim) = state.store.dim() {
-            self.meta.set_dimension(&self.name, dim)?;
+        state.docs.commit(staged);
+        if first_vector {
+            self.record_dimension(&state)?;
         }
         Ok(())
     }
@@ -160,32 +160,37 @@ impl Collection {
     /// Adds many documents atomically. Either every record is added or none is.
     ///
     /// 1. Validate every record before any write: ids, vectors, metadata, duplicates
-    ///    within the batch and against stored rows.
+    ///    within the batch and against stored documents.
     /// 2. Extend the metadata schema if the batch introduces fields.
-    /// 3. Add all vectors to the index, then sync the index once.
-    /// 4. Insert all rows in one SQLite transaction.
+    /// 3. Write all documents to the log and all vectors to the index.
+    /// 4. Sync the index and the log once.
+    /// 5. Make the documents visible.
     ///
-    /// If step 3 or 4 fails, the vectors added so far are removed and the error is returned.
-    /// A crash between the sync and the commit leaves stray vectors, which recovery removes.
+    /// Any failure in 3 or 4 undoes the batch. The schema change in step 2 stays, which is
+    /// harmless because no document uses the new fields.
     pub fn add_many(&self, records: &[Record]) -> Result<usize, ZenarError> {
         if records.is_empty() {
             return Ok(0);
         }
         let mut state = self.write_state()?;
+        healthy(&state)?;
         let first_vector = state.store.dim().is_none();
 
         // 1. Validate.
         if first_vector {
-            crate::storage::validate_dimension(records[0].vector.len())?;
+            validate_dimension(records[0].vector.len())?;
         }
         let expected_dim = state.store.dim().or(Some(records[0].vector.len()));
         let mut seen = HashSet::with_capacity(records.len());
-        let mut schema = state.fields.clone();
+        let mut schema: Vec<(String, FieldKind)> = state.docs.fields().to_vec();
         let mut new_fields: Vec<(String, FieldKind)> = Vec::new();
         let mut prepared: Vec<Vec<(String, MetaValue)>> = Vec::with_capacity(records.len());
         for record in records {
             check_id(record.id)?;
-            if !seen.insert(record.id) || state.store.contains(record.id) {
+            if !seen.insert(record.id)
+                || state.store.contains(record.id)
+                || state.docs.contains(record.id)
+            {
                 return Err(ZenarError::DuplicateId(record.id));
             }
             validate_vector(&record.vector, expected_dim)?;
@@ -194,91 +199,134 @@ impl Collection {
             new_fields.extend(introduced);
             prepared.push(values);
         }
-        let ids: Vec<u64> = records.iter().map(|r| r.id).collect();
-        if let Some(&id) = self.meta.existing_ids(&self.table, &ids)?.iter().next() {
-            return Err(ZenarError::DuplicateId(id));
-        }
+        self.extend_schema(&mut state, &new_fields)?;
 
-        // 2. Vectors, then one sync. The schema changes only after this succeeds.
+        // 3. Documents, then vectors.
+        let refs: Vec<DocRef<'_>> = records
+            .iter()
+            .zip(prepared.iter())
+            .map(|(r, values)| DocRef {
+                id: r.id,
+                text: r.text.as_str(),
+                metadata: values.as_slice(),
+            })
+            .collect();
+        let staged = state.docs.stage_puts(&refs)?;
         let mut added: Vec<u64> = Vec::with_capacity(records.len());
         for record in records {
             if let Err(e) = state.store.add(&record.vector, record.id) {
-                self.rollback_vectors(&mut state, &added);
+                self.rollback(&mut state, &added, staged);
                 return Err(e);
             }
             added.push(record.id);
         }
-        if let Err(e) = state.store.sync(&self.index_path) {
-            self.rollback_vectors(&mut state, &added);
-            return Err(e);
-        }
-        state.unsynced = 0;
 
-        // 3. Schema, then rows in one transaction.
-        if !new_fields.is_empty() {
-            if let Err(e) = self.meta.add_field_columns(&self.table, &new_fields) {
-                self.rollback_vectors(&mut state, &added);
-                return Err(e);
-            }
-            state.fields = schema;
-            if let Err(e) = self.meta.set_fields(&self.name, &state.fields) {
-                self.rollback_vectors(&mut state, &added);
-                return Err(e);
-            }
-        }
-        let rows: Vec<RowRef<'_>> = records
-            .iter()
-            .zip(prepared.iter())
-            .map(|(r, values)| (r.id, r.text.as_str(), values.as_slice()))
-            .collect();
-        if let Err(e) = self.meta.insert_documents(&self.table, &rows) {
-            self.rollback_vectors(&mut state, &added);
+        // 4. One sync for the whole batch.
+        if let Err(e) = self.sync_both(&mut state) {
+            self.rollback(&mut state, &added, staged);
             return Err(e);
         }
-        if first_vector && let Some(dim) = state.store.dim() {
-            self.meta.set_dimension(&self.name, dim)?;
+
+        // 5. Visible.
+        state.docs.commit(staged);
+        if first_vector {
+            self.record_dimension(&state)?;
         }
         Ok(records.len())
     }
 
-    /// Removes vectors added by a failed batch and syncs, so the index file does not keep them.
-    /// If the sync fails, recovery removes the stray vectors on the next open.
-    fn rollback_vectors(&self, state: &mut State, ids: &[u64]) {
-        for id in ids {
-            state.store.remove(*id);
-        }
-        if !ids.is_empty() && state.store.sync(&self.index_path).is_ok() {
-            state.unsynced = 0;
-        }
-    }
-
-    /// Deletes one document. The vector is removed and synced before the row
-    /// is dropped, so a deleted vector cannot survive on disk after `delete` returns (spec section 67).
+    /// Deletes one document. The vector leaves the index and the index is synced before the
+    /// delete is logged, so a deleted vector is gone from disk once `delete` returns (spec section 67).
     pub fn delete(&self, id: u64) -> Result<(), ZenarError> {
         let mut state = self.write_state()?;
-        if self.meta.status_of(&self.table, id)?.is_none() {
+        healthy(&state)?;
+        if !state.docs.contains(id) {
             return Err(ZenarError::VectorNotFound(id));
         }
-        self.meta.set_status(&self.table, id, Status::Deleting)?;
-        state.store.remove(id);
-        state.store.sync(&self.index_path)?;
+        // From here on the in-memory state is ahead of the durable state until the delete is
+        // logged and synced. Any failure poisons the collection, since it cannot be undone safely.
+        if !state.store.remove(id) {
+            return Err(ZenarError::VectorNotFound(id));
+        }
+        if let Err(e) = state.store.sync(&self.index_path) {
+            return Err(poison(&mut state, e));
+        }
+        let staged = match state.docs.stage_delete(id) {
+            Ok(staged) => staged,
+            Err(e) => return Err(poison(&mut state, e)),
+        };
+        if let Err(e) = state.docs.sync() {
+            return Err(poison(&mut state, e));
+        }
+        state.docs.commit(staged);
         state.unsynced = 0;
-        self.meta.delete_document(&self.table, id)
-    }
-
-    /// Makes every add so far durable. Returns once the index file is synced.
-    pub fn flush(&self) -> Result<(), ZenarError> {
-        let mut state = self.write_state()?;
-        if state.unsynced > 0 && state.store.dim().is_some() {
-            state.store.sync(&self.index_path)?;
-            state.unsynced = 0;
+        if state.docs.should_compact() {
+            // Compaction is best effort. A failure after the rename leaves the in-memory log stale,
+            // so it poisons the collection. Failure before the rename changes nothing.
+            if let Err(e) = state.docs.compact() {
+                return Err(poison(&mut state, e));
+            }
         }
         Ok(())
     }
 
-    /// Calibrates the TQ+ quantizer from a sample (spec section 88).
+    /// Deletes many documents with one index sync and one log sync. Either all of them are
+    /// deleted or none is: every id must exist and be unique, or nothing changes.
+    pub fn delete_many(&self, ids: &[u64]) -> Result<usize, ZenarError> {
+        if ids.is_empty() {
+            return Ok(0);
+        }
+        let mut state = self.write_state()?;
+        healthy(&state)?;
+        let mut seen = HashSet::with_capacity(ids.len());
+        for &id in ids {
+            if !seen.insert(id) {
+                return Err(ZenarError::InvalidArgument(format!(
+                    "id {id} appears twice in the batch"
+                )));
+            }
+            if !state.docs.contains(id) {
+                return Err(ZenarError::VectorNotFound(id));
+            }
+        }
+        // From here, see `delete`: any failure poisons the collection.
+        for &id in ids {
+            state.store.remove(id);
+        }
+        if let Err(e) = state.store.sync(&self.index_path) {
+            return Err(poison(&mut state, e));
+        }
+        let staged = match state.docs.stage_deletes(ids) {
+            Ok(staged) => staged,
+            Err(e) => return Err(poison(&mut state, e)),
+        };
+        if let Err(e) = state.docs.sync() {
+            return Err(poison(&mut state, e));
+        }
+        state.docs.commit(staged);
+        state.unsynced = 0;
+        if state.docs.should_compact()
+            && let Err(e) = state.docs.compact()
+        {
+            return Err(poison(&mut state, e));
+        }
+        Ok(ids.len())
+    }
+
+    /// Makes every add so far durable: the index and the document log are synced.
+    pub fn flush(&self) -> Result<(), ZenarError> {
+        let mut state = self.write_state()?;
+        healthy(&state)?;
+        if state.unsynced > 0 || self.durable {
+            self.sync_both(&mut state)?;
+        }
+        Ok(())
+    }
+
+    /// Fits the TQ+ calibration from a sample (spec section 88).
     pub fn calibrate(&self, sample: &[f32]) -> Result<(), ZenarError> {
         let mut state = self.write_state()?;
+        healthy(&state)?;
         state.store.calibrate(sample)?;
         state.store.sync(&self.index_path)?;
         state.unsynced = 0;
@@ -287,34 +335,28 @@ impl Collection {
 
     pub fn get(&self, id: u64) -> Result<Option<DocumentRow>, ZenarError> {
         let state = self.read_state()?;
-        Ok(self
-            .meta
-            .fetch_documents(&self.table, &state.fields, &[id])?
-            .into_iter()
-            .next())
+        healthy(&state)?;
+        Ok(state.docs.fetch(&[id])?.into_iter().next())
     }
 
     /// Returns found documents in the order of `ids`. Missing ids are skipped.
     pub fn get_many(&self, ids: &[u64]) -> Result<Vec<DocumentRow>, ZenarError> {
         let state = self.read_state()?;
-        let mut by_id: HashMap<u64, DocumentRow> = self
-            .meta
-            .fetch_documents(&self.table, &state.fields, ids)?
-            .into_iter()
-            .map(|d| (d.id, d))
-            .collect();
-        Ok(ids.iter().filter_map(|id| by_id.remove(id)).collect())
+        healthy(&state)?;
+        state.docs.fetch(ids)
     }
 
     pub fn count(&self) -> Result<usize, ZenarError> {
-        self.meta.count_ready(&self.table)
+        let state = self.read_state()?;
+        healthy(&state)?;
+        Ok(state.docs.live_count())
     }
 
     /// Top-`top_k` search, optionally filtered (spec sections 18-22).
     ///
-    /// * No filter: TurboVec only. Metadata is fetched for the top-K alone.
-    /// * Filter: SQL returns candidate ids, which are narrowed to ids still in
-    ///   the index (spec section 89), then TurboVec searches with that allowlist.
+    /// * No filter: TurboVec only. Documents are read for the top-K alone.
+    /// * Filter: the document log's indexes give the matching ids. Those are narrowed to ids
+    ///   still in the index (spec section 89), and TurboVec searches only those.
     /// * Empty candidate set: returns without touching TurboVec (spec section 21).
     pub fn search(
         &self,
@@ -328,6 +370,7 @@ impl Collection {
             ));
         }
         let state = self.read_state()?;
+        healthy(&state)?;
         if state.store.dim().is_none() {
             return Ok(Vec::new());
         }
@@ -342,10 +385,8 @@ impl Collection {
                 state.store.search(query, k, None)?
             }
             Some(filter) => {
-                let compiled = compile(filter, &state.fields)?;
-                let candidates =
-                    self.meta
-                        .matching_ids(&self.table, &compiled.sql, compiled.params)?;
+                validate(filter, state.docs.fields())?;
+                let candidates = state.docs.matching_ids(filter)?;
                 let live: Vec<u64> = candidates
                     .into_iter()
                     .filter(|id| state.store.contains(*id))
@@ -357,13 +398,12 @@ impl Collection {
                 state.store.search(query, k, Some(&live))?
             }
         };
-
         if ids.is_empty() {
             return Ok(Vec::new());
         }
-        let mut docs: HashMap<u64, DocumentRow> = self
-            .meta
-            .fetch_documents(&self.table, &state.fields, &ids)?
+        let mut docs: HashMap<u64, DocumentRow> = state
+            .docs
+            .fetch(&ids)?
             .into_iter()
             .map(|d| (d.id, d))
             .collect();
@@ -381,51 +421,41 @@ impl Collection {
             .collect())
     }
 
-    /// Reconciles the metadata store and the vector index after a restart (spec section 26).
+    /// Reconciles the document log and the vector index after a restart (spec section 26).
     pub fn reconcile(&self) -> Result<RecoveryReport, ZenarError> {
         let mut state = self.write_state()?;
+        healthy(&state)?;
         let mut report = RecoveryReport::default();
 
-        for id in self.meta.ids_with_status(&self.table, Status::Pending)? {
-            state.store.remove(id);
-            self.meta.delete_document(&self.table, id)?;
-            report.rolled_back_pending += 1;
-        }
-        for id in self.meta.ids_with_status(&self.table, Status::Deleting)? {
-            state.store.remove(id);
-            self.meta.delete_document(&self.table, id)?;
-            report.finished_deletes += 1;
-        }
-
-        let ready: HashSet<u64> = self
-            .meta
-            .ids_with_status(&self.table, Status::Ready)?
-            .into_iter()
-            .collect();
-        for id in ready
+        let live: HashSet<u64> = state.docs.live_ids().into_iter().collect();
+        let mut orphan_docs: Vec<u64> = live
             .iter()
             .copied()
             .filter(|id| !state.store.contains(*id))
-        {
-            self.meta.delete_document(&self.table, id)?;
+            .collect();
+        orphan_docs.sort_unstable();
+        let mut dirty = false;
+        for id in orphan_docs {
+            let staged = state.docs.stage_delete(id)?;
+            state.docs.commit(staged);
             report.orphaned_rows_removed += 1;
+            dirty = true;
         }
 
-        let rows: HashSet<u64> = self.meta.all_ids(&self.table)?.into_iter().collect();
-        let stray: Vec<u64> = state.store.ids().filter(|id| !rows.contains(id)).collect();
+        let stray: Vec<u64> = state.store.ids().filter(|id| !live.contains(id)).collect();
         for id in stray {
             state.store.remove(id);
             report.orphaned_vectors_removed += 1;
+            dirty = true;
         }
 
-        if !report.is_clean() {
-            state.store.sync(&self.index_path)?;
-            state.unsynced = 0;
+        if dirty {
+            self.sync_both(&mut state)?;
         }
         Ok(report)
     }
 
-    /// Writes the collection's current index to disk (used when a new collection is created).
+    /// Writes the current index file (used when a new collection is created with a dimension).
     pub(crate) fn persist(&self) -> Result<(), ZenarError> {
         let mut state = self.write_state()?;
         state.store.sync(&self.index_path)?;
@@ -433,13 +463,63 @@ impl Collection {
         Ok(())
     }
 
-    fn read_state(&self) -> Result<std::sync::RwLockReadGuard<'_, State>, ZenarError> {
+    /// Persists new schema fields in the catalog, then extends the in-memory schema.
+    /// The order matters. A record that uses a new field must not reach the log before the
+    /// catalog knows the field, or reopening would fail.
+    fn extend_schema(
+        &self,
+        state: &mut State,
+        new_fields: &[(String, FieldKind)],
+    ) -> Result<(), ZenarError> {
+        if new_fields.is_empty() {
+            return Ok(());
+        }
+        let added: Vec<(String, String)> = new_fields
+            .iter()
+            .map(|(n, k)| (n.clone(), k.as_str().to_string()))
+            .collect();
+        self.catalog
+            .update(&self.name, |entry| entry.fields.extend(added))?;
+        state.docs.extend_fields(new_fields);
+        Ok(())
+    }
+
+    fn record_dimension(&self, state: &State) -> Result<(), ZenarError> {
+        if let Some(dim) = state.store.dim() {
+            self.catalog
+                .update(&self.name, |entry| entry.dimension = Some(dim))?;
+        }
+        Ok(())
+    }
+
+    /// Syncs the vector index and the document log. Both must succeed.
+    fn sync_both(&self, state: &mut State) -> Result<(), ZenarError> {
+        state.store.sync(&self.index_path)?;
+        state.docs.sync()?;
+        state.unsynced = 0;
+        Ok(())
+    }
+
+    /// Undoes a batch that failed before it became visible: removes its vectors from memory,
+    /// truncates its log bytes, and syncs the index to match. If that sync fails, recovery on
+    /// the next open removes the stray vectors.
+    fn rollback(&self, state: &mut State, added: &[u64], staged: crate::docstore::Staged) {
+        for id in added {
+            state.store.remove(*id);
+        }
+        if !added.is_empty() {
+            let _ = state.store.sync(&self.index_path);
+        }
+        let _ = state.docs.undo(staged);
+    }
+
+    fn read_state(&self) -> Result<RwLockReadGuard<'_, State>, ZenarError> {
         self.state
             .read()
             .map_err(|_| ZenarError::VectorStoreError("collection lock poisoned".into()))
     }
 
-    fn write_state(&self) -> Result<std::sync::RwLockWriteGuard<'_, State>, ZenarError> {
+    fn write_state(&self) -> Result<RwLockWriteGuard<'_, State>, ZenarError> {
         self.state
             .write()
             .map_err(|_| ZenarError::VectorStoreError("collection lock poisoned".into()))
@@ -447,15 +527,32 @@ impl Collection {
 }
 
 impl Drop for Collection {
+    /// A clean close syncs adds that are still unsynced. Errors cannot be reported from
+    /// drop. If the sync fails, reconciliation on the next open repairs the state.
     fn drop(&mut self) {
-        // Best effort: a clean shutdown should not lose the last batch. Errors cannot be reported from Drop.
         if let Ok(state) = self.state.get_mut()
+            && state.poisoned.is_none()
             && state.unsynced > 0
-            && state.store.dim().is_some()
         {
             let _ = state.store.sync(&self.index_path);
+            let _ = state.docs.sync();
+            state.unsynced = 0;
         }
     }
+}
+
+fn healthy(state: &State) -> Result<(), ZenarError> {
+    match &state.poisoned {
+        None => Ok(()),
+        Some(reason) => Err(ZenarError::PersistenceError(format!(
+            "collection is inconsistent after a failed write ({reason}); reopen the database to recover"
+        ))),
+    }
+}
+
+fn poison(state: &mut State, e: ZenarError) -> ZenarError {
+    state.poisoned.get_or_insert_with(|| e.to_string());
+    e
 }
 
 pub fn check_id(id: u64) -> Result<(), ZenarError> {
@@ -467,16 +564,12 @@ pub fn check_id(id: u64) -> Result<(), ZenarError> {
     Ok(())
 }
 
-/// Validates metadata against the locked schema (or infers it when unlocked).
-/// Returns the newly introduced fields and the values to store.
-type Schema = Vec<(String, FieldKind)>;
-type Metadata = Vec<(String, MetaValue)>;
-
-/// Returns the newly introduced fields and the values to store.
+/// Validates metadata against the schema. An unlocked schema (no fields yet) takes the fields
+/// of this document. Returns the newly introduced fields and the values to store.
 fn resolve_metadata(
     schema: &[(String, FieldKind)],
-    metadata: Metadata,
-) -> Result<(Schema, Metadata), ZenarError> {
+    metadata: Vec<(String, MetaValue)>,
+) -> Result<Resolved, ZenarError> {
     let mut new_fields: Vec<(String, FieldKind)> = Vec::new();
     let mut values: Vec<(String, MetaValue)> = Vec::with_capacity(metadata.len());
     let mut seen = HashSet::new();
@@ -508,7 +601,6 @@ fn resolve_metadata(
         let value = match declared {
             Some(kind) => coerce(&name, kind, value)?,
             None if schema.is_empty() => {
-                // The first add that carries metadata defines the schema (spec section 48 style).
                 new_fields.push((name.clone(), FieldKind::of(&value)));
                 value
             }
@@ -523,7 +615,10 @@ fn resolve_metadata(
     Ok((new_fields, values))
 }
 
-/// Coerces a value to a field's locked kind. Integers widen to floats; nothing else converts.
+/// Fields a document introduces, and its metadata as stored.
+type Resolved = (Vec<(String, FieldKind)>, Vec<(String, MetaValue)>);
+
+/// Coerces a value to a field's kind. Integers widen to floats. Nothing else converts.
 fn coerce(name: &str, kind: FieldKind, value: MetaValue) -> Result<MetaValue, ZenarError> {
     match (kind, value) {
         (FieldKind::Float, MetaValue::Integer(i)) => Ok(MetaValue::Float(i as f64)),
@@ -590,7 +685,6 @@ mod tests {
 mod recovery_tests {
     use super::*;
     use crate::database::VectorDB;
-    use crate::filter::Filter;
     use std::fs;
 
     fn temp_dir(tag: &str) -> PathBuf {
@@ -603,110 +697,83 @@ mod recovery_tests {
         (0..8).map(|i| seed + i as f32).collect()
     }
 
-    /// Spec section 89: a READY row whose vector is gone from the index must not
-    /// make filtered search fail. The stale id is excluded and the rest still return.
+    /// A document made durable without its vector (a crash after the log sync, before the index
+    /// sync) is removed on reopen.
     #[test]
-    fn stale_candidate_id_is_excluded_not_an_error() {
-        let dir = temp_dir("stale");
-        let db = VectorDB::open(&dir).unwrap();
-        let c = db.create_collection("stale", Some(8), 4).unwrap();
-        c.add(
-            1,
-            &v(1.0),
-            "one",
-            vec![("tenant".into(), MetaValue::Text("A".into()))],
-        )
-        .unwrap();
-        c.add(
-            2,
-            &v(2.0),
-            "two",
-            vec![("tenant".into(), MetaValue::Text("A".into()))],
-        )
-        .unwrap();
-        // Diverge: remove id 1 from the index only, leaving its READY row.
-        c.state.write().unwrap().store.remove(1);
-
-        let f = Filter::Eq {
-            field: "tenant".into(),
-            value: MetaValue::Text("A".into()),
-        };
-        let hits = c.search(&v(1.0), 10, Some(&f)).unwrap();
-        assert_eq!(hits.iter().map(|h| h.id).collect::<Vec<_>>(), vec![2]);
-        fs::remove_dir_all(&dir).ok();
-    }
-
-    /// A crash after the PENDING row and in-memory vector, before sync, must roll back on reopen.
-    #[test]
-    fn crash_before_sync_rolls_back_pending() {
-        let dir = temp_dir("pending");
+    fn document_without_vector_is_removed_on_reopen() {
+        let dir = temp_dir("orphan-doc");
         {
             let db = VectorDB::open(&dir).unwrap();
-            let c = db.create_collection("pend", Some(8), 4).unwrap();
+            let c = db.create_collection("od", Some(8), 4).unwrap();
             c.add(1, &v(1.0), "kept", vec![]).unwrap();
-            // Simulate the crash window: PENDING row written, vector added in memory, no sync.
-            c.meta
-                .insert_document(&c.table, 2, "lost", Status::Pending, &[])
+            db.flush().unwrap();
+            // Simulate the crash window: the document is durable, the vector is not.
+            let mut state = c.write_state().unwrap();
+            let staged = state
+                .docs
+                .stage_puts(&[DocRef {
+                    id: 2,
+                    text: "orphan",
+                    metadata: &[],
+                }])
                 .unwrap();
-            c.state.write().unwrap().store.add(&v(2.0), 2).unwrap();
-            // Process "dies" here: dropping without sync leaves the file as it was.
+            state.docs.commit(staged);
+            state.docs.sync().unwrap();
         }
         let db = VectorDB::open(&dir).unwrap();
-        let report = db.recovery_report();
-        assert_eq!(report.rolled_back_pending, 1);
-        let c = db.get_collection("pend").unwrap();
+        assert_eq!(db.recovery_report().orphaned_rows_removed, 1);
+        let c = db.get_collection("od").unwrap();
         assert!(c.get(2).unwrap().is_none());
         assert!(c.get(1).unwrap().is_some());
         assert_eq!(c.count().unwrap(), 1);
         fs::remove_dir_all(&dir).ok();
     }
 
-    /// A delete that crashed after the DELETING mark must be finished on reopen.
+    /// A vector made durable without its document is removed on reopen.
     #[test]
-    fn crash_mid_delete_is_finished_on_reopen() {
-        let dir = temp_dir("deleting");
+    fn vector_without_document_is_removed_on_reopen() {
+        let dir = temp_dir("stray-vec");
         {
             let db = VectorDB::open(&dir).unwrap();
-            let c = db.create_collection("del", Some(8), 4).unwrap();
-            c.add(1, &v(1.0), "gone", vec![]).unwrap();
-            c.meta.set_status(&c.table, 1, Status::Deleting).unwrap();
+            let c = db.create_collection("sv", Some(8), 4).unwrap();
+            c.add(1, &v(1.0), "kept", vec![]).unwrap();
+            db.flush().unwrap();
+            let mut state = c.write_state().unwrap();
+            state.store.add(&v(2.0), 2).unwrap();
+            state.store.sync(&c.index_path).unwrap();
         }
         let db = VectorDB::open(&dir).unwrap();
-        assert_eq!(db.recovery_report().finished_deletes, 1);
-        assert!(db.get_collection("del").unwrap().get(1).unwrap().is_none());
+        assert_eq!(db.recovery_report().orphaned_vectors_removed, 1);
+        let c = db.get_collection("sv").unwrap();
+        let hits = c.search(&v(2.0), 5, None).unwrap();
+        assert!(hits.iter().all(|h| h.id != 2));
         fs::remove_dir_all(&dir).ok();
     }
 
-    /// A READY row whose vector was never durably stored is removed on reopen.
+    /// Once an in-memory state cannot be made durable or undone, every operation fails until reopen.
     #[test]
-    fn ready_row_without_synced_vector_is_removed() {
-        let dir = temp_dir("orphan");
-        {
-            let db = VectorDB::open(&dir).unwrap();
-            db.create_collection("orph", Some(8), 4).unwrap();
-            let c = db.get_collection("orph").unwrap();
-            c.meta
-                .insert_document(&c.table, 5, "orphan", Status::Ready, &[])
-                .unwrap();
-        }
+    fn poisoned_collection_refuses_every_operation() {
+        let dir = temp_dir("poison");
         let db = VectorDB::open(&dir).unwrap();
-        assert_eq!(db.recovery_report().orphaned_rows_removed, 1);
-        assert_eq!(db.get_collection("orph").unwrap().count().unwrap(), 0);
-        fs::remove_dir_all(&dir).ok();
-    }
-
-    #[test]
-    fn duplicate_id_rejected_and_search_is_exact() {
-        let dir = temp_dir("dup");
+        let c = db.create_collection("p", Some(8), 4).unwrap();
+        c.add(1, &v(1.0), "x", vec![]).unwrap();
+        db.flush().unwrap();
+        c.write_state().unwrap().poisoned = Some("test".into());
+        assert!(matches!(
+            c.add(2, &v(2.0), "y", vec![]),
+            Err(ZenarError::PersistenceError(_))
+        ));
+        assert!(matches!(c.get(1), Err(ZenarError::PersistenceError(_))));
+        assert!(matches!(c.delete(1), Err(ZenarError::PersistenceError(_))));
+        assert!(matches!(
+            c.search(&v(1.0), 1, None),
+            Err(ZenarError::PersistenceError(_))
+        ));
+        drop(c);
+        drop(db);
+        // Reopening replays the durable state and clears the poison.
         let db = VectorDB::open(&dir).unwrap();
-        let c = db.create_collection("dup", Some(8), 4).unwrap();
-        c.add(1, &v(1.0), "a", vec![]).unwrap();
-        assert_eq!(
-            c.add(1, &v(1.0), "b", vec![]),
-            Err(ZenarError::DuplicateId(1))
-        );
-        let hits = c.search(&v(1.0), 5, None).unwrap();
-        assert_eq!(hits.len(), 1);
+        assert_eq!(db.get_collection("p").unwrap().count().unwrap(), 1);
         fs::remove_dir_all(&dir).ok();
     }
 }

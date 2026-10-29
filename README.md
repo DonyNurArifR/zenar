@@ -2,8 +2,7 @@
 
 Embedded, lightweight, high-performance vector database for Python — a Rust
 core built on [TurboVec](https://github.com/RyanCodrai/turbovec) for vector
-search and [SQLite](https://sqlite.org) (via rusqlite) for metadata/SQL
-filtering.
+search and a document log with in-memory indexes for metadata filtering.
 
 **Status: 0.1.0, not yet published.** The core, Python API, persistence and
 crash recovery are implemented and tested. Filtered search at 1M rows does not
@@ -32,7 +31,7 @@ Zenar (Rust, PyO3)
   +----------------------+
   |                       |
   v                       v
-TurboVec               SQLite
+TurboVec          doc log + indexes
 vectors / ANN          metadata / SQL
 ```
 
@@ -75,28 +74,29 @@ Measurements: [BENCHMARKS.md](BENCHMARKS.md).
 
 ## Project Status
 
-Implemented and tested (Rust: 41 unit and 11 integration tests, including a random-filter fuzz test and
-a concurrent read/write test; Python: 29 tests, including `kill -9` crash tests):
+Implemented and tested (Rust: 40 unit and 19 integration tests, including a reference-checked three-valued filter
+oracle, a model-based test with reopens, a random-filter fuzz test and a concurrent read/write test; Python: 41 tests,
+including repeated `kill -9` crash cycles):
 
-- Collections, add, get, delete, search, with the query planner and stale-ID handling.
+- Collections, add, add_many (atomic), delete, delete_many (atomic), get, search, with the query planner and stale-ID handling.
 - Typed metadata, the full filter operator set, NULL and type rules, tenant isolation.
-- Persistence, crash reconciliation, process locking, `flush()`.
+- A Zenar-owned document log with in-memory indexes; torn-tail and corruption handling; reconciliation on open.
+- Process locking, `flush()`, `durable=True`, and a poisoning rule for collections that cannot be made consistent.
 - `bit_width` and `calibrate()`.
 - Python bindings with a complete exception hierarchy, GIL release, numpy input, and a panic guard.
 
 Measured on the reference machine at 1M rows, dim 384 (BENCHMARKS.md):
 
-- Selective filters (0.1%) search in 0.34 ms. Unfiltered search is 1.2 ms. Reopen costs nothing extra.
-- Broad filters are the weak case. `tenant = A` (10%) takes 5.7 ms. A compound filter of non-selective
-  predicates takes 25 ms, because each candidate row is read from the table. This does not fully meet the design
-  spec's section 90 gate.
-- Ingest is 0.030 ms per row with `add_many` batches of 1000 (`add` one row at a time: 0.053 ms).
+- Ingest with `add_many`: 0.012 ms per row. One row at a time: 0.014 ms.
+- Unfiltered search: 1.2 ms. Reopened unfiltered search: 1.2 ms. Open (log replay): 0.8 s.
+- Selective filter (0.1%): 0.3 ms. Filter on 10% of rows: 3.7 ms. Compound filter (~4%): 15 ms.
 
-Not yet done:
+Not done:
 
 - **Cross-platform wheels and CI** are written (`.github/workflows/`) but have not run on GitHub or on every target.
-  Verified here: macOS arm64 only.
-- **Zenar-owned document store** (planned) for broad-filter performance and ingest speed.
+  Verified on this machine: macOS arm64 only.
+- **Power-loss behavior** is designed and tested only at the process level (`kill -9`). Real power-loss testing is not done.
+- **Compound filters** are the slowest case. Merging many postings is not tuned yet (BENCHMARKS.md, known gaps).
 
 ## Contributing
 
@@ -110,7 +110,6 @@ Zenar is dual-licensed under the MIT license
 with either one.
 
 Zenar's compiled distribution statically links [TurboVec](https://github.com/RyanCodrai/turbovec)
-(MIT), [rusqlite](https://github.com/rusqlite/rusqlite) (MIT) and the bundled
-[SQLite](https://sqlite.org) (public domain). Their license texts are reproduced in
-[THIRD_PARTY_NOTICES](THIRD_PARTY_NOTICES), as required by their terms. Zenar is not affiliated with
-any of these projects.
+(MIT). Its license text, and the license texts of every other shipped crate, are
+reproduced in [THIRD_PARTY_NOTICES](THIRD_PARTY_NOTICES), as required by their terms. Zenar is not affiliated
+with any of these projects.

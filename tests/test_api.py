@@ -196,7 +196,7 @@ def test_persistence_across_handles(tmp_path):
     with VectorDB(path) as db:
         c = db.get_collection("p")
         assert c.get(7)["text"] == "kept"
-        assert db.recovery_report()["rolled_back_pending"] == 0
+        assert db.recovery_report()["orphaned_rows_removed"] == 0
 
 
 def test_second_handle_is_locked(tmp_path):
@@ -251,7 +251,7 @@ def test_kill_minus_9_mid_write_leaves_consistent_database(tmp_path):
         assert len(hits) == ready, "a READY row was not searchable after recovery"
         # Rows added after the last sync boundary may be lost; the repair is reported.
         report = db.recovery_report()
-        assert report["rolled_back_pending"] >= 0
+        assert report["orphaned_rows_removed"] >= 0
 
 
 def test_flush_makes_adds_survive_kill_minus_9(tmp_path):
@@ -370,3 +370,50 @@ def test_add_many_accepts_numpy_vectors(db):
     c = db.create_collection("npmany", dimension=8)
     rows = [{"id": i, "vector": np.full(8, i + 1, dtype=np.float32), "text": "x"} for i in range(5)]
     assert c.add_many(rows) == 5
+
+
+def test_delete_many_is_atomic(db):
+    c = db.create_collection("dm", dimension=8)
+    c.add_many([{"id": i, "vector": [float(i + 1)] * 8, "text": f"t{i}"} for i in range(10)])
+    with pytest.raises(zenar.VectorNotFoundError):
+        c.delete_many([1, 2, 77])
+    assert c.count() == 10
+    assert c.delete_many([1, 2, 3]) == 3
+    assert c.count() == 7
+    assert c.get(2) is None
+
+
+def test_repeated_kill_minus_9_cycles_stay_consistent(tmp_path):
+    """Several crash-and-restart cycles on one database. After each restart, the live count
+    must match the searchable documents, and flushed batches must still be there."""
+    path = str(tmp_path / "cycles")
+    flushed_total = 0
+    for cycle in range(3):
+        writer = textwrap.dedent(
+            f"""
+            import numpy as np
+            from zenar import VectorDB
+            db = VectorDB({path!r})
+            c = db.get_collection("cy") if "cy" in db.list_collections() else db.create_collection("cy", dimension=32)
+            rng = np.random.default_rng({cycle})
+            base = c.count()
+            batch = 0
+            while True:
+                rows = [{{"id": base + batch * 50 + j + {cycle} * 1000000, "vector": rng.standard_normal(32).astype(np.float32), "text": "row", "metadata": {{"cycle": {cycle}}}}} for j in range(50)]
+                c.add_many(rows)
+                db.flush()
+                batch += 1
+            """
+        )
+        proc = subprocess.Popen([sys.executable, "-c", writer])
+        time.sleep(1.5)
+        proc.kill()
+        proc.wait()
+
+        with VectorDB(path) as db:
+            c = db.get_collection("cy")
+            live = c.count()
+            assert live >= flushed_total, "a flushed batch disappeared"
+            hits = c.search(np.ones(32, dtype=np.float32), top_k=max(live, 1))
+            assert len(hits) == live, f"cycle {cycle}: {live} live but {len(hits)} searchable"
+            flushed_total = live

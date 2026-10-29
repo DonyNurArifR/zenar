@@ -14,14 +14,14 @@ with VectorDB("./data") as db:                       # flushes and releases the 
 
 | Method | Notes |
 |---|---|
-| `VectorDB(path, durable=False)` | Opens or creates a database directory. Raises `DatabaseLockedError` if already open. `durable=True` fsyncs every metadata commit (slower ingest). |
+| `VectorDB(path, durable=False)` | Opens or creates a database directory. Raises `DatabaseLockedError` if already open. `durable=True` syncs the index and the document log on every add. Power-safe per add, at about 7 ms per row. Use `add_many` batches instead when you can. |
 | `create_collection(name, dimension=None, bit_width=4)` | `dimension=None` is inferred from the first `add`. `bit_width` is 2, 3 or 4. |
 | `get_collection(name)` / `list_collections()` | |
 | `drop_collection(name)` | Deletes documents and the vector file. |
 | `rebuild(name)` | Re-runs crash reconciliation for one collection and rewrites its index file. Returns the repair counts. |
 | `recovery_report()` | Repairs made when the database was opened. |
 | `stats()` | Per-collection row counts. |
-| `flush()` | Makes every add made before it returns durable: index synced, WAL checkpointed. Survives a process crash and a power loss. Adds made after the last `flush()` need `durable=True` for power-loss safety (see [STORAGE.md](STORAGE.md)). |
+| `flush()` | Syncs the index and the document log of every collection. Every add made before it returns survives a process crash and a power loss. |
 | `close()` / `with` | Flushes and releases the lock. |
 
 ## Collection
@@ -32,6 +32,7 @@ with VectorDB("./data") as db:                       # flushes and releases the 
 | `add_many(records)` | Each record is a dict with `id`, `vector`, `text`, optional `metadata`. **Atomic:** every record is validated first, then all are written in one transaction. If any record fails, none is added. Returns the count. Use this for ingest: it is about 1.8x faster than a loop of `add`. |
 | `get(id)` / `get_many(ids)` | Return dicts `{id, text, metadata}`, or `None` / skipped ids. Vectors are not returned. |
 | `delete(id)` | Removes the vector from the index and syncs before returning. Raises `VectorNotFoundError` if absent. |
+| `delete_many(ids)` | Deletes many ids atomically with one index sync and one log sync: all of them are deleted, or none is. Use this for bulk deletes. |
 | `search(vector, top_k=10, filter=None, **equality)` | Returns `[{id, score, text, metadata}]`, best first. |
 | `count()`, `stats()`, `dimension`, `bit_width` | |
 | `calibrate(sample)` | Fits the quantizer from a flat sample of `n * dimension` floats. See below. |

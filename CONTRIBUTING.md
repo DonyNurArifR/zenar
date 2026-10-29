@@ -29,5 +29,5 @@ The Python binding needs an interpreter (3.10 or newer) at build time. Point PyO
   against the allowlist before use.
 - Changes to the write path need a crash test (see STORAGE.md).
 - Changes that affect performance need a `bench` or `filter_probe` run recorded in BENCHMARKS.md.
-- TurboVec is pinned with `=`. rusqlite is pinned in `Cargo.lock`. Upgrading either means re-running the Rust and
+- TurboVec is pinned with `=`. Upgrading it means re-running the Rust and
   Python test suites and the benchmarks.
