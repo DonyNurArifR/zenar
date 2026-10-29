@@ -351,22 +351,42 @@ impl MetadataStore {
         if ids.is_empty() {
             return Ok(Vec::new());
         }
+        // Small sets: one `id = $1` query per id. Large sets: chunked IN lists.
+        // In Stoolap 0.4, an IN list on the primary key scans the table after a reopen,
+        // while equality uses the index. A scan costs about the same whatever the list
+        // length, so past a few dozen ids one scan per chunk is cheaper. See BENCHMARKS.md.
+        const PER_ID_MAX: usize = 32;
+        const IN_CHUNK: usize = 256;
         let mut columns = vec!["id".to_string(), "text".to_string()];
         columns.extend(fields.iter().map(|(n, _)| format!("\"{n}\"")));
-        let placeholders: Vec<String> = (1..=ids.len()).map(|i| format!("${i}")).collect();
-        let sql = format!(
-            "SELECT {} FROM {table} WHERE status = 'READY' AND id IN ({})",
-            columns.join(", "),
-            placeholders.join(", ")
-        );
-        let params = ids
-            .iter()
-            .map(|id| stoolap::Value::integer(*id as i64))
-            .collect();
-        let rows = self.query_rows(&sql, params)?;
-        rows.iter()
-            .map(|row| document_from_row(row, fields))
-            .collect()
+        let columns = columns.join(", ");
+        let mut docs = Vec::with_capacity(ids.len());
+        if ids.len() <= PER_ID_MAX {
+            let sql = format!("SELECT {columns} FROM {table} WHERE status = 'READY' AND id = $1");
+            for id in ids {
+                let rows = self.query_rows(&sql, vec![stoolap::Value::integer(*id as i64)])?;
+                for row in &rows {
+                    docs.push(document_from_row(row, fields)?);
+                }
+            }
+        } else {
+            for chunk in ids.chunks(IN_CHUNK) {
+                let placeholders: Vec<String> =
+                    (1..=chunk.len()).map(|i| format!("${i}")).collect();
+                let sql = format!(
+                    "SELECT {columns} FROM {table} WHERE status = 'READY' AND id IN ({})",
+                    placeholders.join(", ")
+                );
+                let params = chunk
+                    .iter()
+                    .map(|id| stoolap::Value::integer(*id as i64))
+                    .collect();
+                for row in &self.query_rows(&sql, params)? {
+                    docs.push(document_from_row(row, fields)?);
+                }
+            }
+        }
+        Ok(docs)
     }
 
     /// Every id in the table regardless of status (recovery, spec section 26).
@@ -518,5 +538,32 @@ mod tests {
         assert!(!is_valid_field_name("id"));
         assert!(!is_valid_field_name("1abc"));
         assert!(!is_valid_field_name("a-b"));
+    }
+
+    /// Both hydration paths (per-id and chunked IN) must return every READY row exactly once.
+    #[test]
+    fn fetch_crosses_per_id_and_chunked_paths() {
+        let store = MetadataStore::open_in_memory().unwrap();
+        let table = MetadataStore::table_name("hydrate");
+        store.create_document_table(&table).unwrap();
+        for id in 0..600u64 {
+            store
+                .insert_document(&table, id, &format!("doc {id}"), Status::Ready, &[])
+                .unwrap();
+        }
+        // A PENDING row must never be returned.
+        store
+            .insert_document(&table, 1000, "pending", Status::Pending, &[])
+            .unwrap();
+        for n in [1usize, 32, 33, 256, 257, 600] {
+            let ids: Vec<u64> = (0..n as u64).collect();
+            let docs = store.fetch_documents(&table, &[], &ids).unwrap();
+            assert_eq!(docs.len(), n, "wrong count for {n} ids");
+            let mut seen: Vec<u64> = docs.iter().map(|d| d.id).collect();
+            seen.sort();
+            assert_eq!(seen, ids);
+        }
+        let pending = store.fetch_documents(&table, &[], &[1000]).unwrap();
+        assert!(pending.is_empty());
     }
 }

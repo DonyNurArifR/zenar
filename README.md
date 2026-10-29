@@ -86,11 +86,11 @@ a concurrent read/write test; Python: 29 tests, including `kill -9` crash tests)
 
 Not yet passed:
 
-- **Reopen blocker (production).** After a reopen, metadata lookups for search results scan the table in
-  Stoolap 0.4. At 1M rows, that is ~46 ms per query. The reproduction and options are in BENCHMARKS.md.
-  This needs a decision before Zenar can be called production-ready on large collections.
-- **Filtered-search performance gate.** At 1M rows and 10% selectivity, filtered search takes ~46 ms,
-  against ~1.2 ms unfiltered. Stoolap's candidate query is ~95% of that. See BENCHMARKS.md.
+- **Reopen lookups (fixed in part).** Result hydration after a reopen used an `IN` list that Stoolap 0.4
+  scans. It now uses per-id lookups. Unfiltered search at 1M rows after reopen is ~12 ms (was ~57). Each lookup
+  still costs ~1 ms, and the cause is not confirmed. See BENCHMARKS.md.
+- **Filtered-search performance gate.** At 1M rows and 10% selectivity, filtered search takes ~32 ms after
+  reopen (~46 ms in-process), against ~1.2 ms unfiltered. Stoolap's candidate query is ~95% of that. See BENCHMARKS.md.
 - **Cross-platform wheels and CI** are written (`.github/workflows/`) but have not been run on
   every target. The MSRV is 1.90, not 1.89 as first planned.
 

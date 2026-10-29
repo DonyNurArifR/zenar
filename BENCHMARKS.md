@@ -36,41 +36,32 @@ Measured right after ingest, in the same process. The database is fresh, so the 
 
 The compound filter is `tenant = A AND category IN (faq, product) AND price >= 100`.
 
-## Reopen blocker: metadata lookups slow down after the database is reopened
+## Reopen: metadata lookups after reopen (fixed in part)
 
-**This blocks production use on large collections.** Search latency after `VectorDB.open()` on an existing
-database is dominated by the metadata fetch for the top-K results (`WHERE status = 'READY' AND id IN (...)`).
+After `VectorDB.open()` on an existing database, search latency was dominated by the metadata fetch for the top-K
+results. The cause, measured in this round:
 
-Measured with `examples/fetch_probe.rs`: a `MetadataStore` fetch of 10 random ids, on an existing database
-in a fresh process, with no other work:
+- Stoolap 0.4 does not use the primary-key index for an `id IN (...)` list (parameterized or literal). It scans
+  the table. Latency grows linearly with rows: 1.5 ms at 10K, 7.6 ms at 100K, 46 ms at 1M for 10 ids.
+- Stoolap does use the index for `id = $1`. Ten single-id queries took ~10 ms at 1M, where one IN query took ~47 ms.
+- In a process that ingested the data, the same IN lookup is fast. The scan problem appears only on a reopened table.
 
-| Rows | Fetch, 10 random ids | Fetch, 10 ids spaced 1000 apart |
+Fix: `MetadataStore::fetch_documents` runs one prepared `id = $1` query per id for up to 32 ids, and chunked
+IN lists (256 ids per query) above that. A scan costs about the same whatever the list length, so past a few dozen
+ids a scan per chunk is cheaper than one lookup per id.
+
+Reopened database, fresh process, 1M rows, dim 384, top-10, 200 queries (`examples/reopen_bench.rs`):
+
+| Case | Before (IN list) | After (per-id) |
 |---|---|---|
-| 10,000 | 1.5 ms | — |
-| 100,000 | 7.6 ms | — |
-| 1,000,000 | 46 ms | 1.4 ms |
+| Unfiltered search | 57 ms (p50, measured earlier) | 12.2 / 16.4 / 20.2 ms |
+| `tenant = A` (10%) | not measured on reopen | 32.5 / 33.4 / 34.3 ms |
 
-Latency grows linearly with row count, which means a full scan per fetch. Spaced ids were fast only because
-their matches sit near the start of the table, so the scan stopped early.
+Open with reconciliation: 0.34 s for 1M rows.
 
-- The same random lookup on a table created in the same process is about 0 ms at 1M rows.
-- A reopened `VectorDB` made 1M-row unfiltered search take ~57 ms per query in a fresh process
-  (compare 1.2 ms in the process that ingested).
-- Adding `CREATE INDEX ... (id)` on the reopened table changed 100K lookups from 7.8 to 5.4 ms. That is not a fix.
-- Writing a Stoolap snapshot before close did not change the reopen cost.
-- The `PkIndex` is a virtual index that Stoolap registers when a table loads (`src/storage/mvcc/engine.rs`).
-  The cause is probably in how that index is populated on reload. This was not confirmed.
-
-Reproduce: `cargo run --release -p zenar-core --example bench -- 1000000 384` (creates the data), then
-`cargo run --release -p zenar-core --example fetch_probe -- target/bench-data/1000000-384 1000000`.
-
-Options, for a decision:
-
-1. Report to Stoolap with this reproduction, and wait for a fix. Zenar's design does not change.
-2. Keep the documents and metadata in a Zenar-owned store (for example a log file plus an in-memory id index
-   rebuilt on open). Stoolap would then serve only collection config. This changes the design in
-   `ZENAR_TECHNICAL_DESIGN_SPECIFICATION.md` (sections 4.2 and 19) and the recovery story.
-3. Switch the metadata engine to SQLite (rusqlite). This is spec section 91's fallback. It changes the dependency and the license set.
+Remaining cost: each reopened `id = $1` lookup still takes ~1 ms. An in-process table takes ~0.005 ms. The cause is
+not confirmed. It may be per-query overhead on reopened tables. Reproduce with `bench 1000000 384`, then
+`reopen_bench target/bench-data/1000000-384 1000000 384`.
 
 ## Filtered-search gate (design spec section 90): **not passed**
 

@@ -330,10 +330,14 @@ fn concurrent_writes_and_filtered_reads_stay_consistent() {
     let dir = temp_dir("concurrent");
     let db = VectorDB::open(&dir).unwrap();
     let c = db.create_collection("conc", Some(8), 4).unwrap();
+    // The first add locks the metadata schema. Filtering on `tenant` before that is an
+    // InvalidFilter error by design, so the readers start after the schema exists.
+    c.add(0, &[1.0; 8], "doc 0", vec![("tenant".into(), text("A"))])
+        .unwrap();
     let writer = Arc::clone(&c);
 
     let w = thread::spawn(move || {
-        for id in 0..1500u64 {
+        for id in 1..1500u64 {
             let tenant = if id % 2 == 0 { "A" } else { "B" };
             let v: Vec<f32> = (0..8).map(|j| ((id + j) % 11) as f32 + 0.5).collect();
             writer
@@ -374,5 +378,22 @@ fn concurrent_writes_and_filtered_reads_stay_consistent() {
         r.join().unwrap();
     }
     assert_eq!(c.count().unwrap(), 1500);
+    fs::remove_dir_all(&dir).ok();
+}
+
+/// Before any add carries metadata, a filter on a field is an error, not an empty result.
+#[test]
+fn filter_before_schema_exists_is_an_error() {
+    let dir = temp_dir("preschema");
+    let db = VectorDB::open(&dir).unwrap();
+    let c = db.create_collection("pre", Some(8), 4).unwrap();
+    let f = Filter::Eq {
+        field: "tenant".into(),
+        value: text("A"),
+    };
+    assert!(matches!(
+        c.search(&[1.0; 8], 5, Some(&f)),
+        Err(ZenarError::InvalidFilter(_))
+    ));
     fs::remove_dir_all(&dir).ok();
 }
