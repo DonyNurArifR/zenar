@@ -1,0 +1,28 @@
+[build-system]
+requires = ["maturin>=1.7,<2.0"]
+build-backend = "maturin"
+
+[project]
+name = "zenar"
+version = "0.1.0"
+description = "Embedded vector database with typed metadata filtering (TurboVec + Stoolap)"
+readme = "README.md"
+license = { text = "MIT OR Apache-2.0" }
+requires-python = ">=3.10"
+classifiers = [
+    "Programming Language :: Rust",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+]
+
+[project.optional-dependencies]
+test = ["pytest>=8", "numpy>=1.24"]
+
+[tool.maturin]
+manifest-path = "crates/zenar-python/Cargo.toml"
+module-name = "zenar._zenar"
+python-source = "python"
+features = ["extension-module"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

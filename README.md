@@ -5,8 +5,9 @@ core built on [TurboVec](https://github.com/RyanCodrai/turbovec) for vector
 search and [Stoolap](https://github.com/stoolap/stoolap) for metadata/SQL
 filtering.
 
-**Status: pre-alpha.** Not yet installable, not yet functional. See
-[Project Status](#project-status).
+**Status: 0.1.0, not yet published.** The core, Python API, persistence and
+crash recovery are implemented and tested. Filtered search at 1M rows does not
+yet meet its performance target. See [Project Status](#project-status).
 
 ## Why Zenar
 
@@ -40,50 +41,62 @@ integration layer over two purpose-built Rust crates, plus the coordination
 logic (ID mapping, consistency, query planning) needed to make them behave
 like one database.
 
-## Target API
+## Usage
 
-This is the API Zenar is being built toward — shown so it's clear what shape
-the project is aiming for. **Not runnable yet.**
+Build the extension from a checkout (PyPI wheels come with the first release):
 
-```python
-from zenar import VectorDB
-
-db = VectorDB("./my_vectors")
-
-docs = db.create_collection("documents")  # dimension inferred from your first add()
-
-docs.add(
-    id=1,
-    vector=embedding,
-    text="Hello world",
-    metadata={"tenant": "A", "category": "faq"},
-)
-
-results = docs.search(query_embedding, top_k=5, tenant="A")
+```sh
+python -m venv .venv && . .venv/bin/activate
+pip install maturin pytest numpy
+maturin develop --release
 ```
 
-No dimension to look up or configure — `create_collection` learns it from
-whatever your first `add()` stores. Pass `dimension=1536` explicitly if you'd
-rather have that locked in upfront.
-
-Filtering has two layers: plain keyword arguments for simple equality (no
-import needed, as above), and `field` objects with real Python operators for
-anything else — comparisons, OR, NOT:
-
 ```python
-from zenar import field as f
+from zenar import VectorDB, field as f
 
-results = docs.search(
-    query_embedding,
-    top_k=5,
-    filter=(f.price >= 100) & ((f.category == "faq") | (f.category == "product")),
-)
+with VectorDB("./my_vectors") as db:
+    docs = db.create_collection("documents", dimension=3)
+
+    docs.add(id=1, vector=[1.0, 0.0, 0.0], text="Hello world",
+             metadata={"tenant": "A", "category": "faq", "price": 150.0})
+
+    docs.search([1.0, 0.0, 0.0], top_k=5, tenant="A")                  # keyword equality
+    docs.search([1.0, 0.0, 0.0], top_k=5,
+                filter=(f.price >= 100) & ((f.category == "faq") | (f.category == "product")))
 ```
+
+- `dimension` is optional. Omit it and Zenar takes it from the first `add()`.
+- Dimensions that are not multiples of 8 are accepted. Zenar pads them internally, and scores are unchanged.
+- Every comparison in a `filter=` expression must be parenthesized when combined with `&`, `|`, `~`.
+
+Full reference: [API.md](API.md). Filter semantics: [FILTERING.md](FILTERING.md).
+Durability and recovery: [STORAGE.md](STORAGE.md). Design: [ARCHITECTURE.md](ARCHITECTURE.md).
+Measurements: [BENCHMARKS.md](BENCHMARKS.md).
 
 ## Project Status
 
-Zenar is in early development. Nothing is published to PyPI or crates.io
-yet, and the core add/search path isn't wired up. Not ready for use.
+Implemented and tested (Rust: 41 unit and 11 integration tests, including a random-filter fuzz test and
+a concurrent read/write test; Python: 29 tests, including `kill -9` crash tests):
+
+- Collections, add, get, delete, search, with the query planner and stale-ID handling.
+- Typed metadata, the full filter operator set, NULL and type rules, tenant isolation.
+- Persistence, crash reconciliation, process locking, `flush()`.
+- `bit_width` and `calibrate()`.
+- Python bindings with a complete exception hierarchy, GIL release, numpy input, and a panic guard.
+
+Not yet passed:
+
+- **Reopen blocker (production).** After a reopen, metadata lookups for search results scan the table in
+  Stoolap 0.4. At 1M rows, that is ~46 ms per query. The reproduction and options are in BENCHMARKS.md.
+  This needs a decision before Zenar can be called production-ready on large collections.
+- **Filtered-search performance gate.** At 1M rows and 10% selectivity, filtered search takes ~46 ms,
+  against ~1.2 ms unfiltered. Stoolap's candidate query is ~95% of that. See BENCHMARKS.md.
+- **Cross-platform wheels and CI** are written (`.github/workflows/`) but have not been run on
+  every target. The MSRV is 1.90, not 1.89 as first planned.
+
+## Contributing
+
+See [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## License
 
@@ -97,8 +110,3 @@ Zenar's compiled distribution statically links [TurboVec](https://github.com/Rya
 full license texts are reproduced in [THIRD_PARTY_NOTICES](THIRD_PARTY_NOTICES),
 as required by their own license terms. Zenar is not affiliated with either
 project.
-
-## Contributing
-
-Not yet set up for external contributions — this will change as the core
-API stabilizes.
