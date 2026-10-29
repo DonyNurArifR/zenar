@@ -4,11 +4,12 @@
 
 ```text
 <root>/LOCK                 advisory lock, held while the database is open
-<root>/metadata.db          Stoolap: collection config, document text, metadata
+<root>/metadata.db          SQLite (WAL mode): collection config, document text, metadata
+<root>/metadata.db-wal      SQLite write-ahead log (exists while the database is open)
 <root>/vectors/<name>.tvim  TurboVec index for each collection
 ```
 
-Stoolap is the source of truth for documents and for recovery. TurboVec holds the vectors. Stoolap stores
+SQLite is the source of truth for documents and for recovery. TurboVec holds the vectors. SQLite stores
 no vectors, so **a lost index file cannot be rebuilt by Zenar**. Its vectors must be re-added from your
 source data.
 
@@ -17,10 +18,9 @@ source data.
 Two layers:
 
 1. **Zenar `LOCK`** (exclusive `flock`) is held for the lifetime of a `VectorDB` handle. A second open,
-   in this process or another, raises `DatabaseLockedError`. This protects the vector files, which sit outside
-   Stoolap's lock.
-2. **Stoolap's own file lock** on `metadata.db`. Measured with `examples/stoolap_probe.rs`: a second process
-   opening the same file gets `database is locked by another process`.
+   in this process or another, raises `DatabaseLockedError`. This covers the vector files, which SQLite does not
+   protect.
+2. **SQLite's own locking** on `metadata.db`. It serializes writers, and readers in WAL mode do not block the writer.
 
 ## Ingest order
 
@@ -30,8 +30,8 @@ For each `add`:
 2. At each sync boundary (every 1000 adds), sync the index file. If the sync fails, the vector is removed again.
 3. Insert the document row with status `READY`.
 
-The row is written after the vector, so no UPDATE is needed per add. Stoolap is MVCC, and an UPDATE per row
-measurably slows every later scan (see BENCHMARKS.md). The consequences of a crash at each point:
+The row is written once, after the vector. The order matters for crash recovery. The consequences of a crash
+at each point:
 
 - Before step 2's sync: the vector is lost with the process. There is no row. Nothing to repair.
 - After the sync, before step 3: a vector with no row. Recovery removes it.
@@ -54,20 +54,20 @@ A deleted vector is therefore never on disk once `delete` returns. This is the c
 | Operation | Durability |
 |---|---|
 | `add` | Index synced every `SYNC_INTERVAL` (1000) adds. Adds since the last sync can be lost on crash. |
-| `flush()` | Syncs the index. Every add made before `flush()` returns survives a process crash (kill -9, panic, OOM). It survives a power loss only with `durable=True` (see below). |
-| `delete` | Index synced before return. Durable. |
-| Metadata commits | `MetadataSync::Normal` (default): WAL is not fsynced per commit. `MetadataSync::Full` / `durable=True`: fsync per commit. |
+| `flush()` | Syncs every index file and runs `PRAGMA wal_checkpoint(FULL)`. Every add made before `flush()` returns survives a process crash **and** a power loss. |
+| `delete` | Index synced before return. Durable against process crash. Power loss: see below. |
+| Metadata commits | `MetadataSync::Normal` (default): `synchronous=NORMAL`. A WAL checkpoint fsyncs. `Full` / `durable=True`: `synchronous=FULL`, fsync per commit. |
 
-With `Normal`, recent metadata commits can be lost on power failure. Stoolap 0.4 has no durability barrier
-that `flush()` could call. `create_snapshot` writes backup files and does not commit the WAL. Reconciliation still
-produces a consistent state, because every combination of a lost recent commit is one recovery already repairs
-(see below). So:
+With `Normal`, commits after the last checkpoint can be lost on power failure. Reconciliation still gives a
+consistent state (see below). Acknowledged adds are power-safe after `flush()`. Without `flush()`, use
+`durable=True` if power-loss durability of every add matters.
 
-- Process crash: adds covered by `flush()` survive, with either setting.
-- Power loss: use `durable=True`. Otherwise acknowledged adds may be dropped, though the database stays consistent.
+A delete with `Normal` can also come back after power loss. The index file was synced, so the vector is gone. On
+reopen, the row that survived is a `READY` row with no vector, and recovery removes it. The document does not come
+back.
 
-Measured cost (dim 384, `examples/bench.rs`): `Normal` ingests at 0.013 ms/row at 1M rows. `Full` took
-15.9 ms/row at 10K rows with batched index sync, and 19.9 ms/row with a sync per add. Both are roughly 600-1100x slower than `Normal`.
+Measured cost (dim 384, 1M rows, `examples/bench.rs`): `Normal` ingests at 0.053 ms/row on SQLite. Stoolap's per-commit fsync
+made `Full` roughly 600-1100x slower on that backend. See BENCHMARKS.md.
 
 ## Recovery on open
 

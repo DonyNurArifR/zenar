@@ -35,9 +35,9 @@ impl FieldKind {
         match self {
             FieldKind::Text => "TEXT",
             FieldKind::Integer => "INTEGER",
-            FieldKind::Float => "FLOAT",
-            FieldKind::Boolean => "BOOLEAN",
-            FieldKind::Timestamp => "TIMESTAMP",
+            FieldKind::Float => "REAL",
+            FieldKind::Boolean => "INTEGER",
+            FieldKind::Timestamp => "INTEGER",
         }
     }
 
@@ -69,29 +69,36 @@ impl FieldKind {
 }
 
 impl MetaValue {
-    /// Converts to a Stoolap bound parameter. Values are always bound, never
-    /// interpolated into SQL (spec section 11).
-    pub fn to_sql(&self) -> stoolap::Value {
+    /// Converts to a bound SQLite parameter. Values are always bound, never
+    /// interpolated into SQL (spec section 11). Booleans are stored as 0/1, and
+    /// timestamps as UTC microseconds since the epoch, so both keep their ordering.
+    pub fn to_sql(&self) -> rusqlite::types::Value {
+        use rusqlite::types::Value as Sql;
         match self {
-            MetaValue::Text(s) => stoolap::Value::text(s.clone()),
-            MetaValue::Integer(i) => stoolap::Value::integer(*i),
-            MetaValue::Float(f) => stoolap::Value::float(*f),
-            MetaValue::Boolean(b) => stoolap::Value::boolean(*b),
-            MetaValue::Timestamp(t) => stoolap::Value::timestamp(*t),
+            MetaValue::Text(s) => Sql::Text(s.clone()),
+            MetaValue::Integer(i) => Sql::Integer(*i),
+            MetaValue::Float(f) => Sql::Real(*f),
+            MetaValue::Boolean(b) => Sql::Integer(i64::from(*b)),
+            MetaValue::Timestamp(t) => Sql::Integer(t.timestamp_micros()),
         }
     }
 
     /// Reads a stored value back. `None` means SQL NULL.
-    pub fn from_sql(kind: FieldKind, value: &stoolap::Value) -> Option<Self> {
-        if value.is_null() {
-            return None;
-        }
-        match kind {
-            FieldKind::Text => value.as_string().map(MetaValue::Text),
-            FieldKind::Integer => value.as_int64().map(MetaValue::Integer),
-            FieldKind::Float => value.as_float64().map(MetaValue::Float),
-            FieldKind::Boolean => value.as_boolean().map(MetaValue::Boolean),
-            FieldKind::Timestamp => value.as_timestamp().map(MetaValue::Timestamp),
+    pub fn from_sql(kind: FieldKind, value: rusqlite::types::ValueRef<'_>) -> Option<Self> {
+        use rusqlite::types::ValueRef;
+        match (kind, value) {
+            (_, ValueRef::Null) => None,
+            (FieldKind::Text, ValueRef::Text(b)) => {
+                Some(MetaValue::Text(String::from_utf8_lossy(b).into_owned()))
+            }
+            (FieldKind::Integer, ValueRef::Integer(i)) => Some(MetaValue::Integer(i)),
+            (FieldKind::Float, ValueRef::Real(f)) => Some(MetaValue::Float(f)),
+            (FieldKind::Float, ValueRef::Integer(i)) => Some(MetaValue::Float(i as f64)),
+            (FieldKind::Boolean, ValueRef::Integer(i)) => Some(MetaValue::Boolean(i != 0)),
+            (FieldKind::Timestamp, ValueRef::Integer(us)) => {
+                chrono::DateTime::from_timestamp_micros(us).map(MetaValue::Timestamp)
+            }
+            _ => None,
         }
     }
 }

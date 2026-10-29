@@ -131,11 +131,10 @@ impl Collection {
         } else {
             state.unsynced += 1;
         }
-        // The row is written only after the vector is in the index. The order is
-        // chosen to avoid an UPDATE per add, which costs Stoolap MVCC versions on
-        // every scan. A crash before the row exists leaves a stray vector, and
-        // recovery removes it. A crash after the row exists but before the sync leaves
-        // a READY row with no vector, and recovery removes that too.
+        // The row is written once, after the vector is in the index, so there is no
+        // UPDATE per add. A crash before the row exists leaves a stray vector, and
+        // recovery removes it. A crash after the row exists but before the next index
+        // sync leaves a READY row with no vector, and recovery removes that too.
         if let Err(e) = self
             .meta
             .insert_document(&self.table, id, text, Status::Ready, &values)

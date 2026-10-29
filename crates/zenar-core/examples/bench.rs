@@ -120,4 +120,11 @@ fn main() {
         },
     ]);
     report("search, compound filter", time_queries(Some(&compound)));
+
+    // price = 5: 0.1% selectivity, the case an index should help most.
+    let selective = Filter::Eq {
+        field: "price".into(),
+        value: MetaValue::Float(5.0),
+    };
+    report("search, price = 5 (0.1%)", time_queries(Some(&selective)));
 }

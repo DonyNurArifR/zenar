@@ -542,7 +542,7 @@ impl PyVectorDB {
 #[pymethods]
 impl PyVectorDB {
     /// `durable=True` fsyncs every metadata commit (slower ingest). The default is
-    /// faster. `flush()` protects against process crashes; power loss needs `durable=True`.
+    /// faster. `flush()` makes everything before it durable, including on power loss.
     #[new]
     #[pyo3(signature = (path, durable=false))]
     fn new(py: Python<'_>, path: &str, durable: bool) -> PyResult<Self> {

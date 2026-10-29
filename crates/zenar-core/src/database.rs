@@ -11,14 +11,14 @@ use crate::storage::{VectorStore, validate_dimension};
 /// Bit widths TurboVec supports (spec section 88).
 const BIT_WIDTHS: [usize; 3] = [2, 3, 4];
 
-/// How hard Stoolap fsyncs metadata commits (spec section 86).
+/// How hard the metadata store fsyncs commits (spec section 86).
 ///
 /// * `Normal` (default): WAL is not fsynced on every commit. Adds are fast.
 ///   Recent commits can be lost on power failure, but reconciliation on open
-///   brings metadata and vectors back into agreement. Call `flush()` to make
-///   acknowledged adds survive a process crash. Power loss needs `Full`.
-/// * `Full`: fsync on every commit. Roughly 600x slower ingest at 384 dims on
-///   the reference Mac, measured by `examples/bench.rs`.
+///   brings metadata and vectors back into agreement. `flush()` makes every earlier
+///   add durable, including on power loss. Adds after the last flush need `Full` for that.
+/// * `Full`: fsync on every commit. Every add is power-safe on return, at a lower
+///   ingest rate (see BENCHMARKS.md).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum MetadataSync {
     #[default]
@@ -26,21 +26,12 @@ pub enum MetadataSync {
     Full,
 }
 
-impl MetadataSync {
-    fn dsn_mode(self) -> &'static str {
-        match self {
-            MetadataSync::Normal => "normal",
-            MetadataSync::Full => "full",
-        }
-    }
-}
-
 /// An embedded, single-writer Zenar database rooted at a directory.
 ///
 /// Layout:
 /// ```text
 /// <root>/LOCK              advisory lock held while the database is open
-/// <root>/metadata.db       Stoolap: collection config, documents, metadata
+/// <root>/metadata.db       SQLite (WAL): collection config, documents, metadata
 /// <root>/vectors/<c>.tvim  TurboVec index per collection
 /// ```
 pub struct VectorDB {
@@ -61,22 +52,11 @@ impl VectorDB {
 
     pub fn open_with(path: impl AsRef<Path>, sync: MetadataSync) -> Result<Self, ZenarError> {
         let root = absolute(path.as_ref())?;
-        // The path is embedded in a Stoolap DSN, where these characters are syntax.
-        let text = root.to_string_lossy();
-        if text.contains(['?', '#', '&']) {
-            return Err(ZenarError::InvalidArgument(format!(
-                "database path {text:?} may not contain '?', '#' or '&'"
-            )));
-        }
         fs::create_dir_all(root.join("vectors")).map_err(io_err)?;
         let lock = acquire_lock(&root)?;
 
-        let dsn = format!(
-            "file://{}/metadata.db?sync_mode={}",
-            root.display(),
-            sync.dsn_mode()
-        );
-        let meta = Arc::new(MetadataStore::open(&dsn)?);
+        let durable = sync == MetadataSync::Full;
+        let meta = Arc::new(MetadataStore::open(&root.join("metadata.db"), durable)?);
 
         let mut collections = HashMap::new();
         let mut recovery = RecoveryReport::default();
@@ -194,7 +174,9 @@ impl VectorDB {
             .values()
             .cloned()
             .collect();
-        collections.iter().try_for_each(|c| c.flush())
+        collections.iter().try_for_each(|c| c.flush())?;
+        // The index files are synced above. This checkpoint makes the metadata rows durable too.
+        self.meta.checkpoint()
     }
 
     /// Deletes a collection, its documents and its vector file.
@@ -285,7 +267,7 @@ mod tests {
     }
 
     #[test]
-    fn path_with_spaces_works_and_dsn_metacharacters_are_rejected() {
+    fn path_with_spaces_and_metacharacters_works() {
         let dir = std::env::temp_dir().join(format!("zenar space {}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         {
@@ -295,11 +277,10 @@ mod tests {
         }
         assert!(VectorDB::open(&dir).is_ok());
         fs::remove_dir_all(&dir).ok();
-        let bad = std::env::temp_dir().join(format!("zenar?bad{}", std::process::id()));
-        assert!(matches!(
-            VectorDB::open(&bad),
-            Err(ZenarError::InvalidArgument(_))
-        ));
+        let odd = std::env::temp_dir().join(format!("zenar ?#&{}", std::process::id()));
+        let _ = fs::remove_dir_all(&odd);
+        assert!(VectorDB::open(&odd).is_ok());
+        fs::remove_dir_all(&odd).ok();
     }
 
     #[test]

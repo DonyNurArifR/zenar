@@ -21,7 +21,7 @@ with VectorDB("./data") as db:                       # flushes and releases the 
 | `rebuild(name)` | Re-runs crash reconciliation for one collection and rewrites its index file. Returns the repair counts. |
 | `recovery_report()` | Repairs made when the database was opened. |
 | `stats()` | Per-collection row counts. |
-| `flush()` | Makes acknowledged adds survive a process crash. For power-loss durability, open with `durable=True` (see [STORAGE.md](STORAGE.md)). |
+| `flush()` | Makes every add made before it returns durable: index synced, WAL checkpointed. Survives a process crash and a power loss. Adds made after the last `flush()` need `durable=True` for power-loss safety (see [STORAGE.md](STORAGE.md)). |
 | `close()` / `with` | Flushes and releases the lock. |
 
 ## Collection

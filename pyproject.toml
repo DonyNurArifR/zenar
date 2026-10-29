@@ -5,7 +5,7 @@ build-backend = "maturin"
 [project]
 name = "zenar"
 version = "0.1.0"
-description = "Embedded vector database with typed metadata filtering (TurboVec + Stoolap)"
+description = "Embedded vector database with typed metadata filtering (TurboVec + SQLite)"
 readme = "README.md"
 license = { text = "MIT OR Apache-2.0" }
 requires-python = ">=3.10"

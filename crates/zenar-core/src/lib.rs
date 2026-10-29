@@ -1,6 +1,6 @@
 //! Zenar core: an embedded vector database with typed metadata filtering.
 //!
-//! TurboVec stores and searches vectors; Stoolap stores documents, metadata
+//! TurboVec stores and searches vectors; SQLite stores documents, metadata
 //! and collection config. This crate has no Python dependency.
 
 pub mod collection;

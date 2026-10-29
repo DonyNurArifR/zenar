@@ -51,7 +51,7 @@ pub enum Filter {
 #[derive(Debug)]
 pub struct CompiledFilter {
     pub sql: String,
-    pub params: Vec<stoolap::Value>,
+    pub params: Vec<rusqlite::types::Value>,
 }
 
 /// Validates a filter against a collection's locked metadata schema and
@@ -90,7 +90,7 @@ fn check_depth(filter: &Filter, depth: usize) -> Result<(), ZenarError> {
 
 struct Compiler<'a> {
     schema: &'a [(String, FieldKind)],
-    params: Vec<stoolap::Value>,
+    params: Vec<rusqlite::types::Value>,
 }
 
 impl Compiler<'_> {

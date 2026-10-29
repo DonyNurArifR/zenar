@@ -2,7 +2,7 @@
 
 Embedded, lightweight, high-performance vector database for Python — a Rust
 core built on [TurboVec](https://github.com/RyanCodrai/turbovec) for vector
-search and [Stoolap](https://github.com/stoolap/stoolap) for metadata/SQL
+search and [SQLite](https://sqlite.org) (via rusqlite) for metadata/SQL
 filtering.
 
 **Status: 0.1.0, not yet published.** The core, Python API, persistence and
@@ -32,7 +32,7 @@ Zenar (Rust, PyO3)
   +----------------------+
   |                       |
   v                       v
-TurboVec               Stoolap
+TurboVec               SQLite
 vectors / ANN          metadata / SQL
 ```
 
@@ -84,15 +84,19 @@ a concurrent read/write test; Python: 29 tests, including `kill -9` crash tests)
 - `bit_width` and `calibrate()`.
 - Python bindings with a complete exception hierarchy, GIL release, numpy input, and a panic guard.
 
-Not yet passed:
+Measured on the reference machine at 1M rows, dim 384 (BENCHMARKS.md):
 
-- **Reopen lookups (fixed in part).** Result hydration after a reopen used an `IN` list that Stoolap 0.4
-  scans. It now uses per-id lookups. Unfiltered search at 1M rows after reopen is ~12 ms (was ~57). Each lookup
-  still costs ~1 ms, and the cause is not confirmed. See BENCHMARKS.md.
-- **Filtered-search performance gate.** At 1M rows and 10% selectivity, filtered search takes ~32 ms after
-  reopen (~46 ms in-process), against ~1.2 ms unfiltered. Stoolap's candidate query is ~95% of that. See BENCHMARKS.md.
-- **Cross-platform wheels and CI** are written (`.github/workflows/`) but have not been run on
-  every target. The MSRV is 1.90, not 1.89 as first planned.
+- Selective filters (0.1%) search in 0.34 ms. Unfiltered search is 1.2 ms. Reopen costs nothing extra.
+- Broad filters are the weak case. `tenant = A` (10%) takes 5.7 ms. A compound filter of non-selective
+  predicates takes 25 ms, because each candidate row is read from the table. This does not fully meet the design
+  spec's section 90 gate.
+- Ingest is 0.053 ms per row. Batch `add_many` in one transaction is planned, not done.
+
+Not yet done:
+
+- **Cross-platform wheels and CI** are written (`.github/workflows/`) but have not run on GitHub or on every target.
+  Verified here: macOS arm64 only.
+- **Zenar-owned document store** (planned) for broad-filter performance and ingest speed.
 
 ## Contributing
 
@@ -106,7 +110,7 @@ Zenar is dual-licensed under the MIT license
 with either one.
 
 Zenar's compiled distribution statically links [TurboVec](https://github.com/RyanCodrai/turbovec)
-(MIT) and [Stoolap](https://github.com/stoolap/stoolap) (Apache-2.0). Their
-full license texts are reproduced in [THIRD_PARTY_NOTICES](THIRD_PARTY_NOTICES),
-as required by their own license terms. Zenar is not affiliated with either
-project.
+(MIT), [rusqlite](https://github.com/rusqlite/rusqlite) (MIT) and the bundled
+[SQLite](https://sqlite.org) (public domain). Their license texts are reproduced in
+[THIRD_PARTY_NOTICES](THIRD_PARTY_NOTICES), as required by their terms. Zenar is not affiliated with
+any of these projects.

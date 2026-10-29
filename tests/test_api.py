@@ -264,9 +264,12 @@ def test_flush_makes_adds_survive_kill_minus_9(tmp_path):
         assert c.get(0) is not None
 
 
-def test_path_with_dsn_metacharacters_is_rejected(tmp_path):
-    with pytest.raises(zenar.InvalidArgumentError):
-        VectorDB(str(tmp_path / "bad?name"))
+def test_path_with_url_metacharacters_works(tmp_path):
+    path = str(tmp_path / "odd?#&name")
+    with VectorDB(path) as db:
+        db.create_collection("m", dimension=8).add(1, [1.0] * 8, "x", {})
+    with VectorDB(path) as db:
+        assert db.get_collection("m").count() == 1
 
 
 def test_path_with_spaces_works(tmp_path):
