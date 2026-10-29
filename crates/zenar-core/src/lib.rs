@@ -11,7 +11,7 @@ pub mod filter;
 pub mod storage;
 pub mod value;
 
-pub use collection::{Collection, Hit, RecoveryReport};
+pub use collection::{Collection, Hit, Record, RecoveryReport};
 pub use database::{MetadataSync, VectorDB, validate_collection_name};
 pub use document::DocumentRow;
 pub use error::ZenarError;

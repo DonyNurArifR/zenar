@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
 
-use crate::document::{DocumentRow, MetadataStore, Status, is_valid_field_name};
+use crate::document::{DocumentRow, MetadataStore, RowRef, Status, is_valid_field_name};
 use crate::error::ZenarError;
 use crate::filter::{Filter, compile};
 use crate::storage::{VectorStore, validate_vector};
@@ -21,6 +21,15 @@ pub const SYNC_INTERVAL: usize = 1000;
 pub struct Hit {
     pub id: u64,
     pub score: f32,
+    pub text: String,
+    pub metadata: Vec<(String, MetaValue)>,
+}
+
+/// One document for `Collection::add_many`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Record {
+    pub id: u64,
+    pub vector: Vec<f32>,
     pub text: String,
     pub metadata: Vec<(String, MetaValue)>,
 }
@@ -146,6 +155,101 @@ impl Collection {
             self.meta.set_dimension(&self.name, dim)?;
         }
         Ok(())
+    }
+
+    /// Adds many documents atomically. Either every record is added or none is.
+    ///
+    /// 1. Validate every record before any write: ids, vectors, metadata, duplicates
+    ///    within the batch and against stored rows.
+    /// 2. Extend the metadata schema if the batch introduces fields.
+    /// 3. Add all vectors to the index, then sync the index once.
+    /// 4. Insert all rows in one SQLite transaction.
+    ///
+    /// If step 3 or 4 fails, the vectors added so far are removed and the error is returned.
+    /// A crash between the sync and the commit leaves stray vectors, which recovery removes.
+    pub fn add_many(&self, records: &[Record]) -> Result<usize, ZenarError> {
+        if records.is_empty() {
+            return Ok(0);
+        }
+        let mut state = self.write_state()?;
+        let first_vector = state.store.dim().is_none();
+
+        // 1. Validate.
+        if first_vector {
+            crate::storage::validate_dimension(records[0].vector.len())?;
+        }
+        let expected_dim = state.store.dim().or(Some(records[0].vector.len()));
+        let mut seen = HashSet::with_capacity(records.len());
+        let mut schema = state.fields.clone();
+        let mut new_fields: Vec<(String, FieldKind)> = Vec::new();
+        let mut prepared: Vec<Vec<(String, MetaValue)>> = Vec::with_capacity(records.len());
+        for record in records {
+            check_id(record.id)?;
+            if !seen.insert(record.id) || state.store.contains(record.id) {
+                return Err(ZenarError::DuplicateId(record.id));
+            }
+            validate_vector(&record.vector, expected_dim)?;
+            let (introduced, values) = resolve_metadata(&schema, record.metadata.clone())?;
+            schema.extend(introduced.iter().cloned());
+            new_fields.extend(introduced);
+            prepared.push(values);
+        }
+        let ids: Vec<u64> = records.iter().map(|r| r.id).collect();
+        if let Some(&id) = self.meta.existing_ids(&self.table, &ids)?.iter().next() {
+            return Err(ZenarError::DuplicateId(id));
+        }
+
+        // 2. Vectors, then one sync. The schema changes only after this succeeds.
+        let mut added: Vec<u64> = Vec::with_capacity(records.len());
+        for record in records {
+            if let Err(e) = state.store.add(&record.vector, record.id) {
+                self.rollback_vectors(&mut state, &added);
+                return Err(e);
+            }
+            added.push(record.id);
+        }
+        if let Err(e) = state.store.sync(&self.index_path) {
+            self.rollback_vectors(&mut state, &added);
+            return Err(e);
+        }
+        state.unsynced = 0;
+
+        // 3. Schema, then rows in one transaction.
+        if !new_fields.is_empty() {
+            if let Err(e) = self.meta.add_field_columns(&self.table, &new_fields) {
+                self.rollback_vectors(&mut state, &added);
+                return Err(e);
+            }
+            state.fields = schema;
+            if let Err(e) = self.meta.set_fields(&self.name, &state.fields) {
+                self.rollback_vectors(&mut state, &added);
+                return Err(e);
+            }
+        }
+        let rows: Vec<RowRef<'_>> = records
+            .iter()
+            .zip(prepared.iter())
+            .map(|(r, values)| (r.id, r.text.as_str(), values.as_slice()))
+            .collect();
+        if let Err(e) = self.meta.insert_documents(&self.table, &rows) {
+            self.rollback_vectors(&mut state, &added);
+            return Err(e);
+        }
+        if first_vector && let Some(dim) = state.store.dim() {
+            self.meta.set_dimension(&self.name, dim)?;
+        }
+        Ok(records.len())
+    }
+
+    /// Removes vectors added by a failed batch and syncs, so the index file does not keep them.
+    /// If the sync fails, recovery removes the stray vectors on the next open.
+    fn rollback_vectors(&self, state: &mut State, ids: &[u64]) {
+        for id in ids {
+            state.store.remove(*id);
+        }
+        if !ids.is_empty() && state.store.sync(&self.index_path).is_ok() {
+            state.unsynced = 0;
+        }
     }
 
     /// Deletes one document. The vector is removed and synced before the row

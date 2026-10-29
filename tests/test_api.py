@@ -341,3 +341,32 @@ def test_max_u64_id_is_accepted_and_round_trips(db):
     assert c.get(2**63 - 1)["text"] == "max"
     with pytest.raises(zenar.InvalidArgumentError):
         c.add(2**63, [1.0] * 8, "over", {})
+
+
+def test_add_many_is_atomic(db):
+    c = db.create_collection("atomic", dimension=8)
+    c.add(1, [1.0] * 8, "existing", {})
+    good = [{"id": i, "vector": [float(i + 1)] * 8, "text": f"t{i}", "metadata": {}} for i in range(2, 30)]
+    bad = good + [{"id": 40, "vector": [1.0] * 7, "text": "wrong dim", "metadata": {}}]
+    with pytest.raises(zenar.DimensionMismatchError):
+        c.add_many(bad)
+    assert c.count() == 1
+    dup = good + [{"id": 1, "vector": [1.0] * 8, "text": "dup", "metadata": {}}]
+    with pytest.raises(zenar.DuplicateIdError):
+        c.add_many(dup)
+    assert c.count() == 1
+
+
+def test_add_many_returns_count_and_is_searchable(db):
+    c = db.create_collection("many2", dimension=8)
+    n = c.add_many([{"id": i, "vector": [float(i + 1)] * 8, "text": f"t{i}", "metadata": {"tenant": "A"}} for i in range(300)])
+    assert n == 300
+    assert c.count() == 300
+    hit = c.search([1.0] * 8, top_k=1, filter=f.tenant == "A")[0]
+    assert hit["text"] == f"t{hit['id']}"  # all vectors share a direction, so the top hit is any of them
+
+
+def test_add_many_accepts_numpy_vectors(db):
+    c = db.create_collection("npmany", dimension=8)
+    rows = [{"id": i, "vector": np.full(8, i + 1, dtype=np.float32), "text": "x"} for i in range(5)]
+    assert c.add_many(rows) == 5

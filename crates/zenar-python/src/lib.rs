@@ -377,9 +377,10 @@ impl PyCollection {
     }
 
     /// Adds records given as dicts with keys `id`, `vector`, `text`, and optional `metadata`.
-    /// Not atomic: records are added in order, and the ones before a failing record stay added.
+    /// Atomic: either all records are added, or none is.
     fn add_many(&self, py: Python<'_>, records: &Bound<'_, PyAny>) -> PyResult<usize> {
-        let mut count = 0;
+        // Parse every record before the core call, so a malformed record fails before any write.
+        let mut parsed = Vec::new();
         for record in records.try_iter()? {
             let record = record?;
             let dict = record.cast::<PyDict>()?;
@@ -390,11 +391,15 @@ impl PyCollection {
                 Some(m) => metadata_from_py(Some(m.cast::<PyDict>()?))?,
                 None => Vec::new(),
             };
-            let inner = Arc::clone(&self.inner);
-            guarded(py, move || inner.add(id, &vector, &text, metadata))?;
-            count += 1;
+            parsed.push(core::Record {
+                id,
+                vector,
+                text,
+                metadata,
+            });
         }
-        Ok(count)
+        let inner = Arc::clone(&self.inner);
+        guarded(py, move || inner.add_many(&parsed))
     }
 
     fn get<'py>(

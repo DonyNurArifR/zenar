@@ -29,7 +29,7 @@ with VectorDB("./data") as db:                       # flushes and releases the 
 | Method | Notes |
 |---|---|
 | `add(id, vector, text, metadata=None)` | `id` is a non-negative integer up to 2**63-1. Duplicate ids raise `DuplicateIdError`. |
-| `add_many(records)` | Each record is a dict with `id`, `vector`, `text`, optional `metadata`. **Not atomic:** records before a failing one stay added. Returns the count added. |
+| `add_many(records)` | Each record is a dict with `id`, `vector`, `text`, optional `metadata`. **Atomic:** every record is validated first, then all are written in one transaction. If any record fails, none is added. Returns the count. Use this for ingest: it is about 1.8x faster than a loop of `add`. |
 | `get(id)` / `get_many(ids)` | Return dicts `{id, text, metadata}`, or `None` / skipped ids. Vectors are not returned. |
 | `delete(id)` | Removes the vector from the index and syncs before returning. Raises `VectorNotFoundError` if absent. |
 | `search(vector, top_k=10, filter=None, **equality)` | Returns `[{id, score, text, metadata}]`, best first. |

@@ -56,29 +56,37 @@ fn main() {
     let mut rng = Lcg(42);
     let categories = ["faq", "product", "tools", "electronics", "appliances"];
     let started = Instant::now();
-    for id in 0..rows {
-        let v = rng.vector(dim);
-        let tenant = if id % 10 == 0 { "A" } else { "B" };
-        c.add(
-            id,
-            &v,
-            "doc",
-            vec![
-                ("tenant".into(), MetaValue::Text(tenant.into())),
-                (
-                    "category".into(),
-                    MetaValue::Text(categories[(id % 5) as usize].into()),
-                ),
-                ("price".into(), MetaValue::Float((id % 1000) as f64)),
-            ],
-        )
-        .expect("add");
+    // Ingest in batches of 1000 through add_many: one index sync and one transaction per batch.
+    const BATCH: u64 = 1000;
+    let mut id = 0;
+    while id < rows {
+        let end = (id + BATCH).min(rows);
+        let batch: Vec<zenar_core::Record> = (id..end)
+            .map(|i| {
+                let tenant = if i % 10 == 0 { "A" } else { "B" };
+                zenar_core::Record {
+                    id: i,
+                    vector: rng.vector(dim),
+                    text: "doc".into(),
+                    metadata: vec![
+                        ("tenant".into(), MetaValue::Text(tenant.into())),
+                        (
+                            "category".into(),
+                            MetaValue::Text(categories[(i % 5) as usize].into()),
+                        ),
+                        ("price".into(), MetaValue::Float((i % 1000) as f64)),
+                    ],
+                }
+            })
+            .collect();
+        c.add_many(&batch).expect("add_many");
+        id = end;
     }
     db.flush().expect("flush");
     let ingest = started.elapsed();
     println!("rows {rows}, dim {dim}, bit_width 4");
     println!(
-        "ingest (MetadataSync::Normal, index synced every 1000 adds): {:.2} s total, {:.3} ms/row",
+        "ingest (add_many, batches of 1000): {:.2} s total, {:.3} ms/row",
         ingest.as_secs_f64(),
         ingest.as_secs_f64() * 1e3 / rows as f64
     );

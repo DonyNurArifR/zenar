@@ -90,7 +90,7 @@ Measured on the reference machine at 1M rows, dim 384 (BENCHMARKS.md):
 - Broad filters are the weak case. `tenant = A` (10%) takes 5.7 ms. A compound filter of non-selective
   predicates takes 25 ms, because each candidate row is read from the table. This does not fully meet the design
   spec's section 90 gate.
-- Ingest is 0.053 ms per row. Batch `add_many` in one transaction is planned, not done.
+- Ingest is 0.030 ms per row with `add_many` batches of 1000 (`add` one row at a time: 0.053 ms).
 
 Not yet done:
 

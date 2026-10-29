@@ -397,3 +397,122 @@ fn filter_before_schema_exists_is_an_error() {
     ));
     fs::remove_dir_all(&dir).ok();
 }
+
+fn record(id: u64, tenant: &str) -> zenar_core::Record {
+    zenar_core::Record {
+        id,
+        vector: (0..8).map(|j| ((id + j) % 9) as f32 + 0.5).collect(),
+        text: format!("doc {id}"),
+        metadata: vec![("tenant".into(), text(tenant))],
+    }
+}
+
+#[test]
+fn add_many_adds_everything_and_survives_reopen() {
+    let dir = temp_dir("many-ok");
+    {
+        let db = VectorDB::open(&dir).unwrap();
+        let c = db.create_collection("m", None, 4).unwrap();
+        let batch: Vec<_> = (0..2500u64)
+            .map(|id| record(id, if id % 2 == 0 { "A" } else { "B" }))
+            .collect();
+        assert_eq!(c.add_many(&batch).unwrap(), 2500);
+        assert_eq!(c.count().unwrap(), 2500);
+        assert_eq!(c.dimension(), Some(8));
+        let f = Filter::Eq {
+            field: "tenant".into(),
+            value: text("A"),
+        };
+        let hits = c.search(&batch[0].vector, 10, Some(&f)).unwrap();
+        assert!(hits.iter().all(|h| h.id % 2 == 0));
+    }
+    let db = VectorDB::open(&dir).unwrap();
+    assert_eq!(db.get_collection("m").unwrap().count().unwrap(), 2500);
+    fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn add_many_with_bad_record_writes_nothing() {
+    let dir = temp_dir("many-bad");
+    let db = VectorDB::open(&dir).unwrap();
+    let c = db.create_collection("b", None, 4).unwrap();
+    let mut batch: Vec<_> = (0..50u64).map(|id| record(id, "A")).collect();
+    batch[40].vector.pop(); // dimension mismatch near the end
+    assert!(matches!(
+        c.add_many(&batch),
+        Err(ZenarError::DimensionMismatch { .. })
+    ));
+    assert_eq!(c.count().unwrap(), 0);
+    assert!(c.search(&[1.0; 8], 5, None).unwrap().is_empty());
+    assert_eq!(
+        c.dimension(),
+        None,
+        "a failed first batch must not lock the dimension"
+    );
+    // The same ids are still usable after the failure.
+    let good: Vec<_> = (0..50u64).map(|id| record(id, "A")).collect();
+    assert_eq!(c.add_many(&good).unwrap(), 50);
+    fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn add_many_rejects_duplicates_within_batch_and_against_store() {
+    let dir = temp_dir("many-dup");
+    let db = VectorDB::open(&dir).unwrap();
+    let c = db.create_collection("d", Some(8), 4).unwrap();
+    c.add(5, &[1.0; 8], "existing", vec![("tenant".into(), text("A"))])
+        .unwrap();
+
+    let within = vec![record(1, "A"), record(2, "A"), record(1, "A")];
+    assert_eq!(c.add_many(&within), Err(ZenarError::DuplicateId(1)));
+
+    let against_store = vec![record(7, "A"), record(5, "A")];
+    assert_eq!(c.add_many(&against_store), Err(ZenarError::DuplicateId(5)));
+
+    assert_eq!(
+        c.count().unwrap(),
+        1,
+        "neither failed batch may write anything"
+    );
+    assert!(c.get(7).unwrap().is_none());
+    fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn add_many_rejects_schema_conflict_and_leaves_schema_unchanged() {
+    let dir = temp_dir("many-schema");
+    let db = VectorDB::open(&dir).unwrap();
+    let c = db.create_collection("s", Some(8), 4).unwrap();
+    c.add(1, &[1.0; 8], "x", vec![("tenant".into(), text("A"))])
+        .unwrap();
+    // Second record uses the wrong type for an existing field.
+    let batch = vec![
+        zenar_core::Record {
+            id: 2,
+            vector: vec![1.0; 8],
+            text: "y".into(),
+            metadata: vec![("tenant".into(), MetaValue::Integer(3))],
+        },
+        zenar_core::Record {
+            id: 3,
+            vector: vec![1.0; 8],
+            text: "z".into(),
+            metadata: vec![("new_field".into(), text("q"))],
+        },
+    ];
+    assert!(matches!(
+        c.add_many(&batch),
+        Err(ZenarError::InvalidMetadata(_))
+    ));
+    assert_eq!(c.count().unwrap(), 1);
+    // The unknown field was not added to the schema by the failed batch.
+    let f = Filter::Eq {
+        field: "new_field".into(),
+        value: text("q"),
+    };
+    assert!(matches!(
+        c.search(&[1.0; 8], 5, Some(&f)),
+        Err(ZenarError::InvalidFilter(_))
+    ));
+    fs::remove_dir_all(&dir).ok();
+}

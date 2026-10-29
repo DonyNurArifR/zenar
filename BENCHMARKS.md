@@ -14,20 +14,17 @@ cargo run --release -p zenar-core --example reopen_bench -- target/bench-data/10
 
 ### Ingest
 
-| Rows | Total | Per row |
-|---|---|---|
-| 1,000,000 | 52.9 s | 0.053 ms |
+| Path | Rows | Total | Per row |
+|---|---|---|---|
+| `add_many`, batches of 1000 (benchmark) | 1,000,000 | 29.9 s | 0.030 ms |
+| `add`, one row at a time (benchmark, before batching) | 1,000,000 | 52.9 s | 0.053 ms |
 
-Each add writes one row and one vector. Index files are synced every 1000 adds. The per-row cost is about 4x the
-Stoolap backend (0.013 ms/row). Measured breakdown with the Python API at 100K rows:
+Each row has three indexed metadata fields and one 384-dim vector. A batch validates every record, adds the vectors,
+syncs the index once, and commits all rows in one SQLite transaction. The old Stoolap backend ingested at 0.013 ms/row
+without these per-row costs, but it had the reopen problem (see History).
 
-| Case (100K rows) | Per row |
-|---|---|
-| No metadata | 0.017 ms |
-| Three metadata fields, each indexed | 0.035 ms |
-
-The indexes cost about half of ingest. Larger B-trees explain the rest of the gap at 1M rows (0.053 ms). Batching
-inserts in one transaction (`add_many`) is the next step. It is not implemented yet.
+Measured breakdown with the Python API at 100K rows, one row at a time: no metadata 0.017 ms, three indexed fields
+0.035 ms. The indexes cost about half of the per-row time.
 
 ### Search, in-process (same process as ingest)
 

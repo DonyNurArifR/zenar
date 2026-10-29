@@ -43,6 +43,9 @@ pub struct DocumentRow {
     pub metadata: Vec<(String, MetaValue)>,
 }
 
+/// One row for `insert_documents`: (id, text, metadata).
+pub type RowRef<'a> = (u64, &'a str, &'a [(String, MetaValue)]);
+
 /// Reserved column names that metadata fields may not use.
 pub const RESERVED_COLUMNS: [&str; 3] = ["id", "text", "status"];
 
@@ -324,6 +327,68 @@ impl MetadataStore {
                 .map_err(store_err)?;
             Ok(())
         })
+    }
+
+    /// Inserts many rows in one transaction. Either all rows are written or none are.
+    /// Each row's metadata is written only for the fields it carries. `rows` holds
+    /// (id, text, metadata).
+    pub fn insert_documents(&self, table: &str, rows: &[RowRef<'_>]) -> Result<(), ZenarError> {
+        let mut conn = self
+            .writer
+            .lock()
+            .map_err(|_| store_msg("writer lock poisoned"))?;
+        let tx = conn.transaction().map_err(store_err)?;
+        for (id, text, metadata) in rows {
+            let mut columns = vec!["id".to_string(), "text".to_string(), "status".to_string()];
+            let mut params = vec![
+                Sql::Integer(*id as i64),
+                Sql::Text((*text).to_string()),
+                Sql::Text(Status::Ready.as_str().to_string()),
+            ];
+            for (name, value) in metadata.iter() {
+                columns.push(format!("\"{name}\""));
+                params.push(value.to_sql());
+            }
+            let placeholders: Vec<String> = (1..=params.len()).map(|i| format!("?{i}")).collect();
+            let sql = format!(
+                "INSERT INTO {table} ({}) VALUES ({})",
+                columns.join(", "),
+                placeholders.join(", ")
+            );
+            tx.prepare_cached(&sql)
+                .and_then(|mut stmt| stmt.execute(params_from_iter(params)))
+                .map_err(store_err)?;
+        }
+        tx.commit().map_err(store_err)
+    }
+
+    /// The subset of `ids` that already have a row in the table, any status.
+    pub fn existing_ids(
+        &self,
+        table: &str,
+        ids: &[u64],
+    ) -> Result<std::collections::HashSet<u64>, ZenarError> {
+        let mut found = std::collections::HashSet::new();
+        self.read(|c| {
+            for chunk in ids.chunks(IN_CHUNK) {
+                let placeholders: Vec<String> =
+                    (1..=chunk.len()).map(|i| format!("?{i}")).collect();
+                let sql = format!(
+                    "SELECT id FROM {table} WHERE id IN ({})",
+                    placeholders.join(", ")
+                );
+                let params = chunk.iter().map(|id| Sql::Integer(*id as i64));
+                let mut stmt = c.prepare_cached(&sql).map_err(store_err)?;
+                let rows = stmt
+                    .query_map(params_from_iter(params), |r| r.get::<_, i64>(0))
+                    .map_err(store_err)?;
+                for row in rows {
+                    found.insert(row.map_err(store_err)? as u64);
+                }
+            }
+            Ok(())
+        })?;
+        Ok(found)
     }
 
     pub fn set_status(&self, table: &str, id: u64, status: Status) -> Result<(), ZenarError> {

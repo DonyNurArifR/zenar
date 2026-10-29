@@ -39,6 +39,19 @@ at each point:
 
 `PENDING` rows can still appear in an older database. Recovery rolls them back.
 
+### Batched adds (`add_many`)
+
+A batch is all-or-nothing as seen by callers. Its steps:
+
+1. Validate every record, then check the schema and duplicates. Nothing is written yet.
+2. Add every vector to the index in memory, then sync the index once.
+3. Extend the metadata schema if the batch introduced fields.
+4. Commit every row in one SQLite transaction.
+
+If step 2, 3 or 4 fails, the vectors are removed from memory and the index is synced again, best effort. A crash
+after the index sync and before the commit leaves stray vectors, which recovery removes. A failed batch can leave
+new metadata fields in the schema, when the failure comes after step 3. Those fields are empty and do no harm.
+
 ## Deletes
 
 For each `delete`:
