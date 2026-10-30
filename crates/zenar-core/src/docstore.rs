@@ -13,7 +13,7 @@
 
 use std::collections::{BTreeMap, HashMap};
 use std::fs::{self, File, OpenOptions};
-use std::io::{Seek, SeekFrom, Write};
+use std::io::{BufReader, Read, Seek, SeekFrom, Write};
 use std::ops::Bound;
 use std::path::{Path, PathBuf};
 
@@ -143,10 +143,10 @@ impl DocStore {
     /// Opens an existing log and replays it. A torn tail is truncated.
     pub fn open(path: &Path, fields: Vec<(String, FieldKind)>) -> Result<Self, ZenarError> {
         let file = open_log(path).map_err(io_err)?;
+        let file_len = file.metadata().map_err(io_err)?.len();
         let mut store = Self::empty(path.to_path_buf(), Some(file), 0, fields);
-        let bytes = fs::read(path).map_err(io_err)?;
-        let good_end = store.replay(&bytes)?;
-        if good_end < bytes.len() as u64 {
+        let good_end = store.replay(file_len)?;
+        if good_end < file_len {
             let file = store.handle()?;
             file.set_len(good_end).map_err(io_err)?;
             file.sync_data().map_err(io_err)?;
@@ -440,19 +440,26 @@ impl DocStore {
                 if children.is_empty() {
                     return Ok((self.live_rows(), Vec::new()));
                 }
-                let mut t: Option<Vec<u32>> = None;
+                let mut trues: Vec<Vec<u32>> = Vec::with_capacity(children.len());
                 let mut f: Vec<u32> = Vec::new();
                 for child in children {
                     let (ct, cf) = self.eval(child, need_false)?;
-                    t = Some(match t {
-                        None => ct,
-                        Some(acc) => intersect(&acc, &ct),
-                    });
+                    trues.push(ct);
                     if need_false {
                         f = union(&f, &cf);
                     }
                 }
-                Ok((t.unwrap_or_default(), f))
+                // Intersect the smallest sets first, so the running result shrinks early.
+                trues.sort_by_key(|t| t.len());
+                let mut trues = trues.into_iter();
+                let mut t = trues.next().unwrap_or_default();
+                for next in trues {
+                    if t.is_empty() {
+                        break;
+                    }
+                    t = intersect(&t, &next);
+                }
+                Ok((t, f))
             }
             Filter::Or(children) => {
                 if children.is_empty() {
@@ -580,14 +587,37 @@ impl DocStore {
                     Cmp::Lt => (Bound::Unbounded, Bound::Excluded(&key)),
                     Cmp::Lte => (Bound::Unbounded, Bound::Included(&key)),
                 };
-                let mut rows: Vec<u32> = index
+                let groups: Vec<&Vec<u32>> = index
                     .values
                     .range::<Key, _>(range)
-                    .flat_map(|(_, rows)| rows.iter().copied())
-                    .filter(|&r| self.is_live(r))
+                    .map(|(_, rows)| rows)
                     .collect();
-                rows.sort_unstable();
-                rows
+                match groups.as_slice() {
+                    [] => Vec::new(),
+                    // One value: its postings are already in row order.
+                    [only] => only.iter().copied().filter(|&r| self.is_live(r)).collect(),
+                    // Several values: set bits in a bitmap over the rows, then read them back in order.
+                    // That is linear in the matches, where sorting them is not.
+                    _ => {
+                        let mut bits = vec![0u64; self.rows.len() / 64 + 1];
+                        for rows in groups {
+                            for &r in rows {
+                                if self.is_live(r) {
+                                    bits[(r >> 6) as usize] |= 1u64 << (r & 63);
+                                }
+                            }
+                        }
+                        let mut out = Vec::new();
+                        for (word_index, &word) in bits.iter().enumerate() {
+                            let mut w = word;
+                            while w != 0 {
+                                out.push((word_index as u32) * 64 + w.trailing_zeros());
+                                w &= w - 1;
+                            }
+                        }
+                        out
+                    }
+                }
             }
             // Mixed integer and float comparisons: scan the distinct values of this field.
             Err(_) => {
@@ -628,39 +658,75 @@ impl DocStore {
     }
 
     /// Replays the log bytes into indexes. Returns the offset just past the last valid frame.
-    fn replay(&mut self, bytes: &[u8]) -> Result<u64, ZenarError> {
-        let mut pos = 0usize;
-        while pos < bytes.len() {
-            // A file system may extend the log before the data is written. The zeros left behind
-            // are a torn tail, not a record.
-            if bytes[pos..].iter().all(|&b| b == 0) {
-                return Ok(pos as u64);
+    /// Replays the log frame by frame, streaming it so memory use does not grow with the log.
+    /// Returns the offset just past the last valid frame. See the module docs for the rules.
+    fn replay(&mut self, file_len: u64) -> Result<u64, ZenarError> {
+        let reader_file = File::open(&self.path).map_err(io_err)?;
+        let mut reader = BufReader::with_capacity(1 << 20, reader_file);
+        let mut pos: u64 = 0;
+        while pos < file_len {
+            let remaining = file_len - pos;
+            if remaining < FRAME_HEADER as u64 {
+                return Ok(pos); // torn header
             }
-            let remaining = bytes.len() - pos;
-            if remaining < FRAME_HEADER {
-                return Ok(pos as u64); // torn header
+            let mut header = [0u8; FRAME_HEADER];
+            reader.read_exact(&mut header).map_err(io_err)?;
+            let len = u32::from_le_bytes(header[0..4].try_into().unwrap()) as u64;
+            let crc = u32::from_le_bytes(header[4..8].try_into().unwrap());
+            if header == [0u8; FRAME_HEADER] {
+                // A zero header is never a record. It is a torn tail if only zeros follow.
+                return self.zeros_or_corrupt(&mut reader, pos, file_len);
             }
-            let len = u32::from_le_bytes(bytes[pos..pos + 4].try_into().unwrap()) as usize;
-            let crc = u32::from_le_bytes(bytes[pos + 4..pos + 8].try_into().unwrap());
-            let frame_end = pos + FRAME_HEADER + len;
-            if frame_end > bytes.len() {
-                return Ok(pos as u64); // torn payload
+            let frame_end = pos + FRAME_HEADER as u64 + len;
+            if frame_end > file_len {
+                return Ok(pos); // torn payload
             }
-            let payload = &bytes[pos + FRAME_HEADER..frame_end];
-            if len > MAX_PAYLOAD || crc32(payload) != crc {
-                // A bad frame that runs to EOF, or is followed only by zeros, is a torn write.
-                if bytes[pos..].iter().all(|&b| b == 0) || frame_end == bytes.len() {
-                    return Ok(pos as u64);
+            // Check the length before allocating for the payload.
+            let oversized = len as usize > MAX_PAYLOAD;
+            let payload = if oversized {
+                Vec::new()
+            } else {
+                let mut payload = vec![0u8; len as usize];
+                reader.read_exact(&mut payload).map_err(io_err)?;
+                payload
+            };
+            if oversized || crc32(&payload) != crc {
+                // A bad frame that runs to EOF is a torn write. Anything after it is corruption.
+                if frame_end == file_len {
+                    return Ok(pos);
                 }
                 return Err(ZenarError::RecoveryError(format!(
                     "corrupt record at byte {pos} of {}; refusing to drop later records",
                     self.path.display()
                 )));
             }
-            self.apply_replayed(payload, (pos + FRAME_HEADER) as u64)?;
+            self.apply_replayed(&payload, pos + FRAME_HEADER as u64)?;
             pos = frame_end;
         }
-        Ok(pos as u64)
+        Ok(pos)
+    }
+
+    /// Called at a zero header. Returns the torn-tail offset if the rest of the file is zeros.
+    fn zeros_or_corrupt(
+        &self,
+        reader: &mut BufReader<File>,
+        pos: u64,
+        file_len: u64,
+    ) -> Result<u64, ZenarError> {
+        let mut buf = vec![0u8; 64 * 1024];
+        let mut left = file_len - pos - FRAME_HEADER as u64;
+        while left > 0 {
+            let n = left.min(buf.len() as u64) as usize;
+            reader.read_exact(&mut buf[..n]).map_err(io_err)?;
+            if buf[..n].iter().any(|&b| b != 0) {
+                return Err(ZenarError::RecoveryError(format!(
+                    "corrupt record at byte {pos} of {}; refusing to drop later records",
+                    self.path.display()
+                )));
+            }
+            left -= n as u64;
+        }
+        Ok(pos)
     }
 
     fn apply_replayed(&mut self, payload: &[u8], payload_off: u64) -> Result<(), ZenarError> {
@@ -736,6 +802,25 @@ fn key_for(kind: FieldKind, value: &MetaValue) -> Result<Key, ZenarError> {
 // ----- sorted set operations -------------------------------------------------
 
 fn intersect(a: &[u32], b: &[u32]) -> Vec<u32> {
+    // A small list against a much larger one: binary-search each element instead of walking the big list.
+    let (small, large) = if a.len() <= b.len() { (a, b) } else { (b, a) };
+    if small.len() * 16 < large.len() {
+        let mut out = Vec::with_capacity(small.len());
+        let mut lo = 0;
+        for &x in small {
+            match large[lo..].binary_search(&x) {
+                Ok(i) => {
+                    out.push(x);
+                    lo += i + 1;
+                }
+                Err(i) => lo += i,
+            }
+            if lo >= large.len() {
+                break;
+            }
+        }
+        return out;
+    }
     let (mut i, mut j) = (0, 0);
     let mut out = Vec::with_capacity(a.len().min(b.len()));
     while i < a.len() && j < b.len() {
@@ -1054,6 +1139,35 @@ mod tests {
         assert_eq!(difference(&b, &a), vec![4, 9]);
         assert!(intersect(&a, &[]).is_empty());
         assert_eq!(union(&[], &b), b.to_vec());
+    }
+
+    /// The galloping and linear intersections must agree with a naive one, at every size ratio.
+    #[test]
+    fn intersect_agrees_with_naive_across_size_ratios() {
+        let mut state = 0x2545_F491_4F6C_DD1Du64;
+        let mut next = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        for small_len in [0usize, 1, 3, 40, 500] {
+            for large_len in [0usize, 5, 600, 20_000] {
+                let mut a: Vec<u32> = (0..small_len).map(|_| (next() % 50_000) as u32).collect();
+                let mut b: Vec<u32> = (0..large_len).map(|_| (next() % 50_000) as u32).collect();
+                a.sort_unstable();
+                a.dedup();
+                b.sort_unstable();
+                b.dedup();
+                let naive: Vec<u32> = a
+                    .iter()
+                    .copied()
+                    .filter(|x| b.binary_search(x).is_ok())
+                    .collect();
+                assert_eq!(intersect(&a, &b), naive, "sizes {small_len} x {large_len}");
+                assert_eq!(intersect(&b, &a), naive, "sizes {large_len} x {small_len}");
+            }
+        }
     }
 
     #[test]

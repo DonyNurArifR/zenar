@@ -243,7 +243,7 @@ def test_kill_minus_9_mid_write_leaves_consistent_database(tmp_path):
     """Spec sections 26 and 86: after SIGKILL, every served row has its vector."""
     path = str(tmp_path / "crash")
     _kill_during_writes(path, flush_every=False)
-    with VectorDB(path) as db:
+    with open_after_crash(path) as db:
         c = db.get_collection("crash")
         ready = c.count()
         query = np.ones(32, dtype=np.float32)
@@ -258,12 +258,13 @@ def test_flush_makes_adds_survive_kill_minus_9(tmp_path):
     """Adds covered by a completed flush() must survive a SIGKILL."""
     path = str(tmp_path / "flushed")
     _kill_during_writes(path, flush_every=True)
-    with VectorDB(path) as db:
+    with open_after_crash(path) as db:
         c = db.get_collection("crash")
         assert c.count() >= 20
         assert c.get(0) is not None
 
 
+@pytest.mark.skipif(sys.platform == "win32", reason="Windows does not allow '?' in file names")
 def test_path_with_url_metacharacters_works(tmp_path):
     path = str(tmp_path / "odd?#&name")
     with VectorDB(path) as db:
@@ -383,6 +384,24 @@ def test_delete_many_is_atomic(db):
     assert c.get(2) is None
 
 
+def open_after_crash(path, timeout=20.0):
+    """Opens a database whose writer was just killed. The lock must clear once the process is gone.
+    On Windows that can take a moment after `wait()` returns, so retry for a bounded time."""
+    deadline = time.monotonic() + timeout
+    started = time.monotonic()
+    while True:
+        try:
+            db = VectorDB(path)
+            waited = time.monotonic() - started
+            if waited > 1.0:
+                print(f"lock cleared after {waited:.2f}s")
+            return db
+        except zenar.DatabaseLockedError:
+            if time.monotonic() > deadline:
+                raise
+            time.sleep(0.1)
+
+
 def test_repeated_kill_minus_9_cycles_stay_consistent(tmp_path):
     """Several crash-and-restart cycles on one database. After each restart, the live count
     must match the searchable documents, and flushed batches must still be there."""
@@ -410,7 +429,7 @@ def test_repeated_kill_minus_9_cycles_stay_consistent(tmp_path):
         proc.kill()
         proc.wait()
 
-        with VectorDB(path) as db:
+        with open_after_crash(path) as db:
             c = db.get_collection("cy")
             live = c.count()
             assert live >= flushed_total, "a flushed batch disappeared"
