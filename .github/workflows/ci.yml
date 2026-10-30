@@ -34,9 +34,15 @@ jobs:
         with:
           python-version: "3.12"
       - uses: dtolnay/rust-toolchain@stable
-      - run: pip install maturin pytest numpy
-      - run: maturin develop --release --locked
-      - run: pytest -q
+      - run: pip install maturin
+      - run: maturin build --release --locked --out dist
+      # Test the built wheel in a fresh venv, the way users install it.
+      - shell: bash
+        run: |
+          python -m venv .venv-test
+          if [ -d .venv-test/Scripts ]; then PY=.venv-test/Scripts/python; else PY=.venv-test/bin/python; fi
+          "$PY" -m pip install --quiet dist/*.whl pytest numpy
+          "$PY" -m pytest -q
 
   supply-chain:
     name: Audit and license check

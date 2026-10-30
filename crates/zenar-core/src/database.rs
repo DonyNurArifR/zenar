@@ -300,7 +300,11 @@ mod tests {
     #[test]
     fn path_with_spaces_and_metacharacters_works() {
         let dir = temp_dir("paths");
+        // Windows does not allow '?' in file names, so the URL-like characters are Unix-only.
+        #[cfg(unix)]
         let odd = std::env::temp_dir().join(format!("zenar ?#&{}", std::process::id()));
+        #[cfg(not(unix))]
+        let odd = std::env::temp_dir().join(format!("zenar space {}", std::process::id()));
         let _ = fs::remove_dir_all(&odd);
         {
             let db = VectorDB::open(&dir).unwrap();

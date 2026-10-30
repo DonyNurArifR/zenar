@@ -13,7 +13,7 @@
 
 use std::collections::{BTreeMap, HashMap};
 use std::fs::{self, File, OpenOptions};
-use std::io::Write;
+use std::io::{Seek, SeekFrom, Write};
 use std::ops::Bound;
 use std::path::{Path, PathBuf};
 
@@ -132,8 +132,8 @@ impl DocStore {
     pub fn create(path: &Path, fields: Vec<(String, FieldKind)>) -> Result<Self, ZenarError> {
         let file = OpenOptions::new()
             .create_new(true)
-            .append(true)
             .read(true)
+            .write(true)
             .open(path)
             .map_err(io_err)?;
         sync_parent(path)?;
@@ -142,7 +142,7 @@ impl DocStore {
 
     /// Opens an existing log and replays it. A torn tail is truncated.
     pub fn open(path: &Path, fields: Vec<(String, FieldKind)>) -> Result<Self, ZenarError> {
-        let file = open_append(path).map_err(io_err)?;
+        let file = open_log(path).map_err(io_err)?;
         let mut store = Self::empty(path.to_path_buf(), Some(file), 0, fields);
         let bytes = fs::read(path).map_err(io_err)?;
         let good_end = store.replay(&bytes)?;
@@ -279,7 +279,10 @@ impl DocStore {
 
     fn write_bytes(&mut self, buf: &[u8], old_len: u64) -> Result<(), ZenarError> {
         let file = self.handle_mut()?;
-        if let Err(e) = file.write_all(buf) {
+        let result = file
+            .seek(SeekFrom::Start(old_len))
+            .and_then(|_| file.write_all(buf));
+        if let Err(e) = result {
             let _ = file.set_len(old_len);
             return Err(io_err(e));
         }
@@ -356,7 +359,7 @@ impl DocStore {
         self.file = None;
         if let Err(e) = fs::rename(&tmp, &self.path) {
             let _ = fs::remove_file(&tmp);
-            self.file = Some(open_append(&self.path).map_err(io_err)?);
+            self.file = Some(open_log(&self.path).map_err(io_err)?);
             return Err(io_err(e));
         }
         sync_parent(&self.path)?;
@@ -968,8 +971,10 @@ fn read_exact_at(file: &File, buf: &mut [u8], offset: u64) -> Result<(), ZenarEr
     Ok(())
 }
 
-fn open_append(path: &Path) -> std::io::Result<File> {
-    OpenOptions::new().append(true).read(true).open(path)
+/// Opens the log for reading and writing. Writes seek to the tracked length first, because
+/// append mode on Windows grants no right to truncate, and truncation is needed to undo a write.
+fn open_log(path: &Path) -> std::io::Result<File> {
+    OpenOptions::new().read(true).write(true).open(path)
 }
 
 /// Makes a new file name durable by syncing its directory (no-op where that is not supported).
