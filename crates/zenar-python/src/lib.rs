@@ -570,7 +570,11 @@ impl PyCollection {
         let inner = Arc::clone(&self.inner);
         let name = name.to_string();
         let spec = guarded(py, move || inner.tool_spec(&name))?;
-        json_to_py(py, &spec)
+        // Wrap in zenar.agent.ToolSpec: a dict that also renders itself as a prompt.
+        let dict = json_to_py(py, &spec)?;
+        py.import("zenar.agent")?
+            .getattr("ToolSpec")?
+            .call1((dict,))
     }
 
     fn count(&self, py: Python<'_>) -> PyResult<usize> {

@@ -529,3 +529,18 @@ def test_tool_spec_prompt_only_lists_fields_and_values(db):
     assert "- price (float): " in text
     assert "description" not in text and "parameters" not in text
 
+
+def test_tool_spec_is_a_dict_that_creates_a_prompt(db):
+    from zenar.agent import ToolSpec
+
+    c = _shop(db)
+    spec = c.tool_spec("search_shop")
+    assert isinstance(spec, ToolSpec) and isinstance(spec, dict)
+    assert spec["name"] == "search_shop"
+    prompt = spec.create_prompt(instructions="You are a shop assistant.")
+    assert "- tenant (text): values \"A\", \"B\"" in prompt
+    assert "Filterable fields:" in prompt
+    assert "Call this tool with `query`" in prompt
+    assert prompt.endswith("You are a shop assistant.")
+    assert "You are a shop assistant." not in spec.create_prompt()
+

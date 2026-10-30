@@ -100,7 +100,8 @@ c = db.get_collection("products")
 c.describe()                 # every field: type, documents, values with counts, or min/max for numbers
 c.find_values("category", "elec")   # values that contain "elec", most frequent first
 c.tool_spec("search_products")      # tool definition: description and JSON Schema for the arguments
-c.tool_spec("search_products", prompt_only=True)  # just the fields and their values, as text for a prompt
+spec = c.tool_spec("search_products")  # a dict you can pass to the tool API as is
+prompt = spec.create_prompt(instructions="You help customers find products.")  # ready-to-use system prompt section
 
 r = c.retrieve(embed(user_query), top_k=5, where={"tenant": "A", "price": {"lt": 100}})
 r["hits"]      # the results
