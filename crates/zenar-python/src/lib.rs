@@ -576,6 +576,7 @@ impl PyCollection {
         let out = PyDict::new(py);
         out.set_item("hits", hits)?;
         out.set_item("matched", retrieval.matched)?;
+        out.set_item("applied", retrieval.applied)?;
         out.set_item("warnings", retrieval.warnings)?;
         Ok(out.into_any())
     }

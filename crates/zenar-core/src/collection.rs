@@ -44,6 +44,8 @@ pub struct Hit {
 #[derive(Debug, Clone, PartialEq)]
 pub struct Retrieval {
     pub hits: Vec<Hit>,
+    /// The model's filter in plain language, or "no filter". Lets the model check what was applied.
+    pub applied: String,
     /// Documents that matched the filter, before `top_k` cut the list.
     pub matched: usize,
     /// Notes for the caller, such as a value no document has.
@@ -561,6 +563,10 @@ impl Collection {
             };
             (where_filter, scope_filter, warnings)
         };
+        let applied = match &where_filter {
+            Some(f) => crate::agent::describe_filter(f),
+            None => "no filter (all documents in scope)".to_string(),
+        };
         let filter = match (scope_filter, where_filter) {
             (None, None) => None,
             (Some(scope), None) => Some(scope),
@@ -570,6 +576,7 @@ impl Collection {
         let (hits, matched) = self.search_counted(query, top_k, filter.as_ref())?;
         Ok(Retrieval {
             hits,
+            applied,
             matched,
             warnings,
         })

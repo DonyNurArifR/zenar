@@ -352,6 +352,38 @@ pub fn value_text(value: &MetaValue) -> String {
     }
 }
 
+/// Plain-language rendering of a filter, so a model can check what was applied, for example
+/// `(category = "tools" AND price < 50)`.
+pub fn describe_filter(filter: &Filter) -> String {
+    fn list(values: &[MetaValue]) -> String {
+        values.iter().map(value_text).collect::<Vec<_>>().join(", ")
+    }
+    fn join(parts: &[Filter], op: &str) -> String {
+        if parts.is_empty() {
+            return if op == "AND" {
+                "true".into()
+            } else {
+                "false".into()
+            };
+        }
+        let inner: Vec<String> = parts.iter().map(describe_filter).collect();
+        format!("({})", inner.join(&format!(" {op} ")))
+    }
+    match filter {
+        Filter::Eq { field, value } => format!("{field} = {}", value_text(value)),
+        Filter::Ne { field, value } => format!("{field} != {}", value_text(value)),
+        Filter::Gt { field, value } => format!("{field} > {}", value_text(value)),
+        Filter::Gte { field, value } => format!("{field} >= {}", value_text(value)),
+        Filter::Lt { field, value } => format!("{field} < {}", value_text(value)),
+        Filter::Lte { field, value } => format!("{field} <= {}", value_text(value)),
+        Filter::In { field, values } => format!("{field} in [{}]", list(values)),
+        Filter::Nin { field, values } => format!("{field} not in [{}]", list(values)),
+        Filter::And(parts) => join(parts, "AND"),
+        Filter::Or(parts) => join(parts, "OR"),
+        Filter::Not(inner) => format!("NOT {}", describe_filter(inner)),
+    }
+}
+
 /// JSON form of a value.
 pub fn value_json(value: &MetaValue) -> Value {
     match value {
@@ -750,6 +782,29 @@ mod tests {
             accepted > 50,
             "the fuzzer should produce some valid filters, got {accepted}"
         );
+    }
+
+    #[test]
+    fn describe_filter_renders_the_applied_filter() {
+        let f = Filter::And(vec![
+            Filter::Eq {
+                field: "category".into(),
+                value: MetaValue::Text("tools".into()),
+            },
+            Filter::Lt {
+                field: "price".into(),
+                value: MetaValue::Float(50.0),
+            },
+        ]);
+        assert_eq!(describe_filter(&f), "(category = \"tools\" AND price < 50)");
+        let g = Filter::Not(Box::new(Filter::In {
+            field: "color".into(),
+            values: vec![
+                MetaValue::Text("red".into()),
+                MetaValue::Text("blue".into()),
+            ],
+        }));
+        assert_eq!(describe_filter(&g), "NOT color in [\"red\", \"blue\"]");
     }
 
     #[test]

@@ -624,3 +624,11 @@ def test_retrieve_caps_top_k_for_model_calls(db):
     c = _two_tenants(db)
     with pytest.raises(zenar.InvalidArgumentError, match="limit for retrieve is 1000"):
         c.retrieve([1.0] * 8, top_k=5000, scope=None)
+
+
+def test_retrieve_reports_the_applied_filter_in_words(db):
+    c = _two_tenants(db)
+    r = c.retrieve([1.0] * 8, 5, {"category": "tools", "tenant": {"in": ["acme"]}}, scope=None)
+    assert r["applied"].startswith("(") and "category = \"tools\"" in r["applied"]
+    assert "tenant in [\"acme\"]" in r["applied"]
+    assert c.retrieve([1.0] * 8, 5, None, scope=None)["applied"] == "no filter (all documents in scope)"
