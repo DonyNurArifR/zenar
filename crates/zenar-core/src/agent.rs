@@ -42,11 +42,23 @@ pub struct Parsed {
 }
 
 /// Parses a `where` object against the schema and the current field statistics.
+/// Largest `where` accepted, in serialized bytes. A model-written filter is untrusted input, so an
+/// oversized one is refused before it is parsed.
+pub const MAX_WHERE_BYTES: usize = 16 * 1024;
+
 pub fn parse(
     where_: &Value,
     schema: &[(String, FieldKind)],
     stats: &[FieldStats],
 ) -> Result<Parsed, ZenarError> {
+    let size = serde_json::to_string(where_)
+        .map(|s| s.len())
+        .unwrap_or(usize::MAX);
+    if size > MAX_WHERE_BYTES {
+        return Err(invalid(format!(
+            "where is {size} bytes; the limit is {MAX_WHERE_BYTES}. Use fewer conditions."
+        )));
+    }
     let object = where_
         .as_object()
         .ok_or_else(|| invalid("where must be a JSON object, for example {\"tenant\": \"A\"}"))?;
@@ -673,6 +685,17 @@ mod tests {
         let tenant = &schema["properties"]["tenant"]["anyOf"][0];
         assert_eq!(tenant["enum"], json!(["A", "B"]));
         assert!(schema["properties"]["and"].is_object());
+    }
+
+    #[test]
+    fn oversized_where_is_refused_before_parsing() {
+        let big: Vec<Value> = (0..2000)
+            .map(|i| json!({"tenant": format!("tenant-{i}")}))
+            .collect();
+        let err = parse(&json!({"or": big}), &schema(), &stats())
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("the limit is"), "{err}");
     }
 
     #[test]

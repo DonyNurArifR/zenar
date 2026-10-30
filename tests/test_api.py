@@ -452,7 +452,7 @@ def _shop(db):
 
 def test_describe_lists_fields_types_values_and_counts(db):
     c = _shop(db)
-    info = c.describe()
+    info = c.describe(scope=None)
     assert info["documents"] == 3
     fields = {f["name"]: f for f in info["fields"]}
     assert fields["tenant"]["type"] == "text"
@@ -462,27 +462,27 @@ def test_describe_lists_fields_types_values_and_counts(db):
 
 def test_describe_is_updated_by_writes(db):
     c = _shop(db)
-    assert {"value": "C", "count": 1} not in c.describe()["fields"][0]["values"]
+    assert {"value": "C", "count": 1} not in c.describe(scope=None)["fields"][0]["values"]
     c.add(4, [1.0] * 8, "pen", {"tenant": "C", "category": "office", "price": 2.0})
-    tenant = next(f for f in c.describe()["fields"] if f["name"] == "tenant")
+    tenant = next(f for f in c.describe(scope=None)["fields"] if f["name"] == "tenant")
     assert {"value": "C", "count": 1} in tenant["values"]
 
 
 def test_retrieve_with_where_operators_and_counts(db):
     c = _shop(db)
-    r = c.retrieve([1.0] * 8, top_k=1, where={"tenant": "A", "price": {"gte": 10, "lt": 30}})
+    r = c.retrieve([1.0] * 8, top_k=1, where={"tenant": "A", "price": {"gte": 10, "lt": 30}}, scope=None)
     assert r["matched"] == 1
     assert [h["text"] for h in r["hits"]] == ["wrench"]
-    r = c.retrieve([1.0] * 8, top_k=10, where={"or": [{"category": "tools"}, {"category": "electronics"}]})
+    r = c.retrieve([1.0] * 8, top_k=10, where={"or": [{"category": "tools"}, {"category": "electronics"}]}, scope=None)
     assert r["matched"] == 2
-    r = c.retrieve([1.0] * 8, top_k=10, where={"not": {"tenant": "A"}, "category": {"in": ["electronics", "tools"]}})
+    r = c.retrieve([1.0] * 8, top_k=10, where={"not": {"tenant": "A"}, "category": {"in": ["electronics", "tools"]}}, scope=None)
     assert r["matched"] == 1 and r["hits"][0]["text"] == "radio"
     assert r["warnings"] == []
 
 
 def test_retrieve_warns_when_a_value_matches_nothing(db):
     c = _shop(db)
-    r = c.retrieve([1.0] * 8, top_k=5, where={"tenant": "Z"})
+    r = c.retrieve([1.0] * 8, top_k=5, where={"tenant": "Z"}, scope=None)
     assert r["matched"] == 0 and r["hits"] == []
     assert len(r["warnings"]) == 1
     assert '"A"' in r["warnings"][0] and '"B"' in r["warnings"][0]
@@ -491,27 +491,27 @@ def test_retrieve_warns_when_a_value_matches_nothing(db):
 def test_retrieve_suggests_the_field_name_for_a_typo(db):
     c = _shop(db)
     with pytest.raises(zenar.InvalidFilterError, match='did you mean "category"'):
-        c.retrieve([1.0] * 8, where={"catgory": "tools"})
+        c.retrieve([1.0] * 8, where={"catgory": "tools"}, scope=None)
 
 
 def test_retrieve_rejects_wrong_types_with_the_expected_type(db):
     c = _shop(db)
     with pytest.raises(zenar.InvalidFilterError, match="expected a number"):
-        c.retrieve([1.0] * 8, where={"price": "cheap"})
+        c.retrieve([1.0] * 8, where={"price": "cheap"}, scope=None)
     with pytest.raises(zenar.InvalidFilterError, match="JSON-compatible"):
-        c.retrieve([1.0] * 8, where={"tenant": object()})
+        c.retrieve([1.0] * 8, where={"tenant": object()}, scope=None)
 
 
 def test_retrieve_without_where_matches_everything(db):
     c = _shop(db)
-    assert c.retrieve([1.0] * 8, top_k=10)["matched"] == 3
-    assert c.retrieve([1.0] * 8, top_k=10, where={})["matched"] == 3
+    assert c.retrieve([1.0] * 8, top_k=10, scope=None)["matched"] == 3
+    assert c.retrieve([1.0] * 8, top_k=10, where={}, scope=None)["matched"] == 3
 
 
 def test_find_values_and_tool_spec(db):
     c = _shop(db)
-    assert [v["value"] for v in c.find_values("category", "TOOL")] == ["tools"]
-    spec = c.tool_spec("search_shop")
+    assert [v["value"] for v in c.find_values("category", "TOOL", scope=None)] == ["tools"]
+    spec = c.tool_spec("search_shop", scope=None)
     assert spec["name"] == "search_shop"
     assert "category (text)" in spec["description"]
     assert set(spec["parameters"]["required"]) == {"query"}
@@ -523,7 +523,7 @@ def test_find_values_and_tool_spec(db):
 
 def test_tool_spec_prompt_only_lists_fields_and_values(db):
     c = _shop(db)
-    text = c.tool_spec("search_shop", prompt_only=True)
+    text = c.tool_spec("search_shop", prompt_only=True, scope=None)
     assert isinstance(text, str)
     assert "- tenant (text): " in text and '"A"' in text
     assert "- price (float): " in text
@@ -534,7 +534,7 @@ def test_tool_spec_is_a_dict_that_creates_a_prompt(db):
     from zenar.agent import ToolSpec
 
     c = _shop(db)
-    spec = c.tool_spec("search_shop")
+    spec = c.tool_spec("search_shop", scope=None)
     assert isinstance(spec, ToolSpec) and isinstance(spec, dict)
     assert spec["name"] == "search_shop"
     prompt = spec.create_prompt(instructions="You are a shop assistant.")
@@ -548,8 +548,73 @@ def test_tool_spec_is_a_dict_that_creates_a_prompt(db):
 
 def test_range_bounds_are_not_restricted_to_existing_values(db):
     c = _shop(db)
-    where = c.tool_spec("search_shop")["parameters"]["properties"]["where"]
+    where = c.tool_spec("search_shop", scope=None)["parameters"]["properties"]["where"]
     price = where["properties"]["price"]["anyOf"][1]["properties"]
     assert "enum" not in price["gte"] and "enum" not in price["lt"], "a range bound may be any number"
     tenant = where["properties"]["tenant"]["anyOf"][1]["properties"]
     assert set(tenant["eq"]["enum"]) == {"A", "B"}, "equality should steer to values that exist"
+
+
+def _two_tenants(db):
+    c = db.create_collection("tenanted", dimension=8)
+    rows = []
+    for i in range(12):
+        tenant = "acme" if i % 3 == 0 else "globex"
+        rows.append({"id": i, "vector": [float(i + 1)] * 8, "text": f"item {i}",
+                     "metadata": {"tenant": tenant, "category": "tools" if i % 2 else "garden"}})
+    c.add_many(rows)
+    return c
+
+
+def test_scope_is_required_on_every_agent_call(db):
+    c = _two_tenants(db)
+    with pytest.raises(TypeError):
+        c.describe()
+    with pytest.raises(TypeError):
+        c.retrieve([1.0] * 8)
+    with pytest.raises(TypeError):
+        c.tool_spec("search")
+    with pytest.raises(TypeError):
+        c.find_values("tenant", "a")
+    # Passing None is an explicit, visible choice.
+    assert c.describe(scope=None)["documents"] == 12
+
+
+def test_model_cannot_reach_another_tenant_through_where(db):
+    c = _two_tenants(db)
+    scope = {"tenant": "acme"}
+    # Asking for the other tenant directly.
+    assert c.retrieve([1.0] * 8, 50, {"tenant": "globex"}, scope=scope)["matched"] == 0
+    # Widening with "or".
+    widened = {"or": [{"tenant": "acme"}, {"tenant": "globex"}]}
+    assert c.retrieve([1.0] * 8, 50, widened, scope=scope)["matched"] == 4
+    # Excluding the scope with "not".
+    assert c.retrieve([1.0] * 8, 50, {"not": {"tenant": "acme"}}, scope=scope)["matched"] == 0
+    # Combining scope with the model's own conditions still works.
+    assert c.retrieve([1.0] * 8, 50, {"category": "tools"}, scope=scope)["matched"] == 2
+
+
+def test_discovery_inside_a_scope_mentions_no_other_tenant(db):
+    c = _two_tenants(db)
+    scope = {"tenant": "acme"}
+    info = c.describe(scope=scope)
+    assert info["documents"] == 4
+    assert "globex" not in str(info)
+    assert c.find_values("tenant", "glob", scope=scope) == []
+    spec = c.tool_spec("search", scope=scope)
+    assert "globex" not in str(spec)
+    assert "globex" not in c.tool_spec("search", prompt_only=True, scope=scope)
+
+
+def test_scope_with_an_unknown_field_is_an_error_not_an_empty_scope(db):
+    c = _two_tenants(db)
+    with pytest.raises(zenar.InvalidFilterError, match='did you mean "tenant"'):
+        c.describe(scope={"tennant": "acme"})
+
+
+def test_warnings_inside_a_scope_name_no_other_tenant(db):
+    c = _two_tenants(db)
+    r = c.retrieve([1.0] * 8, 5, {"tenant": "zzz"}, scope={"tenant": "acme"})
+    assert len(r["warnings"]) == 1
+    assert '"acme"' in r["warnings"][0]
+    assert "globex" not in r["warnings"][0]

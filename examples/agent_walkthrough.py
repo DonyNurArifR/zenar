@@ -17,7 +17,8 @@ c.add_many([{"id": i, "vector": [float(i + 1)] * 8, "text": t,
              "metadata": {"tenant": ten, "category": cat, "price": p, "in_stock": s}}
             for i, (t, ten, cat, p, s) in enumerate(rows, start=1)])
 
-spec = c.tool_spec("search_products")
+SCOPE = None  # a single-tenant catalogue; a multi-tenant app passes {"tenant": ...} here
+spec = c.tool_spec("search_products", scope=SCOPE)
 schema = spec["parameters"]
 where_schema = schema["properties"]["where"]
 
@@ -37,7 +38,7 @@ good = [
 ]
 for where, expected in good:
     jsonschema.validate({"query": "x", "where": where}, schema)
-    r = c.retrieve([1.0] * 8, top_k=10, where=where or None)
+    r = c.retrieve([1.0] * 8, top_k=10, where=where or None, scope=SCOPE)
     assert r["matched"] == expected, (where, r["matched"], expected)
 print(f"2. {len(good)} valid filters validate against the schema and return the expected counts: OK")
 
@@ -52,19 +53,19 @@ mistakes = [
 ]
 for where, fragment in mistakes:
     try:
-        c.retrieve([1.0] * 8, where=where)
+        c.retrieve([1.0] * 8, where=where, scope=SCOPE)
         raise AssertionError(f"accepted a bad filter: {where}")
     except Exception as e:
         assert fragment in str(e), (where, str(e))
         print(f"3. {json.dumps(where):<34} -> {type(e).__name__}: {e}")
 
 # 4. A value that does not exist: zero hits and a warning, not an error.
-r = c.retrieve([1.0] * 8, where={"tenant": "Z"})
+r = c.retrieve([1.0] * 8, where={"tenant": "Z"}, scope=SCOPE)
 assert r["hits"] == [] and r["matched"] == 0 and r["warnings"]
 print("4. unknown value:", r["warnings"][0])
 
 # 5. Results are plain JSON, as a tool result must be.
-r = c.retrieve([1.0] * 8, top_k=2, where={"tenant": "A"})
+r = c.retrieve([1.0] * 8, top_k=2, where={"tenant": "A"}, scope=SCOPE)
 json.dumps(r)
 print("5. tool result serializes to JSON:", json.dumps(r)[:110], "...")
 
@@ -75,11 +76,18 @@ for needle in ['- tenant (text): values "A", "B"', "- price (float):", '- in_sto
 print("6. prompt lists the live fields and values: OK")
 
 # 7. The spec is a snapshot: new values appear only after regenerating it.
-before = c.tool_spec("search_products").create_prompt()
+before = c.tool_spec("search_products", scope=SCOPE).create_prompt()
 assert '"C"' not in before
 c.add(5, [9.0] * 8, "lamp", {"tenant": "C", "category": "electronics", "price": 9.0, "in_stock": True})
 assert '"C"' not in before, "an old prompt must not change"
-assert '"C"' in c.tool_spec("search_products").create_prompt()
+assert '"C"' in c.tool_spec("search_products", scope=SCOPE).create_prompt()
 print("7. regenerating the spec after a write picks up the new tenant: OK")
+# 8. Tenant isolation: a scoped agent cannot see or reach another tenant.
+scoped = {"tenant": "A"}
+assert c.retrieve([1.0] * 8, where={"tenant": "B"}, scope=scoped)["matched"] == 0
+assert c.retrieve([1.0] * 8, where={"or": [{"tenant": "A"}, {"tenant": "B"}]}, scope=scoped)["matched"] == 2
+assert "\"B\"" not in str(c.describe(scope=scoped))
+assert "\"B\"" not in c.tool_spec("search_products", scope=scoped).create_prompt()
+print("8. tenant scope holds against where, or, and discovery: OK")
 db.close()
 print("ALL CHECKS PASSED")

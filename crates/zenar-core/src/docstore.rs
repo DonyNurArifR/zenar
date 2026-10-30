@@ -236,6 +236,23 @@ impl DocStore {
     /// Summary of every metadata field across live documents: how many documents have it, the
     /// distinct values with a count for each, and the range for ordered kinds.
     pub fn field_stats(&self) -> Vec<FieldStats> {
+        self.field_stats_with(&|row| self.is_live(row))
+    }
+
+    /// Like `field_stats`, but only over the given live rows (sorted ascending). Used for scoped
+    /// discovery, so a tenant sees only its own values.
+    pub fn field_stats_in(&self, rows: &[u32]) -> Vec<FieldStats> {
+        // A bitmap over the rows makes each membership test constant-time.
+        let mut bits = vec![0u64; self.rows.len() / 64 + 1];
+        for &row in rows {
+            bits[(row >> 6) as usize] |= 1u64 << (row & 63);
+        }
+        self.field_stats_with(&|row| {
+            self.is_live(row) && bits[(row >> 6) as usize] & (1u64 << (row & 63)) != 0
+        })
+    }
+
+    fn field_stats_with(&self, keep: &dyn Fn(u32) -> bool) -> Vec<FieldStats> {
         self.fields
             .iter()
             .enumerate()
@@ -244,19 +261,19 @@ impl DocStore {
                 let mut values: Vec<(MetaValue, usize)> = Vec::new();
                 let mut present = 0usize;
                 let (mut min, mut max): (Option<MetaValue>, Option<MetaValue>) = (None, None);
-                // BTreeMap order is value order, so the first and last live keys are the range.
+                // BTreeMap order is value order, so the first and last kept keys are the range.
                 for (key, rows) in &index.values {
-                    let live = rows.iter().filter(|&&r| self.is_live(r)).count();
-                    if live == 0 {
+                    let kept = rows.iter().filter(|&&r| keep(r)).count();
+                    if kept == 0 {
                         continue;
                     }
                     let value = key_to_value(key);
-                    present += live;
+                    present += kept;
                     if min.is_none() {
                         min = Some(value.clone());
                     }
                     max = Some(value.clone());
-                    values.push((value, live));
+                    values.push((value, kept));
                 }
                 // Most frequent first. The sort is stable, so ties keep value order.
                 values.sort_by_key(|entry| std::cmp::Reverse(entry.1));
@@ -270,6 +287,11 @@ impl DocStore {
                 }
             })
             .collect()
+    }
+
+    /// Live rows for which `filter` is TRUE, ascending. The filter must be validated first.
+    pub fn matching_rows(&self, filter: &Filter) -> Result<Vec<u32>, ZenarError> {
+        Ok(self.eval(filter, false)?.0)
     }
 
     /// Ids of every live document.

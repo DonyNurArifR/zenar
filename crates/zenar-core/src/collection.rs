@@ -450,13 +450,20 @@ impl Collection {
         Ok((hits, matched))
     }
 
-    /// Field statistics for discovery: every field with its type, counts and values.
-    pub fn describe(&self) -> Result<serde_json::Value, ZenarError> {
+    /// Discovery: every field with its type, the documents that carry it, and its values with
+    /// counts. `scope` limits both the documents counted and the values listed. `None` means
+    /// the whole collection, and should only be used by trusted code.
+    pub fn describe(
+        &self,
+        scope: Option<&serde_json::Value>,
+    ) -> Result<serde_json::Value, ZenarError> {
         let state = self.read_state()?;
         healthy(&state)?;
-        let stats = self.cached_stats(&state)?;
-        let documents = state.docs.live_count();
-        let fields: Vec<serde_json::Value> = stats
+        let (fields, documents) = match self.scope_rows(&state, scope)? {
+            None => (self.cached_stats(&state)?, state.docs.live_count()),
+            Some(rows) => (Arc::new(state.docs.field_stats_in(&rows)), rows.len()),
+        };
+        let fields: Vec<serde_json::Value> = fields
             .iter()
             .map(|stat| crate::agent::field_json(stat, documents))
             .collect();
@@ -469,17 +476,21 @@ impl Collection {
         }))
     }
 
-    /// Finds values of one field that contain `text` (case-insensitive), most frequent first.
-    /// For fields with many distinct values, where listing them all is not useful.
+    /// Finds values of one field that contain `text` (case-insensitive), most frequent first,
+    /// within `scope`. For fields with many distinct values, where listing them is not useful.
     pub fn find_values(
         &self,
         field: &str,
         text: &str,
         limit: usize,
+        scope: Option<&serde_json::Value>,
     ) -> Result<Vec<serde_json::Value>, ZenarError> {
         let state = self.read_state()?;
         healthy(&state)?;
-        let stats = self.cached_stats(&state)?;
+        let stats = match self.scope_rows(&state, scope)? {
+            None => self.cached_stats(&state)?,
+            Some(rows) => Arc::new(state.docs.field_stats_in(&rows)),
+        };
         let stat = stats.iter().find(|s| s.name == field).ok_or_else(|| {
             let names: Vec<&str> = stats.iter().map(|s| s.name.as_str()).collect();
             ZenarError::InvalidFilter(format!(
@@ -493,59 +504,109 @@ impl Collection {
             .iter()
             .filter(|(value, _)| crate::agent::value_text(value).to_lowercase().contains(&needle))
             .take(limit)
-            .map(|(value, count)| serde_json::json!({"value": crate::agent::value_json(value), "count": count}))
+            .map(|(value, count)| {
+                serde_json::json!({"value": crate::agent::value_json(value), "count": count})
+            })
             .collect())
     }
 
-    /// Retrieval for an agent. `where_` is the JSON filter (see `agent`). Returns the hits, how
-    /// many documents matched before `top_k`, and warnings about values that match nothing.
+    /// Retrieval for an agent.
+    ///
+    /// `where_` is the model's filter. `scope` is the caller's fixed filter, such as the tenant.
+    /// The two are ANDed on the server, so the model cannot widen the scope with `or` or `not`.
+    /// Returns the hits, how many documents matched before `top_k`, and warnings about the model's
+    /// values. Warnings about `scope` are not reported.
     pub fn retrieve(
         &self,
         query: &[f32],
         top_k: usize,
         where_: Option<&serde_json::Value>,
+        scope: Option<&serde_json::Value>,
     ) -> Result<Retrieval, ZenarError> {
-        let parsed = match where_ {
-            None => crate::agent::Parsed {
-                filter: None,
-                warnings: Vec::new(),
-            },
-            Some(value) => {
-                // A separate lock acquisition from the search below. Holding one read lock across
-                // both could deadlock with a writer that is waiting.
-                let state = self.read_state()?;
-                healthy(&state)?;
-                let stats = self.cached_stats(&state)?;
-                crate::agent::parse(value, state.docs.fields(), &stats)?
-            }
+        let (where_filter, scope_filter, warnings) = {
+            // One read lock for parsing. It is released before the search takes its own.
+            let state = self.read_state()?;
+            healthy(&state)?;
+            let fields = state.docs.fields();
+            // The model's values and the warnings about them must come from inside the scope, or a
+            // warning could name another tenant's values. Statistics are only needed for the model's
+            // `where`, so they are computed only then.
+            let (where_filter, warnings) = match where_ {
+                None => (None, Vec::new()),
+                Some(value) => {
+                    let stats = match self.scope_rows(&state, scope)? {
+                        None => self.cached_stats(&state)?,
+                        Some(rows) => Arc::new(state.docs.field_stats_in(&rows)),
+                    };
+                    let parsed = crate::agent::parse(value, fields, &stats)?;
+                    (parsed.filter, parsed.warnings)
+                }
+            };
+            // The scope's own warnings are not reported, so its statistics are not needed.
+            let scope_filter = match scope {
+                None => None,
+                Some(value) => crate::agent::parse(value, fields, &[])?.filter,
+            };
+            (where_filter, scope_filter, warnings)
         };
-        let (hits, matched) = self.search_counted(query, top_k, parsed.filter.as_ref())?;
+        let filter = match (scope_filter, where_filter) {
+            (None, None) => None,
+            (Some(scope), None) => Some(scope),
+            (None, Some(model)) => Some(model),
+            (Some(scope), Some(model)) => Some(Filter::And(vec![scope, model])),
+        };
+        let (hits, matched) = self.search_counted(query, top_k, filter.as_ref())?;
         Ok(Retrieval {
             hits,
             matched,
-            warnings: parsed.warnings,
+            warnings,
         })
     }
 
-    /// Fields and their values as plain text, for a prompt (see `agent::fields_prompt`).
-    pub fn fields_prompt(&self) -> Result<String, ZenarError> {
+    /// Fields and their values as plain text, for a prompt, within `scope`.
+    pub fn fields_prompt(&self, scope: Option<&serde_json::Value>) -> Result<String, ZenarError> {
         let state = self.read_state()?;
         healthy(&state)?;
-        let stats = self.cached_stats(&state)?;
+        let stats = match self.scope_rows(&state, scope)? {
+            None => self.cached_stats(&state)?,
+            Some(rows) => Arc::new(state.docs.field_stats_in(&rows)),
+        };
         Ok(crate::agent::fields_prompt(&stats))
     }
 
-    /// Tool definition for this collection (see `agent::tool_spec`).
-    pub fn tool_spec(&self, tool_name: &str) -> Result<serde_json::Value, ZenarError> {
+    /// Tool definition for this collection, within `scope` (see `agent::tool_spec`).
+    pub fn tool_spec(
+        &self,
+        tool_name: &str,
+        scope: Option<&serde_json::Value>,
+    ) -> Result<serde_json::Value, ZenarError> {
         let state = self.read_state()?;
         healthy(&state)?;
-        let stats = self.cached_stats(&state)?;
+        let (stats, documents) = match self.scope_rows(&state, scope)? {
+            None => (self.cached_stats(&state)?, state.docs.live_count()),
+            Some(rows) => (Arc::new(state.docs.field_stats_in(&rows)), rows.len()),
+        };
         Ok(crate::agent::tool_spec(
-            tool_name,
-            &self.name,
-            state.docs.live_count(),
-            &stats,
+            tool_name, &self.name, documents, &stats,
         ))
+    }
+
+    /// The live rows that `scope` allows. `None` for no scope, meaning the whole collection.
+    /// An empty scope object allows every live document.
+    fn scope_rows(
+        &self,
+        state: &State,
+        scope: Option<&serde_json::Value>,
+    ) -> Result<Option<Vec<u32>>, ZenarError> {
+        let Some(value) = scope else {
+            return Ok(None);
+        };
+        let stats = self.cached_stats(state)?;
+        let filter = crate::agent::parse(value, state.docs.fields(), &stats)?
+            .filter
+            .unwrap_or(Filter::And(Vec::new()));
+        validate(&filter, state.docs.fields())?;
+        Ok(Some(state.docs.matching_rows(&filter)?))
     }
 
     /// Reconciles the document log and the vector index after a restart (spec section 26).

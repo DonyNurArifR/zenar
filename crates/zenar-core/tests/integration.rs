@@ -750,7 +750,7 @@ fn describe_reports_fields_values_and_counts_and_follows_writes() {
     ])
     .unwrap();
 
-    let info = c.describe().unwrap();
+    let info = c.describe(None).unwrap();
     assert_eq!(info["documents"], 3);
     let fields = info["fields"].as_array().unwrap();
     let tenant = fields.iter().find(|f| f["name"] == "tenant").unwrap();
@@ -765,7 +765,7 @@ fn describe_reports_fields_values_and_counts_and_follows_writes() {
     c.add(4, &[1.0; 8], "new", vec![("tenant".into(), text("C"))])
         .unwrap();
     c.delete(1).unwrap();
-    let info = c.describe().unwrap();
+    let info = c.describe(None).unwrap();
     let tenant = info["fields"]
         .as_array()
         .unwrap()
@@ -802,14 +802,24 @@ fn retrieve_reports_matches_and_warns_about_missing_values() {
     .unwrap();
 
     let r = c
-        .retrieve(&[1.0; 8], 1, Some(&serde_json::json!({"tenant": "A"})))
+        .retrieve(
+            &[1.0; 8],
+            1,
+            Some(&serde_json::json!({"tenant": "A"})),
+            None,
+        )
         .unwrap();
     assert_eq!(r.hits.len(), 1);
     assert_eq!(r.matched, 2, "matched counts every document before top_k");
     assert!(r.warnings.is_empty());
 
     let r = c
-        .retrieve(&[1.0; 8], 5, Some(&serde_json::json!({"tenant": "Z"})))
+        .retrieve(
+            &[1.0; 8],
+            5,
+            Some(&serde_json::json!({"tenant": "Z"})),
+            None,
+        )
         .unwrap();
     assert!(r.hits.is_empty());
     assert_eq!(r.matched, 0);
@@ -821,12 +831,18 @@ fn retrieve_reports_matches_and_warns_about_missing_values() {
             &[1.0; 8],
             5,
             Some(&serde_json::json!({"price": {"gte": 15, "lt": 35}})),
+            None,
         )
         .unwrap();
     assert_eq!(r.matched, 2);
 
     let err = c
-        .retrieve(&[1.0; 8], 5, Some(&serde_json::json!({"catgory": "faq"})))
+        .retrieve(
+            &[1.0; 8],
+            5,
+            Some(&serde_json::json!({"catgory": "faq"})),
+            None,
+        )
         .unwrap_err();
     assert!(
         err.to_string().contains("did you mean \"category\""),
@@ -834,7 +850,7 @@ fn retrieve_reports_matches_and_warns_about_missing_values() {
     );
 
     let r = c
-        .retrieve(&[1.0; 8], 5, Some(&serde_json::json!({})))
+        .retrieve(&[1.0; 8], 5, Some(&serde_json::json!({})), None)
         .unwrap();
     assert_eq!(r.matched, 3, "an empty where matches everything");
     fs::remove_dir_all(&dir).ok();
@@ -852,13 +868,13 @@ fn find_values_searches_values_and_tool_spec_lists_them() {
     ])
     .unwrap();
 
-    let found = c.find_values("tenant", "NORTH", 10).unwrap();
+    let found = c.find_values("tenant", "NORTH", 10, None).unwrap();
     let names: Vec<&str> = found.iter().map(|v| v["value"].as_str().unwrap()).collect();
     assert_eq!(names.len(), 2, "{names:?}");
     assert!(names.iter().all(|n| n.starts_with("north")));
-    assert!(c.find_values("nope", "x", 10).is_err());
+    assert!(c.find_values("nope", "x", 10, None).is_err());
 
-    let spec = c.tool_spec("search_products").unwrap();
+    let spec = c.tool_spec("search_products", None).unwrap();
     assert_eq!(spec["name"], "search_products");
     assert!(
         spec["parameters"].get("description").is_none(),
@@ -875,5 +891,139 @@ fn find_values_searches_values_and_tool_spec_lists_them() {
             .iter()
             .any(|v| v == "electronics")
     );
+    fs::remove_dir_all(&dir).ok();
+}
+
+/// A tenant's scope must hold against anything the model writes in `where`, and discovery must
+/// show nothing outside the scope.
+#[test]
+fn scope_holds_against_model_filters_and_discovery() {
+    let dir = temp_dir("scope");
+    let db = VectorDB::open(&dir).unwrap();
+    let c = db.create_collection("sc", None, 4).unwrap();
+    let mut batch = Vec::new();
+    for id in 0..30u64 {
+        let tenant = if id % 3 == 0 { "A" } else { "B" };
+        batch.push(doc_with(
+            id,
+            tenant,
+            if id % 2 == 0 { "faq" } else { "tools" },
+            id as f64,
+        ));
+    }
+    c.add_many(&batch).unwrap();
+    let scope_a = serde_json::json!({"tenant": "A"});
+    let a_count = 10;
+    let q = [1.0f32; 8];
+
+    // The model asks for another tenant directly.
+    let r = c
+        .retrieve(
+            &q,
+            50,
+            Some(&serde_json::json!({"tenant": "B"})),
+            Some(&scope_a),
+        )
+        .unwrap();
+    assert_eq!(r.matched, 0, "tenant B must not be reachable from scope A");
+
+    // The model tries to widen the scope with `or`.
+    let r = c
+        .retrieve(
+            &q,
+            50,
+            Some(&serde_json::json!({"or": [{"tenant": "A"}, {"tenant": "B"}]})),
+            Some(&scope_a),
+        )
+        .unwrap();
+    assert_eq!(r.matched, a_count);
+    assert!(
+        r.hits
+            .iter()
+            .all(|h| h.metadata.contains(&("tenant".to_string(), text("A"))))
+    );
+
+    // The model tries to exclude the scope with `not`.
+    let r = c
+        .retrieve(
+            &q,
+            50,
+            Some(&serde_json::json!({"not": {"tenant": "A"}})),
+            Some(&scope_a),
+        )
+        .unwrap();
+    assert_eq!(r.matched, 0);
+
+    // Without a scope, the same request sees everything. That is the trusted path only.
+    let r = c
+        .retrieve(
+            &q,
+            50,
+            Some(&serde_json::json!({"not": {"tenant": "A"}})),
+            None,
+        )
+        .unwrap();
+    assert_eq!(r.matched, 20);
+
+    // Discovery inside the scope mentions no other tenant.
+    let info = c.describe(Some(&scope_a)).unwrap();
+    assert_eq!(info["documents"], a_count);
+    let rendered = info.to_string();
+    assert!(
+        !rendered.contains("\"B\""),
+        "tenant B leaked into describe: {rendered}"
+    );
+    let found = c.find_values("tenant", "b", 10, Some(&scope_a)).unwrap();
+    assert!(found.is_empty(), "tenant B leaked into find_values");
+    let spec = c.tool_spec("search", Some(&scope_a)).unwrap();
+    let spec_text = spec.to_string();
+    assert!(
+        !spec_text.contains("\"B\""),
+        "tenant B leaked into the tool spec"
+    );
+    assert!(
+        c.fields_prompt(Some(&scope_a))
+            .unwrap()
+            .find("\"B\"")
+            .is_none()
+    );
+
+    // An unknown field in the scope is an error, not a silent empty scope.
+    assert!(
+        c.describe(Some(&serde_json::json!({"tennant": "A"})))
+            .is_err()
+    );
+
+    // An empty scope allows everything.
+    assert_eq!(
+        c.describe(Some(&serde_json::json!({}))).unwrap()["documents"],
+        30
+    );
+    fs::remove_dir_all(&dir).ok();
+}
+
+/// A warning about a missing value must not name values outside the scope.
+#[test]
+fn warnings_inside_a_scope_do_not_name_other_tenants() {
+    let dir = temp_dir("scope-warning");
+    let db = VectorDB::open(&dir).unwrap();
+    let c = db.create_collection("sw", None, 4).unwrap();
+    c.add_many(&[
+        doc_with(1, "acme", "x", 1.0),
+        doc_with(2, "globex", "x", 2.0),
+    ])
+    .unwrap();
+    let scope = serde_json::json!({"tenant": "acme"});
+    let r = c
+        .retrieve(
+            &[1.0; 8],
+            5,
+            Some(&serde_json::json!({"tenant": "zzz"})),
+            Some(&scope),
+        )
+        .unwrap();
+    assert_eq!(r.warnings.len(), 1);
+    assert!(r.warnings[0].contains("\"acme\""), "{:?}", r.warnings);
+    assert!(!r.warnings[0].contains("globex"), "{:?}", r.warnings);
     fs::remove_dir_all(&dir).ok();
 }

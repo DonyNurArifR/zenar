@@ -91,25 +91,37 @@ Catch `ZenarError` to handle any library error.
 
 ## Agent tools
 
-`search` is pure vector search, with an optional `filter=` or keyword equality. Agents use `retrieve` and the
-discovery methods below. They are built for a model that picks the filter itself.
+`search` is pure vector search. Agents use `retrieve` and the discovery methods below. They are built for a model
+that writes the filter itself, so they add a scope the model cannot change.
 
 ```python
 c = db.get_collection("products")
+scope = {"tenant": tenant_of(current_user)}   # fixed by your application, never by the model
 
-c.describe()                 # every field: type, documents, values with counts, or min/max for numbers
-c.find_values("category", "elec")   # values that contain "elec", most frequent first
-c.tool_spec("search_products")      # tool definition: description and JSON Schema for the arguments
-spec = c.tool_spec("search_products")  # a dict you can pass to the tool API as is
-prompt = spec.create_prompt(instructions="You help customers find products.")  # ready-to-use system prompt section
+c.describe(scope=scope)                              # fields: type, documents, values with counts
+c.find_values("category", "elec", scope=scope)       # values containing "elec", most frequent first
+spec = c.tool_spec("search_products", scope=scope)   # tool definition, a dict with create_prompt()
+spec.create_prompt(instructions="You help customers find products.")
+c.tool_spec("search_products", prompt_only=True, scope=scope)   # just the fields and values, as text
 
-r = c.retrieve(embed(user_query), top_k=5, where={"tenant": "A", "price": {"lt": 100}})
+r = c.retrieve(embed(user_query), top_k=5, where=model_filter, scope=scope)
 r["hits"]      # the results
 r["matched"]   # documents that matched the filter, before top_k cut the list
 r["warnings"]  # for example: no live document has tenant = "Z"; values that exist: "A", "B"
 ```
 
 The caller embeds the text. `retrieve` takes the vector.
+
+### `scope` is required
+
+Every agent method takes `scope` as a keyword argument, and it has no default. Leaving it out is a `TypeError`.
+Passing `scope=None` means the whole collection. Use it only from trusted code, never for a model-facing tool.
+
+The scope is combined with the model's `where` on the server, with AND. The model cannot widen it with `or`, and it
+cannot exclude it with `not`. Discovery (`describe`, `find_values`, `tool_spec`, the prompt, and the warnings) is
+computed over the documents inside the scope, so it names no value from outside.
+
+An unknown field in the scope is an error, not an empty scope.
 
 ### The `where` format
 
@@ -125,23 +137,35 @@ A JSON object. Each key is a field name. A plain value means equality. An object
 | `{"not": {...}}` | the object does not match |
 
 Operators: `eq`, `ne`, `gt`, `gte`, `lt`, `lte`, `in`, `nin`. Timestamps are RFC 3339 strings. Field names are
-case-sensitive. An empty object matches everything.
+case-sensitive. An empty object matches everything. `and`, `or` and `not` cannot be field names. A `where` larger than
+16 KB is refused.
 
 ### Errors that help a model fix the filter
 
 - An unknown field names the valid fields, and suggests a close one: `unknown field "catgory", did you mean "category"?`
 - A wrong type names the expected type: `field "price" is float; expected a number, got the string "cheap"`.
 - An unknown operator lists the valid ones.
-- A value that no live document has is not an error. It returns zero hits, and `warnings` lists the values that exist.
+- A value that no document in scope has is not an error. It returns zero hits, and `warnings` lists the values that
+  exist in scope.
 
-### What the tool definition contains
+### What the model sees
 
-`tool_spec` describes the collection in plain language: each field with its type and its values, or its range for
-a field with many values. The `where` schema uses `enum` for short value lists, so the model is steered to values
-that exist. Use the same dict in OpenAI-style (`parameters`) or Anthropic-style (`input_schema`) tool calls.
+`tool_spec` describes the collection in plain language: each field with its type and its values, or its range for a
+field with many values. The `where` schema uses `enum` for short value lists, so the model is steered to values that
+exist. Range bounds (`gt`, `gte`, `lt`, `lte`) are not restricted to existing values.
+
+### Limits and things your application must do
+
+- Document text is data. If it can contain instructions written by someone else, do not present it to the model as
+  instructions. Keep it inside a clearly marked data section.
+- `retrieve` does not embed text. Your integration embeds the model's `query`, so an unbounded `top_k` is your
+  responsibility. Cap it when you forward the model's arguments.
+- A scope is only as strong as the value you pass. Derive it from the authenticated user, not from the model's output.
+- Discovery over a large scope costs more than retrieval. `describe` on a 5% scope of 1M documents takes about 14 ms,
+  and it is not cached. Cache the spec per session if the data changes slowly.
 
 ### Discovery for many values
 
 For a field with more than 200 distinct values, `describe` reports the range and the most frequent values, and does not
-list them all. `find_values(field, text)` searches the values instead. Use it when the user names something specific.
-
+list them all. `find_values(field, text, scope=...)` searches the values instead. Use it when the user names something
+specific.
