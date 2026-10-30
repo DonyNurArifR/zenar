@@ -527,6 +527,14 @@ impl Collection {
         })
     }
 
+    /// Fields and their values as plain text, for a prompt (see `agent::fields_prompt`).
+    pub fn fields_prompt(&self) -> Result<String, ZenarError> {
+        let state = self.read_state()?;
+        healthy(&state)?;
+        let stats = self.cached_stats(&state)?;
+        Ok(crate::agent::fields_prompt(&stats))
+    }
+
     /// Tool definition for this collection (see `agent::tool_spec`).
     pub fn tool_spec(&self, tool_name: &str) -> Result<serde_json::Value, ZenarError> {
         let state = self.read_state()?;

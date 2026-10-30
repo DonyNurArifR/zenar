@@ -497,6 +497,25 @@ pub fn tool_spec(name: &str, collection: &str, documents: usize, stats: &[FieldS
     })
 }
 
+/// Plain text listing only the fields and their values, one per line, ready to paste into a prompt.
+pub fn fields_prompt(stats: &[FieldStats]) -> String {
+    if stats.is_empty() {
+        return "No metadata fields.".to_string();
+    }
+    stats
+        .iter()
+        .map(|stat| {
+            format!(
+                "- {} ({}): {}",
+                stat.name,
+                stat.kind.as_str(),
+                summary(stat)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 fn summary(stat: &FieldStats) -> String {
     if stat.values.len() <= VALUE_LIST_LIMIT {
         if stat.values.is_empty() {

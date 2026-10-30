@@ -554,7 +554,19 @@ impl PyCollection {
 
     /// Tool definition for this collection, in the `name` / `description` / `parameters` shape.
     /// `input_schema` carries the same schema under the name some APIs use.
-    fn tool_spec<'py>(&self, py: Python<'py>, name: &str) -> PyResult<Bound<'py, PyAny>> {
+    /// With `prompt_only=True`, returns just the fields and their values as text for a prompt.
+    #[pyo3(signature = (name, prompt_only=false))]
+    fn tool_spec<'py>(
+        &self,
+        py: Python<'py>,
+        name: &str,
+        prompt_only: bool,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        if prompt_only {
+            let inner = Arc::clone(&self.inner);
+            let text = guarded(py, move || inner.fields_prompt())?;
+            return Ok(PyString::new(py, &text).into_any());
+        }
         let inner = Arc::clone(&self.inner);
         let name = name.to_string();
         let spec = guarded(py, move || inner.tool_spec(&name))?;

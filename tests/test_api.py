@@ -519,3 +519,13 @@ def test_find_values_and_tool_spec(db):
     assert set(where["properties"]) >= {"tenant", "category", "price", "and", "or", "not"}
     assert set(where["properties"]["tenant"]["anyOf"][0]["enum"]) == {"A", "B"}
     assert spec["input_schema"] == spec["parameters"]
+
+
+def test_tool_spec_prompt_only_lists_fields_and_values(db):
+    c = _shop(db)
+    text = c.tool_spec("search_shop", prompt_only=True)
+    assert isinstance(text, str)
+    assert "- tenant (text): " in text and '"A"' in text
+    assert "- price (float): " in text
+    assert "description" not in text and "parameters" not in text
+
