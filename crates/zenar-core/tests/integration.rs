@@ -724,3 +724,156 @@ fn random_operations_agree_with_a_reference_model_across_reopens() {
     drop(db);
     fs::remove_dir_all(&dir).ok();
 }
+
+fn doc_with(id: u64, tenant: &str, category: &str, price: f64) -> zenar_core::Record {
+    zenar_core::Record {
+        id,
+        vector: (0..8).map(|j| ((id + j) % 9) as f32 + 0.5).collect(),
+        text: format!("doc {id}"),
+        metadata: vec![
+            ("tenant".into(), text(tenant)),
+            ("category".into(), text(category)),
+            ("price".into(), MetaValue::Float(price)),
+        ],
+    }
+}
+
+#[test]
+fn describe_reports_fields_values_and_counts_and_follows_writes() {
+    let dir = temp_dir("describe");
+    let db = VectorDB::open(&dir).unwrap();
+    let c = db.create_collection("shop", None, 4).unwrap();
+    c.add_many(&[
+        doc_with(1, "A", "faq", 10.0),
+        doc_with(2, "A", "tools", 20.0),
+        doc_with(3, "B", "faq", 30.0),
+    ])
+    .unwrap();
+
+    let info = c.describe().unwrap();
+    assert_eq!(info["documents"], 3);
+    let fields = info["fields"].as_array().unwrap();
+    let tenant = fields.iter().find(|f| f["name"] == "tenant").unwrap();
+    assert_eq!(tenant["type"], "text");
+    assert_eq!(tenant["values"][0]["value"], "A");
+    assert_eq!(tenant["values"][0]["count"], 2);
+    let price = fields.iter().find(|f| f["name"] == "price").unwrap();
+    assert_eq!(price["min"], 10.0);
+    assert_eq!(price["max"], 30.0);
+
+    // Cached statistics must not survive a write.
+    c.add(4, &[1.0; 8], "new", vec![("tenant".into(), text("C"))])
+        .unwrap();
+    c.delete(1).unwrap();
+    let info = c.describe().unwrap();
+    let tenant = info["fields"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|f| f["name"] == "tenant")
+        .unwrap()
+        .clone();
+    let values: Vec<(String, u64)> = tenant["values"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| {
+            (
+                v["value"].as_str().unwrap().to_string(),
+                v["count"].as_u64().unwrap(),
+            )
+        })
+        .collect();
+    assert!(values.contains(&("A".to_string(), 1)), "{values:?}");
+    assert!(values.contains(&("C".to_string(), 1)), "{values:?}");
+    fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn retrieve_reports_matches_and_warns_about_missing_values() {
+    let dir = temp_dir("retrieve");
+    let db = VectorDB::open(&dir).unwrap();
+    let c = db.create_collection("r", None, 4).unwrap();
+    c.add_many(&[
+        doc_with(1, "A", "faq", 10.0),
+        doc_with(2, "A", "tools", 20.0),
+        doc_with(3, "B", "faq", 30.0),
+    ])
+    .unwrap();
+
+    let r = c
+        .retrieve(&[1.0; 8], 1, Some(&serde_json::json!({"tenant": "A"})))
+        .unwrap();
+    assert_eq!(r.hits.len(), 1);
+    assert_eq!(r.matched, 2, "matched counts every document before top_k");
+    assert!(r.warnings.is_empty());
+
+    let r = c
+        .retrieve(&[1.0; 8], 5, Some(&serde_json::json!({"tenant": "Z"})))
+        .unwrap();
+    assert!(r.hits.is_empty());
+    assert_eq!(r.matched, 0);
+    assert_eq!(r.warnings.len(), 1, "{:?}", r.warnings);
+    assert!(r.warnings[0].contains("\"A\""), "{:?}", r.warnings);
+
+    let r = c
+        .retrieve(
+            &[1.0; 8],
+            5,
+            Some(&serde_json::json!({"price": {"gte": 15, "lt": 35}})),
+        )
+        .unwrap();
+    assert_eq!(r.matched, 2);
+
+    let err = c
+        .retrieve(&[1.0; 8], 5, Some(&serde_json::json!({"catgory": "faq"})))
+        .unwrap_err();
+    assert!(
+        err.to_string().contains("did you mean \"category\""),
+        "{err}"
+    );
+
+    let r = c
+        .retrieve(&[1.0; 8], 5, Some(&serde_json::json!({})))
+        .unwrap();
+    assert_eq!(r.matched, 3, "an empty where matches everything");
+    fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn find_values_searches_values_and_tool_spec_lists_them() {
+    let dir = temp_dir("agent-tools");
+    let db = VectorDB::open(&dir).unwrap();
+    let c = db.create_collection("t", None, 4).unwrap();
+    c.add_many(&[
+        doc_with(1, "north-east", "electronics", 1.0),
+        doc_with(2, "south", "appliances", 2.0),
+        doc_with(3, "north-west", "electronics", 3.0),
+    ])
+    .unwrap();
+
+    let found = c.find_values("tenant", "NORTH", 10).unwrap();
+    let names: Vec<&str> = found.iter().map(|v| v["value"].as_str().unwrap()).collect();
+    assert_eq!(names.len(), 2, "{names:?}");
+    assert!(names.iter().all(|n| n.starts_with("north")));
+    assert!(c.find_values("nope", "x", 10).is_err());
+
+    let spec = c.tool_spec("search_products").unwrap();
+    assert_eq!(spec["name"], "search_products");
+    assert!(
+        spec["parameters"].get("description").is_none(),
+        "description belongs at the top level"
+    );
+    let text_desc = spec["description"].as_str().unwrap();
+    assert!(text_desc.contains("category (text)"), "{text_desc}");
+    let enum_values =
+        &spec["parameters"]["properties"]["where"]["properties"]["category"]["anyOf"][0]["enum"];
+    assert!(
+        enum_values
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|v| v == "electronics")
+    );
+    fs::remove_dir_all(&dir).ok();
+}

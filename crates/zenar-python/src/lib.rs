@@ -206,6 +206,54 @@ fn metadata_from_py(metadata: Option<&Bound<'_, PyDict>>) -> PyResult<Vec<(Strin
         .collect()
 }
 
+/// Converts a JSON value to Python objects: dicts for objects, lists for arrays.
+fn json_to_py<'py>(py: Python<'py>, value: &serde_json::Value) -> PyResult<Bound<'py, PyAny>> {
+    use serde_json::Value;
+    Ok(match value {
+        Value::Null => py.None().into_bound(py),
+        Value::Bool(b) => PyBool::new(py, *b).to_owned().into_any(),
+        Value::Number(n) => {
+            if let Some(i) = n.as_i64() {
+                i.into_pyobject(py)?.into_any()
+            } else if let Some(u) = n.as_u64() {
+                u.into_pyobject(py)?.into_any()
+            } else {
+                n.as_f64().unwrap_or(f64::NAN).into_pyobject(py)?.into_any()
+            }
+        }
+        Value::String(s) => PyString::new(py, s).into_any(),
+        Value::Array(items) => {
+            let list = PyList::empty(py);
+            for item in items {
+                list.append(json_to_py(py, item)?)?;
+            }
+            list.into_any()
+        }
+        Value::Object(map) => {
+            let dict = PyDict::new(py);
+            for (k, v) in map {
+                dict.set_item(k, json_to_py(py, v)?)?;
+            }
+            dict.into_any()
+        }
+    })
+}
+
+/// Serializes a Python `where` object to JSON with the standard `json` module, so the same
+/// JSON-compatible values are accepted here as everywhere else.
+fn py_to_json(py: Python<'_>, value: &Bound<'_, PyAny>) -> PyResult<serde_json::Value> {
+    let text: String = py
+        .import("json")?
+        .call_method1("dumps", (value,))
+        .map_err(|_| {
+            InvalidFilterError::new_err(
+                "where must be JSON-compatible (strings, numbers, booleans, lists, dicts)",
+            )
+        })?
+        .extract()?;
+    serde_json::from_str(&text).map_err(|e| InvalidFilterError::new_err(format!("where: {e}")))
+}
+
 /// Converts a Python integer argument to u64. Negative, oversized, and non-integer
 /// values raise `InvalidArgumentError`, not PyO3's `OverflowError` or `TypeError`.
 fn py_u64(value: &Bound<'_, PyAny>, what: &str) -> PyResult<u64> {
@@ -447,6 +495,70 @@ impl PyCollection {
             .collect::<PyResult<Vec<u64>>>()?;
         let inner = Arc::clone(&self.inner);
         guarded(py, move || inner.delete_many(&ids))
+    }
+
+    /// Field-level description for discovery: every metadata field with its type, the number of
+    /// documents that carry it, and its distinct values with counts (or range for long lists).
+    fn describe<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let inner = Arc::clone(&self.inner);
+        let info = guarded(py, move || inner.describe())?;
+        json_to_py(py, &info)
+    }
+
+    /// Finds values of one field that contain `text` (case-insensitive), most frequent first.
+    #[pyo3(signature = (field, text, limit=20))]
+    fn find_values<'py>(
+        &self,
+        py: Python<'py>,
+        field: &str,
+        text: &str,
+        limit: usize,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let inner = Arc::clone(&self.inner);
+        let field = field.to_string();
+        let text = text.to_string();
+        let found = guarded(py, move || inner.find_values(&field, &text, limit))?;
+        json_to_py(py, &serde_json::Value::Array(found))
+    }
+
+    /// Filtered retrieval for an agent. `where` is a JSON-compatible dict such as
+    /// `{"tenant": "A", "price": {"gte": 100}}`. Returns `{"hits", "matched", "warnings"}`.
+    /// `matched` counts every document that matched the filter, before `top_k` cut the list.
+    #[pyo3(signature = (vector, top_k=10, r#where=None))]
+    fn retrieve<'py>(
+        &self,
+        py: Python<'py>,
+        vector: &Bound<'_, PyAny>,
+        top_k: usize,
+        r#where: Option<&Bound<'_, PyAny>>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let vector = extract_vector(vector)?;
+        let where_json = match r#where {
+            Some(w) if !w.is_none() => Some(py_to_json(py, w)?),
+            _ => None,
+        };
+        let inner = Arc::clone(&self.inner);
+        let retrieval = guarded(py, move || {
+            inner.retrieve(&vector, top_k, where_json.as_ref())
+        })?;
+        let hits = PyList::empty(py);
+        for hit in &retrieval.hits {
+            hits.append(hit_to_py(py, hit)?)?;
+        }
+        let out = PyDict::new(py);
+        out.set_item("hits", hits)?;
+        out.set_item("matched", retrieval.matched)?;
+        out.set_item("warnings", retrieval.warnings)?;
+        Ok(out.into_any())
+    }
+
+    /// Tool definition for this collection, in the `name` / `description` / `parameters` shape.
+    /// `input_schema` carries the same schema under the name some APIs use.
+    fn tool_spec<'py>(&self, py: Python<'py>, name: &str) -> PyResult<Bound<'py, PyAny>> {
+        let inner = Arc::clone(&self.inner);
+        let name = name.to_string();
+        let spec = guarded(py, move || inner.tool_spec(&name))?;
+        json_to_py(py, &spec)
     }
 
     fn count(&self, py: Python<'_>) -> PyResult<usize> {

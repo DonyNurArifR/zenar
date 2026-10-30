@@ -11,9 +11,10 @@ pub fn valid_identifier(name: &str) -> bool {
             .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
 }
 
-/// Metadata field names follow the same rule as collection names.
+/// Metadata field names follow the same rule as collection names, and may not be an operator of
+/// the agent `where` grammar (`and`, `or`, `not`).
 pub fn is_valid_field_name(name: &str) -> bool {
-    valid_identifier(name)
+    valid_identifier(name) && !crate::agent::RESERVED_FIELD_NAMES.contains(&name)
 }
 
 /// Collection names follow the same rule. Checked before any path is built (spec section 73).

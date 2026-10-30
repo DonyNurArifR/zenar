@@ -1,9 +1,9 @@
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
-use std::sync::{Arc, RwLock, RwLockReadGuard, RwLockWriteGuard};
+use std::sync::{Arc, Mutex, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 use crate::catalog::Catalog;
-use crate::docstore::{DocRef, DocStore, DocumentRow};
+use crate::docstore::{DocRef, DocStore, DocumentRow, FieldStats};
 use crate::error::ZenarError;
 use crate::filter::{Filter, validate};
 use crate::names::is_valid_field_name;
@@ -25,6 +25,16 @@ pub struct Hit {
     pub score: f32,
     pub text: String,
     pub metadata: Vec<(String, MetaValue)>,
+}
+
+/// Result of `Collection::retrieve`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Retrieval {
+    pub hits: Vec<Hit>,
+    /// Documents that matched the filter, before `top_k` cut the list.
+    pub matched: usize,
+    /// Notes for the caller, such as a value no document has.
+    pub warnings: Vec<String>,
 }
 
 /// One document for `Collection::add_many`.
@@ -67,6 +77,8 @@ struct State {
 /// Writes are serialized behind one lock. Reads run concurrently with each other.
 pub struct Collection {
     name: String,
+    /// Field statistics for discovery. Cleared by every write, see `write_state`.
+    stats: Mutex<Option<Arc<Vec<FieldStats>>>>,
     index_path: PathBuf,
     catalog: Arc<Catalog>,
     /// Sync the document log on every commit, not only at sync boundaries.
@@ -85,6 +97,7 @@ impl Collection {
     ) -> Self {
         Self {
             name: name.to_string(),
+            stats: Mutex::new(None),
             index_path,
             catalog,
             durable,
@@ -364,6 +377,17 @@ impl Collection {
         top_k: usize,
         filter: Option<&Filter>,
     ) -> Result<Vec<Hit>, ZenarError> {
+        Ok(self.search_counted(query, top_k, filter)?.0)
+    }
+
+    /// Like `search`, and also returns how many documents matched the filter before `top_k`
+    /// cut the list. A caller can tell "no match" apart from "more matches than requested".
+    pub fn search_counted(
+        &self,
+        query: &[f32],
+        top_k: usize,
+        filter: Option<&Filter>,
+    ) -> Result<(Vec<Hit>, usize), ZenarError> {
         if top_k == 0 {
             return Err(ZenarError::InvalidArgument(
                 "top_k must be greater than 0".into(),
@@ -372,17 +396,19 @@ impl Collection {
         let state = self.read_state()?;
         healthy(&state)?;
         if state.store.dim().is_none() {
-            return Ok(Vec::new());
+            return Ok((Vec::new(), 0));
         }
         validate_vector(query, state.store.dim())?;
 
-        let (scores, ids) = match filter {
+        let (scores, ids, matched) = match filter {
             None => {
+                let matched = state.docs.live_count();
                 if state.store.is_empty() {
-                    return Ok(Vec::new());
+                    return Ok((Vec::new(), 0));
                 }
                 let k = top_k.min(state.store.len());
-                state.store.search(query, k, None)?
+                let (scores, ids) = state.store.search(query, k, None)?;
+                (scores, ids, matched)
             }
             Some(filter) => {
                 validate(filter, state.docs.fields())?;
@@ -391,15 +417,17 @@ impl Collection {
                     .into_iter()
                     .filter(|id| state.store.contains(*id))
                     .collect();
+                let matched = live.len();
                 if live.is_empty() {
-                    return Ok(Vec::new());
+                    return Ok((Vec::new(), 0));
                 }
                 let k = top_k.min(live.len());
-                state.store.search(query, k, Some(&live))?
+                let (scores, ids) = state.store.search(query, k, Some(&live))?;
+                (scores, ids, matched)
             }
         };
         if ids.is_empty() {
-            return Ok(Vec::new());
+            return Ok((Vec::new(), matched));
         }
         let mut docs: HashMap<u64, DocumentRow> = state
             .docs
@@ -407,7 +435,7 @@ impl Collection {
             .into_iter()
             .map(|d| (d.id, d))
             .collect();
-        Ok(ids
+        let hits = ids
             .into_iter()
             .zip(scores)
             .filter_map(|(id, score)| {
@@ -418,7 +446,98 @@ impl Collection {
                     metadata: doc.metadata,
                 })
             })
+            .collect();
+        Ok((hits, matched))
+    }
+
+    /// Field statistics for discovery: every field with its type, counts and values.
+    pub fn describe(&self) -> Result<serde_json::Value, ZenarError> {
+        let state = self.read_state()?;
+        healthy(&state)?;
+        let stats = self.cached_stats(&state)?;
+        let documents = state.docs.live_count();
+        let fields: Vec<serde_json::Value> = stats
+            .iter()
+            .map(|stat| crate::agent::field_json(stat, documents))
+            .collect();
+        Ok(serde_json::json!({
+            "name": self.name,
+            "dimension": state.store.dim(),
+            "bit_width": state.store.bit_width(),
+            "documents": documents,
+            "fields": fields,
+        }))
+    }
+
+    /// Finds values of one field that contain `text` (case-insensitive), most frequent first.
+    /// For fields with many distinct values, where listing them all is not useful.
+    pub fn find_values(
+        &self,
+        field: &str,
+        text: &str,
+        limit: usize,
+    ) -> Result<Vec<serde_json::Value>, ZenarError> {
+        let state = self.read_state()?;
+        healthy(&state)?;
+        let stats = self.cached_stats(&state)?;
+        let stat = stats.iter().find(|s| s.name == field).ok_or_else(|| {
+            let names: Vec<&str> = stats.iter().map(|s| s.name.as_str()).collect();
+            ZenarError::InvalidFilter(format!(
+                "unknown field {field:?}; filterable fields: {}",
+                names.join(", ")
+            ))
+        })?;
+        let needle = text.to_lowercase();
+        Ok(stat
+            .values
+            .iter()
+            .filter(|(value, _)| crate::agent::value_text(value).to_lowercase().contains(&needle))
+            .take(limit)
+            .map(|(value, count)| serde_json::json!({"value": crate::agent::value_json(value), "count": count}))
             .collect())
+    }
+
+    /// Retrieval for an agent. `where_` is the JSON filter (see `agent`). Returns the hits, how
+    /// many documents matched before `top_k`, and warnings about values that match nothing.
+    pub fn retrieve(
+        &self,
+        query: &[f32],
+        top_k: usize,
+        where_: Option<&serde_json::Value>,
+    ) -> Result<Retrieval, ZenarError> {
+        let parsed = match where_ {
+            None => crate::agent::Parsed {
+                filter: None,
+                warnings: Vec::new(),
+            },
+            Some(value) => {
+                // A separate lock acquisition from the search below. Holding one read lock across
+                // both could deadlock with a writer that is waiting.
+                let state = self.read_state()?;
+                healthy(&state)?;
+                let stats = self.cached_stats(&state)?;
+                crate::agent::parse(value, state.docs.fields(), &stats)?
+            }
+        };
+        let (hits, matched) = self.search_counted(query, top_k, parsed.filter.as_ref())?;
+        Ok(Retrieval {
+            hits,
+            matched,
+            warnings: parsed.warnings,
+        })
+    }
+
+    /// Tool definition for this collection (see `agent::tool_spec`).
+    pub fn tool_spec(&self, tool_name: &str) -> Result<serde_json::Value, ZenarError> {
+        let state = self.read_state()?;
+        healthy(&state)?;
+        let stats = self.cached_stats(&state)?;
+        Ok(crate::agent::tool_spec(
+            tool_name,
+            &self.name,
+            state.docs.live_count(),
+            &stats,
+        ))
     }
 
     /// Reconciles the document log and the vector index after a restart (spec section 26).
@@ -520,9 +639,30 @@ impl Collection {
     }
 
     fn write_state(&self) -> Result<RwLockWriteGuard<'_, State>, ZenarError> {
-        self.state
+        let guard = self
+            .state
             .write()
-            .map_err(|_| ZenarError::VectorStoreError("collection lock poisoned".into()))
+            .map_err(|_| ZenarError::VectorStoreError("collection lock poisoned".into()))?;
+        // Every mutation takes the write lock first, so clearing here means no reader can store
+        // statistics computed before the mutation after it has been cleared.
+        if let Ok(mut cache) = self.stats.lock() {
+            *cache = None;
+        }
+        Ok(guard)
+    }
+
+    /// Field statistics, cached until the next write.
+    fn cached_stats(&self, state: &State) -> Result<Arc<Vec<FieldStats>>, ZenarError> {
+        let mut cache = self
+            .stats
+            .lock()
+            .map_err(|_| ZenarError::VectorStoreError("stats cache poisoned".into()))?;
+        if let Some(stats) = cache.as_ref() {
+            return Ok(Arc::clone(stats));
+        }
+        let stats = Arc::new(state.docs.field_stats());
+        *cache = Some(Arc::clone(&stats));
+        Ok(stats)
     }
 }
 

@@ -84,6 +84,9 @@ including repeated `kill -9` crash cycles):
 - Process locking, `flush()`, `durable=True`, and a poisoning rule for collections that cannot be made consistent.
 - `bit_width` and `calibrate()`.
 - Python bindings with a complete exception hierarchy, GIL release, numpy input, and a panic guard.
+- Agent tools: `describe` (fields, values and counts), `find_values`, `retrieve` with a JSON `where`
+  filter that suggests field names and explains empty results, and `tool_spec` for tool-calling models.
+  See API.md, "Agent tools".
 
 Measured on the reference machine at 1M rows, dim 384 (BENCHMARKS.md):
 

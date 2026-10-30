@@ -436,3 +436,86 @@ def test_repeated_kill_minus_9_cycles_stay_consistent(tmp_path):
             hits = c.search(np.ones(32, dtype=np.float32), top_k=max(live, 1))
             assert len(hits) == live, f"cycle {cycle}: {live} live but {len(hits)} searchable"
             flushed_total = live
+
+
+def _shop(db):
+    c = db.create_collection("shop", dimension=8)
+    c.add_many(
+        [
+            {"id": 1, "vector": [1.0] * 8, "text": "wrench", "metadata": {"tenant": "A", "category": "tools", "price": 12.5}},
+            {"id": 2, "vector": [1.0] * 8, "text": "kettle", "metadata": {"tenant": "A", "category": "appliances", "price": 40.0}},
+            {"id": 3, "vector": [1.0] * 8, "text": "radio", "metadata": {"tenant": "B", "category": "electronics", "price": 25.0}},
+        ]
+    )
+    return c
+
+
+def test_describe_lists_fields_types_values_and_counts(db):
+    c = _shop(db)
+    info = c.describe()
+    assert info["documents"] == 3
+    fields = {f["name"]: f for f in info["fields"]}
+    assert fields["tenant"]["type"] == "text"
+    assert {v["value"]: v["count"] for v in fields["tenant"]["values"]} == {"A": 2, "B": 1}
+    assert fields["price"]["min"] == 12.5 and fields["price"]["max"] == 40.0
+
+
+def test_describe_is_updated_by_writes(db):
+    c = _shop(db)
+    assert {"value": "C", "count": 1} not in c.describe()["fields"][0]["values"]
+    c.add(4, [1.0] * 8, "pen", {"tenant": "C", "category": "office", "price": 2.0})
+    tenant = next(f for f in c.describe()["fields"] if f["name"] == "tenant")
+    assert {"value": "C", "count": 1} in tenant["values"]
+
+
+def test_retrieve_with_where_operators_and_counts(db):
+    c = _shop(db)
+    r = c.retrieve([1.0] * 8, top_k=1, where={"tenant": "A", "price": {"gte": 10, "lt": 30}})
+    assert r["matched"] == 1
+    assert [h["text"] for h in r["hits"]] == ["wrench"]
+    r = c.retrieve([1.0] * 8, top_k=10, where={"or": [{"category": "tools"}, {"category": "electronics"}]})
+    assert r["matched"] == 2
+    r = c.retrieve([1.0] * 8, top_k=10, where={"not": {"tenant": "A"}, "category": {"in": ["electronics", "tools"]}})
+    assert r["matched"] == 1 and r["hits"][0]["text"] == "radio"
+    assert r["warnings"] == []
+
+
+def test_retrieve_warns_when_a_value_matches_nothing(db):
+    c = _shop(db)
+    r = c.retrieve([1.0] * 8, top_k=5, where={"tenant": "Z"})
+    assert r["matched"] == 0 and r["hits"] == []
+    assert len(r["warnings"]) == 1
+    assert '"A"' in r["warnings"][0] and '"B"' in r["warnings"][0]
+
+
+def test_retrieve_suggests_the_field_name_for_a_typo(db):
+    c = _shop(db)
+    with pytest.raises(zenar.InvalidFilterError, match='did you mean "category"'):
+        c.retrieve([1.0] * 8, where={"catgory": "tools"})
+
+
+def test_retrieve_rejects_wrong_types_with_the_expected_type(db):
+    c = _shop(db)
+    with pytest.raises(zenar.InvalidFilterError, match="expected a number"):
+        c.retrieve([1.0] * 8, where={"price": "cheap"})
+    with pytest.raises(zenar.InvalidFilterError, match="JSON-compatible"):
+        c.retrieve([1.0] * 8, where={"tenant": object()})
+
+
+def test_retrieve_without_where_matches_everything(db):
+    c = _shop(db)
+    assert c.retrieve([1.0] * 8, top_k=10)["matched"] == 3
+    assert c.retrieve([1.0] * 8, top_k=10, where={})["matched"] == 3
+
+
+def test_find_values_and_tool_spec(db):
+    c = _shop(db)
+    assert [v["value"] for v in c.find_values("category", "TOOL")] == ["tools"]
+    spec = c.tool_spec("search_shop")
+    assert spec["name"] == "search_shop"
+    assert "category (text)" in spec["description"]
+    assert set(spec["parameters"]["required"]) == {"query"}
+    where = spec["parameters"]["properties"]["where"]
+    assert set(where["properties"]) >= {"tenant", "category", "price", "and", "or", "not"}
+    assert set(where["properties"]["tenant"]["anyOf"][0]["enum"]) == {"A", "B"}
+    assert spec["input_schema"] == spec["parameters"]

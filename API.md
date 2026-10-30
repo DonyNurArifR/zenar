@@ -88,3 +88,58 @@ Every error inherits from `zenar.ZenarError`:
 `VectorStoreError`, `MetadataStoreError`, `PersistenceError`, `RecoveryError`.
 
 Catch `ZenarError` to handle any library error.
+
+## Agent tools
+
+`search` is pure vector search, with an optional `filter=` or keyword equality. Agents use `retrieve` and the
+discovery methods below. They are built for a model that picks the filter itself.
+
+```python
+c = db.get_collection("products")
+
+c.describe()                 # every field: type, documents, values with counts, or min/max for numbers
+c.find_values("category", "elec")   # values that contain "elec", most frequent first
+c.tool_spec("search_products")      # tool definition: description and JSON Schema for the arguments
+
+r = c.retrieve(embed(user_query), top_k=5, where={"tenant": "A", "price": {"lt": 100}})
+r["hits"]      # the results
+r["matched"]   # documents that matched the filter, before top_k cut the list
+r["warnings"]  # for example: no live document has tenant = "Z"; values that exist: "A", "B"
+```
+
+The caller embeds the text. `retrieve` takes the vector.
+
+### The `where` format
+
+A JSON object. Each key is a field name. A plain value means equality. An object gives operators:
+
+| Form | Meaning |
+|---|---|
+| `{"tenant": "A"}` | `tenant` equals `"A"` |
+| `{"price": {"gte": 10, "lt": 50}}` | both conditions hold |
+| `{"category": {"in": ["tools", "garden"]}}` | one of the values |
+| `{"or": [{...}, {...}]}` | at least one object matches |
+| `{"and": [{...}, {...}]}` | all objects match |
+| `{"not": {...}}` | the object does not match |
+
+Operators: `eq`, `ne`, `gt`, `gte`, `lt`, `lte`, `in`, `nin`. Timestamps are RFC 3339 strings. Field names are
+case-sensitive. An empty object matches everything.
+
+### Errors that help a model fix the filter
+
+- An unknown field names the valid fields, and suggests a close one: `unknown field "catgory", did you mean "category"?`
+- A wrong type names the expected type: `field "price" is float; expected a number, got the string "cheap"`.
+- An unknown operator lists the valid ones.
+- A value that no live document has is not an error. It returns zero hits, and `warnings` lists the values that exist.
+
+### What the tool definition contains
+
+`tool_spec` describes the collection in plain language: each field with its type and its values, or its range for
+a field with many values. The `where` schema uses `enum` for short value lists, so the model is steered to values
+that exist. Use the same dict in OpenAI-style (`parameters`) or Anthropic-style (`input_schema`) tool calls.
+
+### Discovery for many values
+
+For a field with more than 200 distinct values, `describe` reports the range and the most frequent values, and does not
+list them all. `find_values(field, text)` searches the values instead. Use it when the user names something specific.
+

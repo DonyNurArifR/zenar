@@ -89,6 +89,32 @@ impl Ord for Key {
     }
 }
 
+/// Summary of one metadata field across live documents. See `DocStore::field_stats`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct FieldStats {
+    pub name: String,
+    pub kind: FieldKind,
+    /// Live documents that carry this field (not NULL).
+    pub present: usize,
+    /// Distinct values with the number of live documents holding each, most frequent first.
+    pub values: Vec<(MetaValue, usize)>,
+    /// Smallest and largest value, for kinds with an order.
+    pub min: Option<MetaValue>,
+    pub max: Option<MetaValue>,
+}
+
+fn key_to_value(key: &Key) -> MetaValue {
+    match key {
+        Key::Bool(b) => MetaValue::Boolean(*b),
+        Key::Int(i) => MetaValue::Integer(*i),
+        Key::Float(f) => MetaValue::Float(*f),
+        Key::Text(s) => MetaValue::Text(s.clone()),
+        Key::Time(us) => MetaValue::Timestamp(
+            chrono::DateTime::from_timestamp_micros(*us).unwrap_or(chrono::DateTime::UNIX_EPOCH),
+        ),
+    }
+}
+
 /// Index for one metadata field.
 struct FieldIndex {
     kind: FieldKind,
@@ -205,6 +231,45 @@ impl DocStore {
 
     pub fn contains(&self, id: u64) -> bool {
         self.by_id.contains_key(&id)
+    }
+
+    /// Summary of every metadata field across live documents: how many documents have it, the
+    /// distinct values with a count for each, and the range for ordered kinds.
+    pub fn field_stats(&self) -> Vec<FieldStats> {
+        self.fields
+            .iter()
+            .enumerate()
+            .map(|(fi, (name, kind))| {
+                let index = &self.index[fi];
+                let mut values: Vec<(MetaValue, usize)> = Vec::new();
+                let mut present = 0usize;
+                let (mut min, mut max): (Option<MetaValue>, Option<MetaValue>) = (None, None);
+                // BTreeMap order is value order, so the first and last live keys are the range.
+                for (key, rows) in &index.values {
+                    let live = rows.iter().filter(|&&r| self.is_live(r)).count();
+                    if live == 0 {
+                        continue;
+                    }
+                    let value = key_to_value(key);
+                    present += live;
+                    if min.is_none() {
+                        min = Some(value.clone());
+                    }
+                    max = Some(value.clone());
+                    values.push((value, live));
+                }
+                // Most frequent first. The sort is stable, so ties keep value order.
+                values.sort_by_key(|entry| std::cmp::Reverse(entry.1));
+                FieldStats {
+                    name: name.clone(),
+                    kind: *kind,
+                    present,
+                    values,
+                    min,
+                    max,
+                }
+            })
+            .collect()
     }
 
     /// Ids of every live document.
