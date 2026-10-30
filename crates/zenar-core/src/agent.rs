@@ -395,13 +395,16 @@ pub fn where_schema(stats: &[FieldStats]) -> Value {
     let mut properties = Map::new();
     for stat in stats {
         let scalar = scalar_schema(stat);
+        // Range bounds are not restricted to the values that exist: `gte: 15` is valid even when
+        // no price is exactly 15. Only equality and membership use the enum.
+        let bound = scalar_type(stat);
         let operator_properties: Map<String, Value> = OPERATORS
             .iter()
             .map(|op| {
-                let schema = if matches!(*op, "in" | "nin") {
-                    json!({"type": "array", "items": scalar.clone()})
-                } else {
-                    scalar.clone()
+                let schema = match *op {
+                    "in" | "nin" => json!({"type": "array", "items": scalar.clone()}),
+                    "gt" | "gte" | "lt" | "lte" => bound.clone(),
+                    _ => scalar.clone(),
                 };
                 (op.to_string(), schema)
             })
@@ -442,14 +445,19 @@ pub fn where_schema(stats: &[FieldStats]) -> Value {
     })
 }
 
-fn scalar_schema(stat: &FieldStats) -> Value {
-    let mut schema = match stat.kind {
+/// The JSON type of a field's values, with no list of allowed values.
+fn scalar_type(stat: &FieldStats) -> Value {
+    match stat.kind {
         FieldKind::Text => json!({"type": "string"}),
         FieldKind::Integer => json!({"type": "integer"}),
         FieldKind::Float => json!({"type": "number"}),
         FieldKind::Boolean => json!({"type": "boolean"}),
         FieldKind::Timestamp => json!({"type": "string", "format": "date-time"}),
-    };
+    }
+}
+
+fn scalar_schema(stat: &FieldStats) -> Value {
+    let mut schema = scalar_type(stat);
     if stat.values.len() <= VALUE_LIST_LIMIT && !stat.values.is_empty() {
         let values: Vec<Value> = stat.values.iter().map(|(v, _)| value_json(v)).collect();
         schema["enum"] = Value::Array(values);

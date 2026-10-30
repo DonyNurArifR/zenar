@@ -544,3 +544,12 @@ def test_tool_spec_is_a_dict_that_creates_a_prompt(db):
     assert prompt.endswith("You are a shop assistant.")
     assert "You are a shop assistant." not in spec.create_prompt()
 
+
+
+def test_range_bounds_are_not_restricted_to_existing_values(db):
+    c = _shop(db)
+    where = c.tool_spec("search_shop")["parameters"]["properties"]["where"]
+    price = where["properties"]["price"]["anyOf"][1]["properties"]
+    assert "enum" not in price["gte"] and "enum" not in price["lt"], "a range bound may be any number"
+    tenant = where["properties"]["tenant"]["anyOf"][1]["properties"]
+    assert set(tenant["eq"]["enum"]) == {"A", "B"}, "equality should steer to values that exist"
