@@ -490,6 +490,17 @@ pub fn where_schema(stats: &[FieldStats]) -> Value {
 }
 
 /// The JSON type of a field's values, with no list of allowed values.
+/// The `where` argument. The description says it must be an object, because some models send it
+/// as a JSON-encoded string, which the tool then rejects.
+fn where_parameter(stats: &[FieldStats]) -> Value {
+    let mut schema = where_schema(stats);
+    schema["description"] = json!(
+        "A JSON object, not a string, that filters documents by their fields. \
+         Example: {\"category\": \"tools\", \"price\": {\"lt\": 50}}."
+    );
+    schema
+}
+
 fn scalar_type(stat: &FieldStats) -> Value {
     match stat.kind {
         FieldKind::Text => json!({"type": "string"}),
@@ -536,7 +547,7 @@ pub fn tool_spec(name: &str, collection: &str, documents: usize, stats: &[FieldS
             "query": {"type": "string", "description": "What to search for, in natural language."},
             "top_k": {"type": "integer", "minimum": 1, "maximum": 100, "default": 10,
                       "description": "How many results to return."},
-            "where": where_schema(stats)
+            "where": where_parameter(stats)
         },
         "required": ["query"],
         "additionalProperties": false
