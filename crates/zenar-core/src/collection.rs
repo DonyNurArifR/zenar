@@ -13,6 +13,19 @@ use crate::value::{FieldKind, MetaValue};
 /// Largest id the store accepts. Ids are stored as i64 in the index files.
 pub const MAX_ID: u64 = i64::MAX as u64;
 
+/// Scopes whose statistics are kept between calls.
+const SCOPE_CACHE_ENTRIES: usize = 16;
+
+/// Largest `top_k` a model may request. Larger values cost more than a tool call should.
+pub const MAX_TOP_K: usize = 1000;
+
+/// Statistics for one scope, as cached by `Collection::stats_for_scope`.
+struct ScopedEntry {
+    key: String,
+    stats: Arc<Vec<FieldStats>>,
+    documents: usize,
+}
+
 /// Adds between index syncs (spec section 86). Syncing on every add made ingest quadratic.
 /// Adds since the last sync can be lost on a crash. Recovery removes their documents or
 /// vectors, and `flush()` makes them durable on demand.
@@ -79,6 +92,8 @@ pub struct Collection {
     name: String,
     /// Field statistics for discovery. Cleared by every write, see `write_state`.
     stats: Mutex<Option<Arc<Vec<FieldStats>>>>,
+    /// Statistics for scoped calls, keyed by the scope, most recent last. Cleared by every write.
+    scoped: Mutex<Vec<ScopedEntry>>,
     index_path: PathBuf,
     catalog: Arc<Catalog>,
     /// Sync the document log on every commit, not only at sync boundaries.
@@ -98,6 +113,7 @@ impl Collection {
         Self {
             name: name.to_string(),
             stats: Mutex::new(None),
+            scoped: Mutex::new(Vec::new()),
             index_path,
             catalog,
             durable,
@@ -459,10 +475,7 @@ impl Collection {
     ) -> Result<serde_json::Value, ZenarError> {
         let state = self.read_state()?;
         healthy(&state)?;
-        let (fields, documents) = match self.scope_rows(&state, scope)? {
-            None => (self.cached_stats(&state)?, state.docs.live_count()),
-            Some(rows) => (Arc::new(state.docs.field_stats_in(&rows)), rows.len()),
-        };
+        let (fields, documents) = self.stats_for_scope(&state, scope)?;
         let fields: Vec<serde_json::Value> = fields
             .iter()
             .map(|stat| crate::agent::field_json(stat, documents))
@@ -487,10 +500,7 @@ impl Collection {
     ) -> Result<Vec<serde_json::Value>, ZenarError> {
         let state = self.read_state()?;
         healthy(&state)?;
-        let stats = match self.scope_rows(&state, scope)? {
-            None => self.cached_stats(&state)?,
-            Some(rows) => Arc::new(state.docs.field_stats_in(&rows)),
-        };
+        let (stats, _) = self.stats_for_scope(&state, scope)?;
         let stat = stats.iter().find(|s| s.name == field).ok_or_else(|| {
             let names: Vec<&str> = stats.iter().map(|s| s.name.as_str()).collect();
             ZenarError::InvalidFilter(format!(
@@ -523,6 +533,11 @@ impl Collection {
         where_: Option<&serde_json::Value>,
         scope: Option<&serde_json::Value>,
     ) -> Result<Retrieval, ZenarError> {
+        if top_k > MAX_TOP_K {
+            return Err(ZenarError::InvalidArgument(format!(
+                "top_k is {top_k}; the limit for retrieve is {MAX_TOP_K}"
+            )));
+        }
         let (where_filter, scope_filter, warnings) = {
             // One read lock for parsing. It is released before the search takes its own.
             let state = self.read_state()?;
@@ -534,10 +549,7 @@ impl Collection {
             let (where_filter, warnings) = match where_ {
                 None => (None, Vec::new()),
                 Some(value) => {
-                    let stats = match self.scope_rows(&state, scope)? {
-                        None => self.cached_stats(&state)?,
-                        Some(rows) => Arc::new(state.docs.field_stats_in(&rows)),
-                    };
+                    let (stats, _) = self.stats_for_scope(&state, scope)?;
                     let parsed = crate::agent::parse(value, fields, &stats)?;
                     (parsed.filter, parsed.warnings)
                 }
@@ -567,10 +579,7 @@ impl Collection {
     pub fn fields_prompt(&self, scope: Option<&serde_json::Value>) -> Result<String, ZenarError> {
         let state = self.read_state()?;
         healthy(&state)?;
-        let stats = match self.scope_rows(&state, scope)? {
-            None => self.cached_stats(&state)?,
-            Some(rows) => Arc::new(state.docs.field_stats_in(&rows)),
-        };
+        let (stats, _) = self.stats_for_scope(&state, scope)?;
         Ok(crate::agent::fields_prompt(&stats))
     }
 
@@ -582,13 +591,48 @@ impl Collection {
     ) -> Result<serde_json::Value, ZenarError> {
         let state = self.read_state()?;
         healthy(&state)?;
-        let (stats, documents) = match self.scope_rows(&state, scope)? {
-            None => (self.cached_stats(&state)?, state.docs.live_count()),
-            Some(rows) => (Arc::new(state.docs.field_stats_in(&rows)), rows.len()),
-        };
+        let (stats, documents) = self.stats_for_scope(&state, scope)?;
         Ok(crate::agent::tool_spec(
             tool_name, &self.name, documents, &stats,
         ))
+    }
+
+    /// Statistics and document count for a scope. `None` is the whole collection. A scope is
+    /// computed once and reused until the next write, since discovery repeats the same scope.
+    fn stats_for_scope(
+        &self,
+        state: &State,
+        scope: Option<&serde_json::Value>,
+    ) -> Result<(Arc<Vec<FieldStats>>, usize), ZenarError> {
+        let Some(value) = scope else {
+            return Ok((self.cached_stats(state)?, state.docs.live_count()));
+        };
+        let key = value.to_string();
+        {
+            let scoped = self
+                .scoped
+                .lock()
+                .map_err(|_| ZenarError::VectorStoreError("scope cache poisoned".into()))?;
+            if let Some(entry) = scoped.iter().find(|e| e.key == key) {
+                return Ok((Arc::clone(&entry.stats), entry.documents));
+            }
+        }
+        let rows = self.scope_rows(state, Some(value))?.unwrap_or_default();
+        let stats = Arc::new(state.docs.field_stats_in(&rows));
+        let documents = rows.len();
+        let mut scoped = self
+            .scoped
+            .lock()
+            .map_err(|_| ZenarError::VectorStoreError("scope cache poisoned".into()))?;
+        if scoped.len() >= SCOPE_CACHE_ENTRIES {
+            scoped.remove(0);
+        }
+        scoped.push(ScopedEntry {
+            key,
+            stats: Arc::clone(&stats),
+            documents,
+        });
+        Ok((stats, documents))
     }
 
     /// The live rows that `scope` allows. `None` for no scope, meaning the whole collection.
@@ -716,6 +760,9 @@ impl Collection {
         // statistics computed before the mutation after it has been cleared.
         if let Ok(mut cache) = self.stats.lock() {
             *cache = None;
+        }
+        if let Ok(mut scoped) = self.scoped.lock() {
+            scoped.clear();
         }
         Ok(guard)
     }

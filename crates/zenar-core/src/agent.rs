@@ -698,6 +698,60 @@ mod tests {
         assert!(err.contains("the limit is"), "{err}");
     }
 
+    /// Random JSON, mostly shaped like `where` objects with some noise: the parser must always
+    /// return a filter or an InvalidFilter error. It must never panic.
+    #[test]
+    fn random_where_objects_never_panic() {
+        let mut state = 0x9E37_79B9_7F4A_7C15u64;
+        let mut next = move |n: u64| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state % n
+        };
+        fn value(next: &mut dyn FnMut(u64) -> u64, depth: u64) -> Value {
+            match next(if depth > 3 { 5 } else { 9 }) {
+                0 => json!("A"),
+                1 => json!(next(100) as i64 - 50),
+                2 => json!(next(100) as f64 / 3.0),
+                3 => json!(next(2) == 0),
+                4 => Value::Null,
+                5 => json!(["A", "B"]),
+                6 => json!([{"tenant": "A"}]),
+                7 => json!({"gte": next(10)}),
+                _ => {
+                    let mut m = Map::new();
+                    let keys = [
+                        "tenant", "price", "active", "and", "or", "not", "tennant", "gte", "in", "",
+                    ];
+                    for _ in 0..next(4) {
+                        m.insert(
+                            keys[next(keys.len() as u64) as usize].to_string(),
+                            value(next, depth + 1),
+                        );
+                    }
+                    Value::Object(m)
+                }
+            }
+        }
+        let mut accepted = 0;
+        for _ in 0..3000 {
+            let v = value(&mut next, 0);
+            if !v.is_object() {
+                continue;
+            }
+            match parse(&v, &schema(), &stats()) {
+                Ok(_) => accepted += 1,
+                Err(ZenarError::InvalidFilter(_)) => {}
+                Err(other) => panic!("unexpected error for {v}: {other:?}"),
+            }
+        }
+        assert!(
+            accepted > 50,
+            "the fuzzer should produce some valid filters, got {accepted}"
+        );
+    }
+
     #[test]
     fn edit_distance_is_levenshtein() {
         assert_eq!(edit_distance("kitten", "sitting"), 3);

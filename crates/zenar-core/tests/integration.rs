@@ -1027,3 +1027,120 @@ fn warnings_inside_a_scope_do_not_name_other_tenants() {
     assert!(!r.warnings[0].contains("globex"), "{:?}", r.warnings);
     fs::remove_dir_all(&dir).ok();
 }
+
+/// A cached scope must not outlive a write.
+#[test]
+fn scoped_discovery_is_fresh_after_a_write() {
+    let dir = temp_dir("scope-fresh");
+    let db = VectorDB::open(&dir).unwrap();
+    let c = db.create_collection("sf", None, 4).unwrap();
+    c.add_many(&[doc_with(1, "acme", "x", 1.0)]).unwrap();
+    let scope = serde_json::json!({"tenant": "acme"});
+    assert_eq!(c.describe(Some(&scope)).unwrap()["documents"], 1);
+    assert_eq!(
+        c.describe(Some(&scope)).unwrap()["documents"],
+        1,
+        "second call is served from the cache"
+    );
+    c.add(
+        2,
+        &[1.0; 8],
+        "two",
+        vec![
+            ("tenant".into(), text("acme")),
+            ("category".into(), text("x")),
+            ("price".into(), MetaValue::Float(2.0)),
+        ],
+    )
+    .unwrap();
+    assert_eq!(
+        c.describe(Some(&scope)).unwrap()["documents"],
+        2,
+        "a write must invalidate the scope cache"
+    );
+    c.delete(1).unwrap();
+    assert_eq!(c.describe(Some(&scope)).unwrap()["documents"], 1);
+    fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn retrieve_refuses_an_oversized_top_k() {
+    let dir = temp_dir("topk");
+    let db = VectorDB::open(&dir).unwrap();
+    let c = db.create_collection("tk", None, 4).unwrap();
+    c.add_many(&[doc_with(1, "acme", "x", 1.0)]).unwrap();
+    let err = c.retrieve(&[1.0; 8], 5000, None, None).unwrap_err();
+    assert!(matches!(err, ZenarError::InvalidArgument(_)), "{err}");
+    assert!(c.retrieve(&[1.0; 8], 1000, None, None).is_ok());
+    fs::remove_dir_all(&dir).ok();
+}
+
+/// Agent-path calls while documents are being written: no errors, and no tenant leaks.
+#[test]
+fn agent_calls_stay_correct_during_concurrent_writes() {
+    use std::sync::Arc;
+    use std::thread;
+
+    let dir = temp_dir("agent-concurrent");
+    let db = VectorDB::open(&dir).unwrap();
+    let c = db.create_collection("ac", None, 4).unwrap();
+    c.add_many(&[
+        doc_with(0, "acme", "x", 0.0),
+        doc_with(1, "globex", "x", 1.0),
+    ])
+    .unwrap();
+    let writer = Arc::clone(&c);
+    let w = thread::spawn(move || {
+        for id in 2..800u64 {
+            let tenant = if id % 2 == 0 { "acme" } else { "globex" };
+            writer
+                .add(
+                    id,
+                    &[id as f32 + 1.0; 8],
+                    "w",
+                    vec![
+                        ("tenant".into(), text(tenant)),
+                        ("category".into(), text("x")),
+                        ("price".into(), MetaValue::Float(id as f64)),
+                    ],
+                )
+                .unwrap();
+        }
+    });
+    let readers: Vec<_> = (0..3)
+        .map(|_| {
+            let reader = Arc::clone(&c);
+            thread::spawn(move || {
+                let scope = serde_json::json!({"tenant": "acme"});
+                for _ in 0..200 {
+                    let info = reader
+                        .describe(Some(&scope))
+                        .expect("describe must not fail during writes");
+                    assert!(
+                        !info.to_string().contains("globex"),
+                        "globex leaked into a scoped describe"
+                    );
+                    let r = reader
+                        .retrieve(
+                            &[1.0; 8],
+                            20,
+                            Some(&serde_json::json!({"category": "x"})),
+                            Some(&scope),
+                        )
+                        .expect("retrieve must not fail during writes");
+                    for hit in r.hits {
+                        assert!(
+                            hit.metadata.contains(&("tenant".to_string(), text("acme"))),
+                            "globex hit inside acme scope"
+                        );
+                    }
+                }
+            })
+        })
+        .collect();
+    w.join().unwrap();
+    for r in readers {
+        r.join().unwrap();
+    }
+    fs::remove_dir_all(&dir).ok();
+}
