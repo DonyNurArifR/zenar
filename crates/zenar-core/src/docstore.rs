@@ -116,7 +116,8 @@ struct StagedPut {
 /// Document log plus indexes for one collection.
 pub struct DocStore {
     path: PathBuf,
-    file: File,
+    /// The append handle. `None` only while compaction has released it for the rename.
+    file: Option<File>,
     len: u64,
     fields: Vec<(String, FieldKind)>,
     index: Vec<FieldIndex>,
@@ -136,28 +137,30 @@ impl DocStore {
             .open(path)
             .map_err(io_err)?;
         sync_parent(path)?;
-        Ok(Self::empty(path.to_path_buf(), file, 0, fields))
+        Ok(Self::empty(path.to_path_buf(), Some(file), 0, fields))
     }
 
     /// Opens an existing log and replays it. A torn tail is truncated.
     pub fn open(path: &Path, fields: Vec<(String, FieldKind)>) -> Result<Self, ZenarError> {
-        let file = OpenOptions::new()
-            .append(true)
-            .read(true)
-            .open(path)
-            .map_err(io_err)?;
-        let mut store = Self::empty(path.to_path_buf(), file, 0, fields);
+        let file = open_append(path).map_err(io_err)?;
+        let mut store = Self::empty(path.to_path_buf(), Some(file), 0, fields);
         let bytes = fs::read(path).map_err(io_err)?;
         let good_end = store.replay(&bytes)?;
         if good_end < bytes.len() as u64 {
-            store.file.set_len(good_end).map_err(io_err)?;
-            store.file.sync_data().map_err(io_err)?;
+            let file = store.handle()?;
+            file.set_len(good_end).map_err(io_err)?;
+            file.sync_data().map_err(io_err)?;
         }
         store.len = good_end;
         Ok(store)
     }
 
-    fn empty(path: PathBuf, file: File, len: u64, fields: Vec<(String, FieldKind)>) -> Self {
+    fn empty(
+        path: PathBuf,
+        file: Option<File>,
+        len: u64,
+        fields: Vec<(String, FieldKind)>,
+    ) -> Self {
         let index = fields
             .iter()
             .map(|(_, kind)| FieldIndex {
@@ -275,8 +278,9 @@ impl DocStore {
     }
 
     fn write_bytes(&mut self, buf: &[u8], old_len: u64) -> Result<(), ZenarError> {
-        if let Err(e) = self.file.write_all(buf) {
-            let _ = self.file.set_len(old_len);
+        let file = self.handle_mut()?;
+        if let Err(e) = file.write_all(buf) {
+            let _ = file.set_len(old_len);
             return Err(io_err(e));
         }
         self.len = old_len + buf.len() as u64;
@@ -285,7 +289,7 @@ impl DocStore {
 
     /// Discards a staged write by truncating the log back to its length before the write.
     pub fn undo(&mut self, staged: Staged) -> Result<(), ZenarError> {
-        self.file.set_len(staged.old_len).map_err(io_err)?;
+        self.handle()?.set_len(staged.old_len).map_err(io_err)?;
         self.len = staged.old_len;
         Ok(())
     }
@@ -319,7 +323,7 @@ impl DocStore {
 
     /// Flushes the log to stable storage.
     pub fn sync(&mut self) -> Result<(), ZenarError> {
-        self.file.sync_data().map_err(io_err)
+        self.handle()?.sync_data().map_err(io_err)
     }
 
     /// True when dead rows are worth reclaiming: more dead than live, and enough to matter.
@@ -328,14 +332,17 @@ impl DocStore {
     }
 
     /// Rewrites the log with only live documents, then replaces the old log atomically.
-    /// The old log stays valid until the rename, so a failure here loses nothing.
+    ///
+    /// The old log stays valid until the rename. Windows refuses to rename over a file that is
+    /// still open, so the append handle is released first and reopened afterwards, on both the
+    /// success path and the failure path.
     pub fn compact(&mut self) -> Result<(), ZenarError> {
         let tmp = self.path.with_extension("log.compact");
         let mut out = File::create(&tmp).map_err(io_err)?;
         let mut buf = Vec::new();
         for row in self.rows.iter().filter(|r| r.live) {
             let mut payload = vec![0u8; row.payload_len as usize];
-            read_exact_at(&self.file, &mut payload, row.payload_off)?;
+            read_exact_at(self.handle()?, &mut payload, row.payload_off)?;
             push_frame(&mut buf, &payload);
             if buf.len() >= 1 << 20 {
                 out.write_all(&buf).map_err(io_err)?;
@@ -345,11 +352,29 @@ impl DocStore {
         out.write_all(&buf).map_err(io_err)?;
         out.sync_all().map_err(io_err)?;
         drop(out);
-        fs::rename(&tmp, &self.path).map_err(io_err)?;
+
+        self.file = None;
+        if let Err(e) = fs::rename(&tmp, &self.path) {
+            let _ = fs::remove_file(&tmp);
+            self.file = Some(open_append(&self.path).map_err(io_err)?);
+            return Err(io_err(e));
+        }
         sync_parent(&self.path)?;
         let fields = self.fields.clone();
         *self = Self::open(&self.path.clone(), fields)?;
         Ok(())
+    }
+
+    fn handle(&self) -> Result<&File, ZenarError> {
+        self.file
+            .as_ref()
+            .ok_or_else(|| ZenarError::PersistenceError("document log handle is released".into()))
+    }
+
+    fn handle_mut(&mut self) -> Result<&mut File, ZenarError> {
+        self.file
+            .as_mut()
+            .ok_or_else(|| ZenarError::PersistenceError("document log handle is released".into()))
     }
 
     /// Documents for the given ids, skipping ids that are not live. Order follows `ids`.
@@ -366,7 +391,7 @@ impl DocStore {
     fn read_row(&self, row: u32) -> Result<DocumentRow, ZenarError> {
         let r = self.rows[row as usize];
         let mut payload = vec![0u8; r.payload_len as usize];
-        read_exact_at(&self.file, &mut payload, r.payload_off)?;
+        read_exact_at(self.handle()?, &mut payload, r.payload_off)?;
         decode_put(&payload, &self.fields)
     }
 
@@ -943,6 +968,10 @@ fn read_exact_at(file: &File, buf: &mut [u8], offset: u64) -> Result<(), ZenarEr
     Ok(())
 }
 
+fn open_append(path: &Path) -> std::io::Result<File> {
+    OpenOptions::new().append(true).read(true).open(path)
+}
+
 /// Makes a new file name durable by syncing its directory (no-op where that is not supported).
 pub fn sync_parent(path: &Path) -> Result<(), ZenarError> {
     #[cfg(unix)]
@@ -1164,6 +1193,28 @@ mod tests {
         let mut got = store.matching_ids(&f).unwrap();
         got.sort_unstable();
         assert_eq!(got, vec![45, 46, 47, 48, 49]);
+        fs::remove_dir_all(path.parent().unwrap()).ok();
+    }
+
+    /// After compaction the handle is reopened on the new file. Writes made after it must land
+    /// there, and survive a reopen.
+    #[test]
+    fn writes_after_compaction_go_to_the_new_log() {
+        let path = temp_log("after-compact");
+        let mut store = DocStore::create(&path, schema()).unwrap();
+        let docs: Vec<Doc> = (0..30u64).map(|i| (i, "x", vec![])).collect();
+        put(&mut store, &docs);
+        for i in 0..20u64 {
+            del(&mut store, i);
+        }
+        store.compact().unwrap();
+        put(&mut store, &[(100, "after compaction", vec![])]);
+        assert_eq!(store.fetch(&[100]).unwrap()[0].text, "after compaction");
+        drop(store);
+
+        let reopened = DocStore::open(&path, schema()).unwrap();
+        assert_eq!(reopened.live_count(), 11);
+        assert_eq!(reopened.fetch(&[100]).unwrap()[0].text, "after compaction");
         fs::remove_dir_all(path.parent().unwrap()).ok();
     }
 
