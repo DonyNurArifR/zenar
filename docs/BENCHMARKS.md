@@ -89,6 +89,12 @@ was slower than on the earlier days, which is why ingest differs from the 0.011 
 The on-disk format is unchanged for this fixture: a database written by 1.0.0 opens under 1.1.2 and returns the same
 top results (`tests/test_fixture_compat.py`). The memory rise is largest at small sizes and about 2% at 1M rows.
 
+### Metadata memory after open (1M documents, 3 fields, tiny vectors)
+
+Current resident memory in a fresh process: 225 MB before the presence list was removed, 206 MB after. The on-disk log
+was 257 MB, about 270 bytes per document. The largest remaining in-memory item is a second id map: Zenar keeps one from
+id to row, and TurboVec keeps its own. Removing either needs a change to the library or the layout.
+
 ### Memory, 1M rows, dim 384
 
 Measured with `/usr/bin/time -l` around the `bench` example (ingest, then all searches, same process). Peak resident

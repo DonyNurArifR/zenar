@@ -6,6 +6,8 @@ project follows [semantic versioning](https://semver.org/) while it is pre-1.0.
 ## Unreleased
 
 ### Changed
+- Less memory per document. The per-field presence list held the same rows as the codes list, so it is gone. A million
+  documents with three metadata fields open in 206 MB, down from 225 MB. The file format is unchanged.
 - The agent `where` schema is the one the parser checks, at every level of `and`, `or` and `not` (they referred only to
   "an object" before). It is shared under `$defs`, so nested filters cost no extra size. A tool name must be 1 to 64
   letters, digits, `_` or `-`.
