@@ -18,6 +18,8 @@ pytest -q                           # Python API and crash tests (needs maturin 
 cargo clippy -p zenar-core          # lint
 ```
 
+The panic-guard test needs a build with the `test-hooks` feature: `maturin develop --release --features test-hooks`, then `pytest -k panic`. Shipped wheels do not include the hook.
+
 The Python binding needs an interpreter (3.10 or newer) at build time. Point PyO3 at one:
 `PYO3_PYTHON=.venv/bin/python cargo build --workspace`. Wheels are built by maturin, which enables the
 `extension-module` feature. Without it a plain build links against libpython.

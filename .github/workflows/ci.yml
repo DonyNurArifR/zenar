@@ -18,8 +18,8 @@ jobs:
         os: [ubuntu-latest, macos-latest, windows-latest]
         toolchain: ["1.89.0", stable]
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@master
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@v1
         with:
           toolchain: ${{ matrix.toolchain }}
       - run: cargo test --locked -p zenar-core
@@ -37,11 +37,13 @@ jobs:
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.12"
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@v1
+        with:
+          toolchain: stable
       - run: pip install maturin
       - run: maturin build --release --locked --out dist
       # Test the built wheel in a fresh venv, the way users install it.
@@ -59,12 +61,33 @@ jobs:
           .venv-test/bin/python -m pip install --quiet mypy
           .venv-test/bin/python -m mypy.stubtest zenar._zenar --allowlist tests/stubtest_allowlist.txt
 
+  panic-guard:
+    # The panic hook exists only in builds with test-hooks, so this job builds one and runs its test.
+    name: Panic guard (test-hooks build)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+      - uses: dtolnay/rust-toolchain@v1
+        with:
+          toolchain: stable
+      - run: pip install maturin pytest numpy
+      - run: maturin build --release --locked --features test-hooks --out dist
+      - run: |
+          python -m venv .venv-hooks
+          .venv-hooks/bin/python -m pip install --quiet dist/*.whl pytest numpy
+          .venv-hooks/bin/python -m pytest -q tests -k panic
+
   supply-chain:
     name: Audit and license check
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@v1
+        with:
+          toolchain: stable
       - run: cargo install --locked cargo-audit cargo-deny
       - run: cargo audit
       - run: cargo deny check licenses advisories bans
