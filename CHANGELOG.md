@@ -3,9 +3,16 @@
 All notable changes to Zenar. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the
 project follows [semantic versioning](https://semver.org/) while it is pre-1.0.
 
+## Unreleased
+
+### Changed
+- TurboVec is 1.1.2 (was 1.0.0). Unfiltered search is about 3x faster at 1M rows. A database written by 1.0.0 opens
+  unchanged and gives the same answers.
+- `top_k` is no longer capped at 1000. A result is at most the number of matching documents.
+
 ## 0.1.2
 
-Released on GitHub. Not yet on PyPI.
+Tagged. The release workflow has not run for this tag, so there is no GitHub release yet.
 
 ### Fixed
 - A database whose document log or vector index was emptied, deleted or truncated outside Zenar now fails to open

@@ -4,9 +4,9 @@ Embedded, lightweight, high-performance vector database for Python — a Rust
 core built on [TurboVec](https://github.com/RyanCodrai/turbovec) for vector
 search and a document log with in-memory indexes for metadata filtering.
 
-**Status: 0.1.2, released on GitHub with wheels attached; not yet on PyPI.** The core, Python API, persistence and
+**Status: 0.1.1 is the latest release (GitHub, wheels attached). Not yet on PyPI.** The core, Python API, persistence and
 crash recovery are implemented and tested. At 1M rows, filtered search takes
-0.3 to 3.5 ms against 1.2 ms unfiltered, depending on the filter. The design
+0.3 to 3.0 ms against 0.4 ms unfiltered, depending on the filter. The design
 spec makes the filter path a pass/fail gate but sets no numeric threshold, so
 this is measured, not yet judged. See [Project Status](#project-status).
 
@@ -93,9 +93,9 @@ or flips every byte of the last log record; Python: 84 tests, including repeated
 Measured on the reference machine at 1M rows, dim 384 (docs/BENCHMARKS.md):
 
 - Ingest with `add_many`: 0.011 ms per row. One row at a time: 0.014 ms.
-- Unfiltered search: 1.2 ms. Reopened unfiltered search: 1.2 ms. Open (log replay and index load): 0.45 s.
-- Selective filter (0.1%): 0.3 ms. Filter on 10% of rows: 3.5 ms. Compound filter (~4%): 3.5 ms.
-- Peak memory at this size: 430 MB (4-bit vectors, about 192 MB of it).
+- Unfiltered search: 0.4 ms. Reopened unfiltered search: 0.4 ms. Open (log replay and index load): 0.44 s.
+- Selective filter (0.1%): 0.3 ms. Filter on 10% of rows: 2.9 ms. Compound filter (~4%): 3.0 ms.
+- Peak memory at this size: 418 MB (4-bit vectors, about 192 MB of it).
 
 Not done:
 
@@ -105,8 +105,8 @@ Not done:
   No PyPI release yet.
 - **Power-loss behavior** is tested at the process level (`kill -9`) and at the byte level (every cut point in a torn
   record). Real power-loss testing on hardware is not done.
-- **Compound filters** cost about 3x an unfiltered search at 1M rows. The rest of that cost is TurboVec's allowlist
-  search, not Zenar's (docs/BENCHMARKS.md).
+- **Compound filters** cost about 8x an unfiltered search at 1M rows. Most of that is TurboVec's allowlist search, not
+  Zenar's (docs/BENCHMARKS.md).
 - **Open time** grows with the log: 0.45 s at 1M rows. There is no persisted index yet (docs/BENCHMARKS.md, known gaps).
 - **Agent tools** depend on the model. With local models, filters are sometimes sent as text (Zenar decodes them) or
   drop conditions. Accuracy against hosted models is not measured (docs/API.md, Agent tools).
