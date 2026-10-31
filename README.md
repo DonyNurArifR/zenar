@@ -4,9 +4,10 @@ Embedded, lightweight, high-performance vector database for Python — a Rust
 core built on [TurboVec](https://github.com/RyanCodrai/turbovec) for vector
 search and a document log with in-memory indexes for metadata filtering.
 
-**Status: 0.1.1 is the latest release (GitHub, wheels attached). Not yet on PyPI.** The core, Python API, persistence and
+**Status: 0.2.0 is the latest release (GitHub, wheels attached). Not yet on PyPI.** 0.2.0 changes the on-disk format:
+databases from 0.1.x must be recreated (see [CHANGELOG.md](CHANGELOG.md)). The core, Python API, persistence and
 crash recovery are implemented and tested. At 1M rows, filtered search takes
-0.3 to 3.0 ms against 0.4 ms unfiltered, depending on the filter. The design
+0.3 to 3.8 ms against 0.4 ms unfiltered, depending on the filter. The design
 spec makes the filter path a pass/fail gate but sets no numeric threshold, so
 this is measured, not yet judged. See [Project Status](#project-status).
 
@@ -76,9 +77,9 @@ Measurements: [docs/BENCHMARKS.md](docs/BENCHMARKS.md).
 
 ## Project Status
 
-Implemented and tested (Rust: 58 unit and 27 integration tests, including a reference-checked three-valued filter
+Implemented and tested (Rust: 60 unit and 28 integration tests, including a reference-checked three-valued filter
 oracle, a model-based test with reopens, a random-filter fuzz test, a concurrent read/write test, and a test that cuts
-or flips every byte of the last log record; Python: 84 tests, including repeated `kill -9` crash cycles):
+or flips every byte of the last log record; Python: 99 tests, including repeated `kill -9` crash cycles):
 
 - Collections, add, add_many (atomic), delete, delete_many (atomic), get, search, with the query planner and stale-ID handling.
 - Typed metadata, the full filter operator set, NULL and type rules, tenant isolation.
@@ -102,7 +103,7 @@ Not done:
 - **Cross-platform CI** runs on GitHub Actions for Ubuntu, macOS and Windows: Rust tests on Rust 1.89 and stable,
   Python wheel tests in a fresh venv on all three OS, plus a dependency audit and license check. Each release builds
   five wheels and an sdist, and smoke-tests them on three OS. The Intel macOS wheel is built but has not been run.
-  No PyPI release yet.
+  Not on PyPI yet.
 - **Power-loss behavior** is tested at the process level (`kill -9`) and at the byte level (every cut point in a torn
   record). Real power-loss testing on hardware is not done.
 - **Compound filters** cost about 10x an unfiltered search at 1M rows. Most of that is TurboVec's allowlist search, not
