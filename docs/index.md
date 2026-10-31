@@ -4,6 +4,9 @@ Zenar is an embedded vector database for Python. There is no server to run: you 
 
 It pairs a fast vector index ([TurboVec](https://github.com/RyanCodrai/turbovec)) with a document log that holds your metadata. Filters resolve to an exact set of candidate documents before the vector search runs, so a tenant-scoped query cannot return another tenant's documents.
 
+`VectorDB()` with no argument keeps the database in `./zenar`, created if it does not exist. Pass a path to choose the
+folder yourself.
+
 ## Install
 
 Build from a checkout for now. Prebuilt wheels are attached to each GitHub release.
