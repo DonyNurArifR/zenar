@@ -18,7 +18,7 @@ const BIT_WIDTHS: [usize; 3] = [2, 3, 4];
 /// * `Normal` (default): the index and the document log are synced at each sync boundary
 ///   (every 1000 adds) and by `flush()`. Adds after the last boundary can be lost on power failure.
 /// * `Full`: every add syncs the index and the log before returning. Power-safe per add, at a
-///   much lower ingest rate (see BENCHMARKS.md).
+///   much lower ingest rate (see docs/BENCHMARKS.md).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum MetadataSync {
     #[default]

@@ -17,5 +17,5 @@ pyo3 = { version = "0.29", features = ["abi3-py310"] }
 
 [features]
 # Enabled by maturin for wheels. Leaves Python symbols to the interpreter, so a
-# plain `cargo build` of the workspace links (see CONTRIBUTING.md).
+# plain `cargo build` of the workspace links (see docs/CONTRIBUTING.md).
 extension-module = ["pyo3/extension-module"]

@@ -144,7 +144,7 @@ impl Collection {
     ///
     /// Order: stage the document write, add the vector in memory, and at a sync boundary
     /// sync the index and the log. Only then make the document visible. A crash before the
-    /// boundary can lose the newest adds, and reconciliation removes the rest (STORAGE.md).
+    /// boundary can lose the newest adds, and reconciliation removes the rest (docs/STORAGE.md).
     pub fn add(
         &self,
         id: u64,

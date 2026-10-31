@@ -70,9 +70,9 @@ with VectorDB("./my_vectors") as db:
 - Dimensions that are not multiples of 8 are accepted. Zenar pads them internally, and scores are unchanged.
 - Every comparison in a `filter=` expression must be parenthesized when combined with `&`, `|`, `~`.
 
-Full reference: [API.md](API.md). Filter semantics: [FILTERING.md](FILTERING.md).
-Durability and recovery: [STORAGE.md](STORAGE.md). Design: [ARCHITECTURE.md](ARCHITECTURE.md).
-Measurements: [BENCHMARKS.md](BENCHMARKS.md).
+Full reference: [docs/API.md](docs/API.md). Filter semantics: [docs/FILTERING.md](docs/FILTERING.md).
+Durability and recovery: [docs/STORAGE.md](docs/STORAGE.md). Design: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
+Measurements: [docs/BENCHMARKS.md](docs/BENCHMARKS.md).
 
 ## Project Status
 
@@ -88,9 +88,9 @@ or flips every byte of the last log record; Python: 60 tests, including repeated
 - Python bindings with a complete exception hierarchy, GIL release, numpy input, and a panic guard.
 - Agent tools: `describe` (fields, values and counts), `find_values`, `retrieve` with a JSON `where`
   filter that suggests field names and explains empty results, and `tool_spec` for tool-calling models.
-  See API.md, "Agent tools".
+  See docs/API.md, "Agent tools".
 
-Measured on the reference machine at 1M rows, dim 384 (BENCHMARKS.md):
+Measured on the reference machine at 1M rows, dim 384 (docs/BENCHMARKS.md):
 
 - Ingest with `add_many`: 0.011 ms per row. One row at a time: 0.014 ms.
 - Unfiltered search: 1.2 ms. Reopened unfiltered search: 1.2 ms. Open (log replay and index load): 0.45 s.
@@ -104,11 +104,11 @@ Not done:
   current branch. Wheels are built in CI only; no PyPI release yet.
 - **Power-loss behavior** is tested at the process level (`kill -9`) and at the byte level (every cut point in a torn
   record). Real power-loss testing on hardware is not done.
-- **Compound filters** are the slowest case. Merging many postings is not tuned yet (BENCHMARKS.md, known gaps).
+- **Compound filters** are the slowest case. Merging many postings is not tuned yet (docs/BENCHMARKS.md, known gaps).
 
 ## Contributing
 
-See [CONTRIBUTING.md](CONTRIBUTING.md).
+See [docs/CONTRIBUTING.md](docs/CONTRIBUTING.md).
 
 ## License
 

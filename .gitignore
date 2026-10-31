@@ -26,12 +26,7 @@ venv/
 # Markdown — ignore all except the public project docs
 *.md
 !README.md
-!API.md
-!FILTERING.md
-!STORAGE.md
-!ARCHITECTURE.md
-!BENCHMARKS.md
-!CONTRIBUTING.md
+!docs/*.md
 
 # IDE / OS
 .DS_Store
