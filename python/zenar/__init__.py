@@ -10,6 +10,7 @@
 
 from ._zenar import (
     CollectionAlreadyExistsError,
+    CollectionClosedError,
     CollectionNotFoundError,
     Collection,
     DatabaseLockedError,
@@ -33,6 +34,7 @@ from ._zenar import (
 __all__ = [
     "Collection",
     "CollectionAlreadyExistsError",
+    "CollectionClosedError",
     "CollectionNotFoundError",
     "DatabaseLockedError",
     "DimensionMismatchError",

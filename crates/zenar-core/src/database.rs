@@ -44,6 +44,19 @@ pub struct VectorDB {
     recovery: RecoveryReport,
 }
 
+impl Drop for VectorDB {
+    /// Flushes and closes every collection. Errors cannot be reported from drop; `flush()` before
+    /// closing reports them. Handles that outlive the database then fail instead of writing.
+    fn drop(&mut self) {
+        if let Ok(collections) = self.collections.get_mut() {
+            for collection in collections.values() {
+                let _ = collection.flush();
+                collection.close();
+            }
+        }
+    }
+}
+
 impl VectorDB {
     /// Opens (or creates) a database with the default `MetadataSync::Normal`.
     pub fn open(path: impl AsRef<Path>) -> Result<Self, ZenarError> {
@@ -228,9 +241,11 @@ impl VectorDB {
     /// Deletes a collection, its documents and its vector file.
     pub fn drop_collection(&self, name: &str) -> Result<(), ZenarError> {
         let mut collections = self.collections.write().map_err(|_| lock_poisoned())?;
-        if collections.remove(name).is_none() {
+        let Some(collection) = collections.remove(name) else {
             return Err(ZenarError::CollectionNotFound(name.to_string()));
-        }
+        };
+        // Close the handle before its files go, so a write through it cannot recreate them.
+        collection.close();
         self.catalog.remove(name)?;
         for path in [docs_path(&self.root, name), index_path(&self.root, name)] {
             if path.exists() {

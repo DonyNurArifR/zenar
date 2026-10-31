@@ -7,6 +7,9 @@ pub enum ZenarError {
     #[error("collection not found: {0}")]
     CollectionNotFound(String),
 
+    #[error("collection {0} is closed: its database was closed, or the collection was dropped")]
+    CollectionClosed(String),
+
     #[error("collection already exists: {0}")]
     CollectionAlreadyExists(String),
 

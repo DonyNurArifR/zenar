@@ -82,12 +82,16 @@ your vectors, at least 256 of them (`n * dimension` floats).
 
 Every error inherits from `zenar.ZenarError`:
 
-`CollectionNotFoundError`, `CollectionAlreadyExistsError`, `InvalidCollectionNameError`,
+`CollectionNotFoundError`, `CollectionClosedError`, `CollectionAlreadyExistsError`, `InvalidCollectionNameError`,
 `DimensionMismatchError`, `DuplicateIdError`, `VectorNotFoundError`, `InvalidVectorError`,
 `InvalidMetadataError`, `InvalidFilterError`, `InvalidArgumentError`, `DatabaseLockedError`,
 `VectorStoreError`, `MetadataStoreError`, `PersistenceError`, `RecoveryError`.
 
 `DimensionMismatchError` means a vector's length differs from the collection's dimension. A dimension argument that is out of range (zero, or above the limit) raises `InvalidArgumentError`.
+
+`CollectionClosedError` means the handle outlived its database, or its collection was dropped. Keep a reference to the
+`VectorDB` for as long as you use its collections. A collection handle cannot write after its database is closed, since
+such a write would look successful and then be lost.
 
 Catch `ZenarError` to handle any library error.
 

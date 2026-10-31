@@ -23,6 +23,7 @@ create_exception!(
     "Base class for all Zenar errors."
 );
 create_exception!(_zenar, CollectionNotFoundError, ZenarError);
+create_exception!(_zenar, CollectionClosedError, ZenarError);
 create_exception!(_zenar, CollectionAlreadyExistsError, ZenarError);
 create_exception!(_zenar, InvalidCollectionNameError, ZenarError);
 create_exception!(_zenar, DimensionMismatchError, ZenarError);
@@ -43,6 +44,7 @@ fn to_py_err(e: CoreError) -> PyErr {
     let msg = e.to_string();
     match e {
         CoreError::CollectionNotFound(_) => CollectionNotFoundError::new_err(msg),
+        CoreError::CollectionClosed(_) => CollectionClosedError::new_err(msg),
         CoreError::CollectionAlreadyExists(_) => CollectionAlreadyExistsError::new_err(msg),
         CoreError::InvalidCollectionName(_) => InvalidCollectionNameError::new_err(msg),
         CoreError::DimensionMismatch { .. } => DimensionMismatchError::new_err(msg),
@@ -150,6 +152,15 @@ fn meta_to_py<'py>(py: Python<'py>, value: &MetaValue) -> PyResult<Bound<'py, Py
 /// once. The limited-API build does not expose the buffer protocol, so this is the fast path.
 fn extract_vector(value: &Bound<'_, PyAny>) -> PyResult<Vec<f32>> {
     if value.hasattr("tobytes")? && value.hasattr("astype")? {
+        // The bytes path flattens, so a (1, n) or (n, 1) array would pass as a vector of n floats.
+        if value.hasattr("ndim")? {
+            let ndim: usize = value.getattr("ndim")?.extract()?;
+            if ndim != 1 {
+                return Err(InvalidVectorError::new_err(format!(
+                    "vector must be one-dimensional, got an array with {ndim} dimensions"
+                )));
+            }
+        }
         let bytes: Vec<u8> = value
             .call_method1("astype", ("<f4",))?
             .call_method0("tobytes")?
@@ -865,6 +876,10 @@ fn _zenar(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add(
         "CollectionNotFoundError",
         m.py().get_type::<CollectionNotFoundError>(),
+    )?;
+    m.add(
+        "CollectionClosedError",
+        m.py().get_type::<CollectionClosedError>(),
     )?;
     m.add(
         "CollectionAlreadyExistsError",

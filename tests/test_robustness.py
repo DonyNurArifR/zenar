@@ -169,3 +169,64 @@ def test_a_stale_index_from_an_interrupted_drop_is_not_loaded_by_a_new_collectio
     assert db.get_collection("a").count() == 0
     assert db.recovery_report()["orphaned_vectors_removed"] == 0
     db.close()
+
+
+def test_a_handle_cannot_write_after_its_database_is_closed():
+    root = tempfile.mkdtemp()
+    db = zenar.VectorDB(root)
+    c = db.create_collection("docs", dimension=3)
+    c.add(id=1, vector=[1.0, 0.0, 0.0], text="kept")
+    db.close()
+    with pytest.raises(zenar.CollectionClosedError):
+        c.add(id=2, vector=[1.0, 0.0, 0.0], text="lost")
+    with pytest.raises(zenar.CollectionClosedError):
+        c.count()
+    reopened = zenar.VectorDB(root)
+    assert reopened.get_collection("docs").count() == 1
+    reopened.close()
+
+
+def test_a_handle_cannot_write_after_its_collection_is_dropped():
+    db = zenar.VectorDB(tempfile.mkdtemp())
+    c = db.create_collection("docs", dimension=3)
+    db.drop_collection("docs")
+    with pytest.raises(zenar.CollectionClosedError):
+        c.add(id=1, vector=[1.0, 0.0, 0.0], text="lost")
+    assert "docs" not in db.list_collections()
+    db.close()
+
+
+@pytest.mark.parametrize("make_filter", [
+    lambda f: f.p == float("nan"),
+    lambda f: f.p < float("nan"),
+    lambda f: f.p >= float("nan"),
+    lambda f: f.p.isin([float("nan")]),
+])
+def test_a_nan_filter_value_is_refused(make_filter):
+    db = zenar.VectorDB(tempfile.mkdtemp())
+    c = db.create_collection("docs", dimension=3)
+    c.add(id=1, vector=[1.0, 0.0, 0.0], text="a", metadata={"p": 1.0})
+    with pytest.raises(zenar.InvalidFilterError):
+        c.search([1.0, 0.0, 0.0], top_k=5, filter=make_filter(zenar.field))
+    db.close()
+
+
+def test_only_one_dimensional_arrays_are_vectors():
+    np = pytest.importorskip("numpy")
+    db = zenar.VectorDB(tempfile.mkdtemp())
+    c = db.create_collection("docs", dimension=3)
+    c.add(id=1, vector=np.array([1.0, 0.0, 0.0]), text="ok")
+    for shape_vector in (np.array([[1.0, 0.0, 0.0]]), np.array([[1.0], [0.0], [0.0]])):
+        with pytest.raises(zenar.InvalidVectorError):
+            c.add(id=2, vector=shape_vector, text="flattened")
+    assert c.count() == 1
+    db.close()
+
+
+def test_a_non_object_scope_names_the_scope_argument():
+    db = zenar.VectorDB(tempfile.mkdtemp())
+    c = db.create_collection("docs", dimension=3)
+    c.add(id=1, vector=[1.0, 0.0, 0.0], text="a", metadata={"tenant": "A"})
+    with pytest.raises(zenar.InvalidFilterError, match="scope must be a JSON object"):
+        c.describe(scope="A")
+    db.close()
