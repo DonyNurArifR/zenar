@@ -48,8 +48,8 @@ open. Drop the handle first, then drop the collection.
 
 ### `add`
 
-1. Validate the record. Extend the schema in the catalog if the record introduces fields. The catalog is written first,
-   so a record that uses a new field never reaches the log before the catalog knows the field.
+1. Validate the record. If the collection has no schema yet, the record's fields become the schema, and the catalog is
+   written first. After that, a record may not use a field name the schema lacks.
 2. Write the PUT frame to the log (not yet visible to readers).
 3. Add the vector to the in-memory index.
 4. At a sync boundary (every 1000 adds, or every add with `durable=True`), sync the index file and the log. If that
@@ -61,7 +61,8 @@ open. Drop the handle first, then drop the collection.
 A batch is all-or-nothing:
 
 1. Validate every record: ids, vectors, metadata, duplicates within the batch and against stored documents.
-   If the batch introduces metadata fields, the new schema is written to the catalog. No document is written yet.
+   If the collection has no schema yet and the batch defines one, the schema is written to the catalog. No document is
+   written yet.
 2. Write every PUT frame to the log, in one write.
 3. Add every vector to the index.
 4. Sync the index file, then the log.
