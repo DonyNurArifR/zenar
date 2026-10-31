@@ -161,6 +161,15 @@ case-sensitive. An empty object matches everything. `and`, `or` and `not` cannot
 field with many values. The `where` schema uses `enum` for short value lists, so the model is steered to values that
 exist. Range bounds (`gt`, `gte`, `lt`, `lte`) are not restricted to existing values.
 
+The schema is the same one the parser checks, at every level of `and`, `or` and `not`. Every `where` the schema accepts,
+the parser accepts. The reverse is not true: a value outside the `enum` is accepted by the parser, with a warning, so
+a call that matches nothing still returns zero hits, not an error.
+
+The tool's `parameters` carry the shared `where` definition under `$defs`, and nested filters refer to it with `$ref`.
+Some function-calling APIs do not support `$ref`. Check this with the provider you use before relying on nested filters.
+
+The tool name must be 1 to 64 letters, digits, `_` or `-`. Any other name is refused by `tool_spec`.
+
 ### Limits and things your application must do
 
 - Metadata values: `str`, `int` (64-bit), `float` (finite), `bool`, timezone-aware `datetime`, and numpy scalars (converted

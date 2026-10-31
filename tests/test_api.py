@@ -528,7 +528,7 @@ def test_find_values_and_tool_spec(db):
     assert spec["name"] == "search_shop"
     assert "category (text)" in spec["description"]
     assert set(spec["parameters"]["required"]) == {"query"}
-    where = spec["parameters"]["properties"]["where"]
+    where = spec["parameters"]["$defs"]["where"]
     assert set(where["properties"]) >= {"tenant", "category", "price", "and", "or", "not"}
     assert set(where["properties"]["tenant"]["anyOf"][0]["enum"]) == {"A", "B"}
     assert spec["input_schema"] == spec["parameters"]
@@ -561,7 +561,7 @@ def test_tool_spec_is_a_dict_that_creates_a_prompt(db):
 
 def test_range_bounds_are_not_restricted_to_existing_values(db):
     c = _shop(db)
-    where = c.tool_spec("search_shop", scope=None)["parameters"]["properties"]["where"]
+    where = c.tool_spec("search_shop", scope=None)["parameters"]["$defs"]["where"]
     price = where["properties"]["price"]["anyOf"][1]["properties"]
     assert "enum" not in price["gte"] and "enum" not in price["lt"], "a range bound may be any number"
     tenant = where["properties"]["tenant"]["anyOf"][1]["properties"]

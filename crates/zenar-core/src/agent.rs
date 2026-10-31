@@ -481,17 +481,19 @@ pub fn where_schema(stats: &[FieldStats]) -> Value {
             }),
         );
     }
+    // Nested filters refer to this same definition, so the model sees the field names and values
+    // at every level. See `WHERE_DEF`.
     properties.insert(
         "and".into(),
-        json!({"type": "array", "items": {"type": "object"}, "description": "all of these must match"}),
+        json!({"type": "array", "items": {"$ref": WHERE_DEF}, "description": "all of these must match"}),
     );
     properties.insert(
         "or".into(),
-        json!({"type": "array", "items": {"type": "object"}, "description": "at least one of these must match"}),
+        json!({"type": "array", "items": {"$ref": WHERE_DEF}, "description": "at least one of these must match"}),
     );
     properties.insert(
         "not".into(),
-        json!({"type": "object", "description": "the document must not match this"}),
+        json!({"$ref": WHERE_DEF, "description": "the document must not match this"}),
     );
     json!({
         "type": "object",
@@ -502,9 +504,17 @@ pub fn where_schema(stats: &[FieldStats]) -> Value {
 }
 
 /// The JSON type of a field's values, with no list of allowed values.
-/// The `where` argument. The description says it must be an object, because some models send it
-/// as a JSON-encoded string, which the tool then rejects.
-fn where_parameter(stats: &[FieldStats]) -> Value {
+/// Where the shared `where` definition lives in the tool's parameters.
+const WHERE_DEF: &str = "#/$defs/where";
+
+/// The `where` argument: a reference to the shared definition. The definition's description says it
+/// must be an object, because some models send it as a JSON-encoded string, which the tool then rejects.
+fn where_parameter() -> Value {
+    json!({"$ref": WHERE_DEF})
+}
+
+/// The shared definition of a `where` object, placed under `$defs` in the tool's parameters.
+fn where_definition(stats: &[FieldStats]) -> Value {
     let mut schema = where_schema(stats);
     schema["description"] = json!(
         "A JSON object, not a string, that filters documents by their fields. \
@@ -555,11 +565,12 @@ pub fn tool_spec(name: &str, collection: &str, documents: usize, stats: &[FieldS
     let description = lines.join("\n");
     let parameters = json!({
         "type": "object",
+        "$defs": {"where": where_definition(stats)},
         "properties": {
             "query": {"type": "string", "description": "What to search for, in natural language."},
             "top_k": {"type": "integer", "minimum": 1, "default": 10,
                       "description": "How many results to return, best first. At most the number of matching documents."},
-            "where": where_parameter(stats)
+            "where": where_parameter()
         },
         "required": ["query"],
         "additionalProperties": false

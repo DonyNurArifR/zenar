@@ -883,7 +883,7 @@ fn find_values_searches_values_and_tool_spec_lists_them() {
     let text_desc = spec["description"].as_str().unwrap();
     assert!(text_desc.contains("category (text)"), "{text_desc}");
     let enum_values =
-        &spec["parameters"]["properties"]["where"]["properties"]["category"]["anyOf"][0]["enum"];
+        &spec["parameters"]["$defs"]["where"]["properties"]["category"]["anyOf"][0]["enum"];
     assert!(
         enum_values
             .as_array()
@@ -1142,6 +1142,27 @@ fn agent_calls_stay_correct_during_concurrent_writes() {
     w.join().unwrap();
     for r in readers {
         r.join().unwrap();
+    }
+    fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn tool_spec_refuses_names_the_function_calling_apis_reject() {
+    let dir = temp_dir("toolname");
+    let db = VectorDB::open(&dir).unwrap();
+    let c = db.create_collection("tn", None, 4).unwrap();
+    c.add_many(&[doc_with(1, "acme", "x", 1.0)]).unwrap();
+    assert!(c.tool_spec("search_products-2", None).is_ok());
+    for bad in [
+        "",
+        "search products",
+        "search.products",
+        "x".repeat(65).as_str(),
+    ] {
+        assert!(
+            matches!(c.tool_spec(bad, None), Err(ZenarError::InvalidArgument(_))),
+            "name {bad:?} should be refused"
+        );
     }
     fs::remove_dir_all(&dir).ok();
 }

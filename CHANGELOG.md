@@ -6,6 +6,9 @@ project follows [semantic versioning](https://semver.org/) while it is pre-1.0.
 ## Unreleased
 
 ### Changed
+- The agent `where` schema is the one the parser checks, at every level of `and`, `or` and `not` (they referred only to
+  "an object" before). It is shared under `$defs`, so nested filters cost no extra size. A tool name must be 1 to 64
+  letters, digits, `_` or `-`.
 - The catalog format is version 2. Version 2 also marks the record format with 32-bit field counts. A database from an
   earlier release is refused with a message that says so, instead of being misread. No database has been released to
   PyPI. Releases 0.1.1 and 0.1.2 on GitHub wrote version 1, and they cannot be read by this version.

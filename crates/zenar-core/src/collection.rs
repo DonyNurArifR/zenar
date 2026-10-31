@@ -600,6 +600,18 @@ impl Collection {
         tool_name: &str,
         scope: Option<&serde_json::Value>,
     ) -> Result<serde_json::Value, ZenarError> {
+        // Function-calling APIs accept only these names. Refusing a bad one here gives a clear error,
+        // instead of a rejection from the model provider.
+        let valid_name = !tool_name.is_empty()
+            && tool_name.len() <= 64
+            && tool_name
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-');
+        if !valid_name {
+            return Err(ZenarError::InvalidArgument(format!(
+                "tool name {tool_name:?} must be 1 to 64 letters, digits, '_' or '-'"
+            )));
+        }
         let state = self.read_state()?;
         healthy(&state)?;
         let (stats, documents) = self.stats_for_scope(&state, scope)?;
