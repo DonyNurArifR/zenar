@@ -43,3 +43,5 @@ graphify-out/
 *.so
 *.pyd
 *.dylib
+docs/_build/
+_site/
