@@ -360,6 +360,10 @@ impl Collection {
         if state.unsynced > 0 || self.durable {
             self.sync_both(&mut state)?;
         }
+        // Adds only grow the files, so their recorded lengths can lag until the next flush. Recording
+        // here keeps the shortened-file check exact at every flush and close. Deletes record on their own,
+        // since they are the operations that shrink a file.
+        self.record_durable(&state)?;
         Ok(())
     }
 
@@ -757,7 +761,6 @@ impl Collection {
     fn sync_both(&self, state: &mut State) -> Result<(), ZenarError> {
         state.store.sync(&self.index_path)?;
         state.docs.sync()?;
-        self.record_durable(state)?;
         state.unsynced = 0;
         Ok(())
     }

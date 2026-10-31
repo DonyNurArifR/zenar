@@ -6,6 +6,8 @@ project follows [semantic versioning](https://semver.org/) while it is pre-1.0.
 ## Unreleased
 
 ### Changed
+- A batch writes the catalog once, at flush or close, not at every sync. A 50-document `add_many` took 16 ms; it now takes
+  9 ms on macOS, where a full flush is the main cost. Deletes still record their lengths at once.
 - Less memory per document. The per-field presence list held the same rows as the codes list, so it is gone. A million
   documents with three metadata fields open in 206 MB, down from 225 MB. The file format is unchanged.
 - The agent `where` schema is the one the parser checks, at every level of `and`, `or` and `not` (they referred only to
