@@ -58,15 +58,20 @@ pub struct Catalog {
     entries: Mutex<BTreeMap<String, Entry>>,
 }
 
+/// On-disk format version of `catalog.json`. It also versions the record format in the logs: version 2
+/// stores each document's field count as 32 bits. Bump it for any change that an older build cannot read.
+pub const CATALOG_VERSION: u32 = 3;
+
 impl Catalog {
     pub fn open(path: &Path) -> Result<Self, ZenarError> {
         let entries = if path.exists() {
             let text = fs::read_to_string(path).map_err(io_err)?;
             let file: CatalogFile = serde_json::from_str(&text)
                 .map_err(|e| ZenarError::RecoveryError(format!("catalog is unreadable: {e}")))?;
-            if file.version != 1 {
+            if file.version != CATALOG_VERSION {
                 return Err(ZenarError::RecoveryError(format!(
-                    "unsupported catalog version {}",
+                    "this database has catalog version {}, and this Zenar reads version {CATALOG_VERSION}. \
+                     Databases written by earlier releases cannot be read; create a new one",
                     file.version
                 )));
             }
@@ -132,7 +137,7 @@ impl Catalog {
 
     fn persist(&self, map: &BTreeMap<String, Entry>) -> Result<(), ZenarError> {
         let file = CatalogFile {
-            version: 1,
+            version: CATALOG_VERSION,
             collections: map.values().cloned().collect(),
         };
         let text = serde_json::to_string_pretty(&file)

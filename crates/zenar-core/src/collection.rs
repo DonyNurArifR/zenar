@@ -360,6 +360,10 @@ impl Collection {
         if state.unsynced > 0 || self.durable {
             self.sync_both(&mut state)?;
         }
+        // Adds only grow the files, so their recorded lengths can lag until the next flush. Recording
+        // here keeps the shortened-file check exact at every flush and close. Deletes record on their own,
+        // since they are the operations that shrink a file.
+        self.record_durable(&state)?;
         Ok(())
     }
 
@@ -600,6 +604,18 @@ impl Collection {
         tool_name: &str,
         scope: Option<&serde_json::Value>,
     ) -> Result<serde_json::Value, ZenarError> {
+        // Function-calling APIs accept only these names. Refusing a bad one here gives a clear error,
+        // instead of a rejection from the model provider.
+        let valid_name = !tool_name.is_empty()
+            && tool_name.len() <= 64
+            && tool_name
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-');
+        if !valid_name {
+            return Err(ZenarError::InvalidArgument(format!(
+                "tool name {tool_name:?} must be 1 to 64 letters, digits, '_' or '-'"
+            )));
+        }
         let state = self.read_state()?;
         healthy(&state)?;
         let (stats, documents) = self.stats_for_scope(&state, scope)?;
@@ -745,7 +761,6 @@ impl Collection {
     fn sync_both(&self, state: &mut State) -> Result<(), ZenarError> {
         state.store.sync(&self.index_path)?;
         state.docs.sync()?;
-        self.record_durable(state)?;
         state.unsynced = 0;
         Ok(())
     }
@@ -916,14 +931,11 @@ fn resolve_metadata(
             .map(|(_, k)| *k);
         let value = match declared {
             Some(kind) => coerce(&name, kind, value)?,
-            None if schema.is_empty() => {
+            // A new field name extends the schema, with the type of its first value. A field keeps
+            // that type for the life of the collection (see `coerce`).
+            None => {
                 new_fields.push((name.clone(), FieldKind::of(&value)));
                 value
-            }
-            None => {
-                return Err(ZenarError::InvalidMetadata(format!(
-                    "field {name:?} is not part of this collection's metadata schema"
-                )));
             }
         };
         values.push((name, value));
@@ -960,13 +972,23 @@ mod tests {
     }
 
     #[test]
-    fn unknown_field_after_schema_lock_rejected() {
+    fn unknown_field_extends_the_schema() {
         let schema = vec![("tenant".to_string(), FieldKind::Text)];
-        let r = resolve_metadata(
+        let (new_fields, values) = resolve_metadata(
             &schema,
             vec![("color".into(), MetaValue::Text("red".into()))],
-        );
-        assert!(matches!(r, Err(ZenarError::InvalidMetadata(_))));
+        )
+        .unwrap();
+        assert_eq!(new_fields, vec![("color".to_string(), FieldKind::Text)]);
+        assert_eq!(values[0].0, "color");
+    }
+
+    #[test]
+    fn a_new_field_keeps_the_type_of_its_first_value() {
+        let schema = vec![("tenant".to_string(), FieldKind::Text)];
+        let (new_fields, _) =
+            resolve_metadata(&schema, vec![("price".into(), MetaValue::Float(9.5))]).unwrap();
+        assert_eq!(new_fields, vec![("price".to_string(), FieldKind::Float)]);
     }
 
     #[test]

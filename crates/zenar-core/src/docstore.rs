@@ -153,22 +153,20 @@ struct FieldIndex {
     kind: FieldKind,
     /// Value to rows. Rows marked dead are filtered out when read.
     values: BTreeMap<Key, Group>,
-    /// Each row's value code for this field, or `NO_CODE`. One entry per row, in row order.
-    codes: Vec<u32>,
+    /// (row, code) for each row that has this field, in row order. Only rows that have the field are
+    /// stored, so the cost follows the data, not the number of fields times the number of rows.
+    codes: Vec<(u32, u32)>,
     /// Codes handed out so far. Codes are never reused, so this bounds every code.
     code_count: u32,
-    /// Rows where the field is present, ascending. Dead rows are filtered out when read.
-    present: Vec<u32>,
 }
 
 impl FieldIndex {
-    fn new(kind: FieldKind, rows: usize) -> Self {
+    fn new(kind: FieldKind) -> Self {
         Self {
             kind,
             values: BTreeMap::new(),
-            codes: vec![NO_CODE; rows],
+            codes: Vec::new(),
             code_count: 0,
-            present: Vec::new(),
         }
     }
 }
@@ -238,7 +236,7 @@ impl DocStore {
     ) -> Self {
         let index = fields
             .iter()
-            .map(|(_, kind)| FieldIndex::new(*kind, 0))
+            .map(|(_, kind)| FieldIndex::new(*kind))
             .collect();
         Self {
             path,
@@ -258,7 +256,7 @@ impl DocStore {
     pub fn extend_fields(&mut self, new_fields: &[(String, FieldKind)]) {
         for (name, kind) in new_fields {
             self.fields.push((name.clone(), *kind));
-            self.index.push(FieldIndex::new(*kind, self.rows.len()));
+            self.index.push(FieldIndex::new(*kind));
         }
     }
 
@@ -456,9 +454,6 @@ impl DocStore {
         });
         self.by_id.insert(id, row);
         self.live += 1;
-        for index in &mut self.index {
-            index.codes.push(NO_CODE);
-        }
         for (fi, key) in keys {
             let index = &mut self.index[fi];
             let next_code = index.code_count;
@@ -471,8 +466,7 @@ impl DocStore {
             if code == next_code {
                 index.code_count += 1;
             }
-            index.codes[row as usize] = code;
-            index.present.push(row);
+            index.codes.push((row, code));
         }
     }
 
@@ -719,12 +713,13 @@ impl DocStore {
         Ok((fi, self.fields[fi].1))
     }
 
-    /// Rows where field `fi` is present and live.
+    /// Rows where field `fi` is present and live. The codes list holds exactly the rows that have the
+    /// field, in row order, so it doubles as the presence list.
     fn present_live(&self, fi: usize) -> Vec<u32> {
         self.index[fi]
-            .present
+            .codes
             .iter()
-            .copied()
+            .map(|&(row, _)| row)
             .filter(|&r| self.is_live(r))
             .collect()
     }
@@ -940,8 +935,7 @@ impl DocStore {
             many => self.live_rows_of(many),
         };
         for leaf in &leaves {
-            let codes = &self.index[leaf.fi].codes;
-            candidates.retain(|&r| leaf.accepts(codes[r as usize]));
+            retain_accepted(&mut candidates, &self.index[leaf.fi], leaf);
             if candidates.is_empty() {
                 return Ok(candidates);
             }
@@ -1071,6 +1065,34 @@ enum Cmp {
 
 /// Index key for a value of a field with this kind. Integers are widened for float fields.
 /// Other mismatches return an error, and the caller uses a scan for mixed numeric comparisons.
+/// Keeps the candidates whose code for `index`'s field `leaf` accepts. Candidates are ascending. When
+/// they are dense relative to the field's codes, one forward pass over the codes is cheapest. When
+/// they are sparse, a binary search per candidate costs less than walking the whole list.
+fn retain_accepted(candidates: &mut Vec<u32>, index: &FieldIndex, leaf: &Selector<'_>) {
+    let codes = &index.codes;
+    if candidates.len().saturating_mul(16) >= codes.len() {
+        let mut at = 0;
+        candidates.retain(|&r| {
+            while at < codes.len() && codes[at].0 < r {
+                at += 1;
+            }
+            let code = match codes.get(at) {
+                Some(&(row, code)) if row == r => code,
+                _ => NO_CODE,
+            };
+            leaf.accepts(code)
+        });
+    } else {
+        candidates.retain(|&r| {
+            let code = match codes.binary_search_by_key(&r, |&(row, _)| row) {
+                Ok(at) => codes[at].1,
+                Err(_) => NO_CODE,
+            };
+            leaf.accepts(code)
+        });
+    }
+}
+
 /// Refuses a write that would take the row count past `MAX_ROWS`. Row numbers are stored as `u32`,
 /// and a wrapped row number would point at the wrong document. Dead rows count, until compaction.
 fn check_row_capacity(rows: usize, incoming: usize) -> Result<(), ZenarError> {
@@ -1184,7 +1206,7 @@ fn encode_put(doc: &DocRef<'_>, fields: &[(String, FieldKind)]) -> Result<Vec<u8
     out.extend_from_slice(&doc.id.to_le_bytes());
     out.extend_from_slice(&(doc.text.len() as u32).to_le_bytes());
     out.extend_from_slice(doc.text.as_bytes());
-    out.extend_from_slice(&(doc.metadata.len() as u16).to_le_bytes());
+    out.extend_from_slice(&(doc.metadata.len() as u32).to_le_bytes());
     for (name, value) in doc.metadata {
         if !fields.iter().any(|(n, _)| n == name) {
             return Err(ZenarError::InvalidMetadata(format!(
@@ -1264,7 +1286,7 @@ fn decode_put(payload: &[u8], fields: &[(String, FieldKind)]) -> Result<Document
     let text_len = r.u32()? as usize;
     let text = String::from_utf8(r.bytes(text_len)?.to_vec())
         .map_err(|_| ZenarError::RecoveryError("document text is not UTF-8".into()))?;
-    let n = r.u16()? as usize;
+    let n = r.u32()? as usize;
     let mut metadata = Vec::with_capacity(n);
     for _ in 0..n {
         let name_len = r.u8()? as usize;
@@ -1300,7 +1322,7 @@ fn decode_for_replay(
     let id = r.u64()?;
     let text_len = r.u32()? as usize;
     r.bytes(text_len)?;
-    let n = r.u16()? as usize;
+    let n = r.u32()? as usize;
     let mut metadata = Vec::with_capacity(n);
     for _ in 0..n {
         let name_len = r.u8()? as usize;
@@ -1334,9 +1356,6 @@ impl<'a> Reader<'a> {
     }
     fn u8(&mut self) -> Result<u8, ZenarError> {
         Ok(self.array::<1>()?[0])
-    }
-    fn u16(&mut self) -> Result<u16, ZenarError> {
-        Ok(u16::from_le_bytes(self.array()?))
     }
     fn u32(&mut self) -> Result<u32, ZenarError> {
         Ok(u32::from_le_bytes(self.array()?))
@@ -1456,7 +1475,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("zenar-docstore-{tag}-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
-        dir.join("docs.log")
+        dir.join("docs.zdocs")
     }
 
     /// Writes and commits a batch of documents.

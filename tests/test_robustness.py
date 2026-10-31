@@ -1,5 +1,6 @@
 """Bad inputs get a named error, and concurrent use keeps the collection consistent."""
 
+import json
 import math
 import pathlib
 import random
@@ -127,8 +128,8 @@ def _saved_collection(root):
 def test_a_file_shortened_outside_zenar_is_refused_not_silently_dropped(damage):
     root = tempfile.mkdtemp()
     _saved_collection(root)
-    log = pathlib.Path(root, "docs", "docs.log")
-    vectors = pathlib.Path(root, "vectors", "docs.tvim")
+    log = pathlib.Path(root, "docs", "docs.zdocs")
+    vectors = pathlib.Path(root, "vectors", "docs.zvec")
     if damage == "log_deleted":
         log.unlink()
     elif damage == "log_emptied":
@@ -156,7 +157,7 @@ def test_a_stale_index_from_an_interrupted_drop_is_not_loaded_by_a_new_collectio
     c = db.create_collection("a", dimension=8)
     c.add_many([{"id": i, "vector": [1.0] * 8, "text": "t", "metadata": {}} for i in range(20)])
     db.close()
-    index = pathlib.Path(root, "vectors", "a.tvim")
+    index = pathlib.Path(root, "vectors", "a.zvec")
     stale = index.read_bytes()
     db = zenar.VectorDB(root)
     db.drop_collection("a")
@@ -230,3 +231,66 @@ def test_a_non_object_scope_names_the_scope_argument():
     with pytest.raises(zenar.InvalidFilterError, match="scope must be a JSON object"):
         c.describe(scope="A")
     db.close()
+
+
+def test_calling_without_a_path_uses_a_default_folder_in_the_current_directory(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    db = zenar.VectorDB()
+    db.create_collection("docs", dimension=3).add(id=1, vector=[1.0, 0.0, 0.0], text="a")
+    db.close()
+    assert (tmp_path / "zenar" / "catalog.json").is_file()
+    reopened = zenar.VectorDB()
+    assert reopened.get_collection("docs").count() == 1
+    reopened.close()
+
+
+def test_a_document_may_have_more_fields_than_a_16_bit_count_holds():
+    db = zenar.VectorDB(tempfile.mkdtemp())
+    c = db.create_collection("wide", dimension=3)
+    fields = {f"f{i}": i for i in range(70_000)}
+    c.add(id=1, vector=[1.0, 0.0, 0.0], text="wide", metadata=fields)
+    assert c.get(1)["metadata"]["f69999"] == 69_999
+    hits = c.search([1.0, 0.0, 0.0], top_k=1, filter=zenar.field.f69999 == 69_999)
+    assert [h["id"] for h in hits] == [1]
+    db.close()
+
+
+def test_a_new_metadata_field_extends_the_schema_and_keeps_its_type():
+    root = tempfile.mkdtemp()
+    db = zenar.VectorDB(root)
+    c = db.create_collection("docs", dimension=3)
+    c.add(id=1, vector=[1.0, 0.0, 0.0], text="a", metadata={"tenant": "A"})
+    c.add(id=2, vector=[1.0, 0.0, 0.0], text="b", metadata={"tenant": "A", "price": 9.5})
+    with pytest.raises(zenar.InvalidMetadataError):
+        c.add(id=3, vector=[1.0, 0.0, 0.0], text="c", metadata={"price": "cheap"})
+    db.close()
+    reopened = zenar.VectorDB(root)
+    c = reopened.get_collection("docs")
+    assert [h["id"] for h in c.search([1.0, 0.0, 0.0], top_k=5, filter=zenar.field.price >= 9)] == [2]
+    assert c.count() == 2
+    reopened.close()
+
+
+def test_numpy_scalars_and_none_are_metadata_values():
+    np = pytest.importorskip("numpy")
+    db = zenar.VectorDB(tempfile.mkdtemp())
+    c = db.create_collection("docs", dimension=3)
+    c.add(id=1, vector=[1.0, 0.0, 0.0], text="a",
+          metadata={"n": np.int64(7), "flag": np.bool_(True), "ratio": np.float64(0.5), "gone": None})
+    assert c.get(1)["metadata"] == {"n": 7, "flag": True, "ratio": 0.5}
+    hits = c.search([1.0, 0.0, 0.0], top_k=5, filter=zenar.field.n == np.int64(7))
+    assert [h["id"] for h in hits] == [1]
+    db.close()
+
+
+def test_a_database_with_an_older_catalog_version_is_refused_with_a_clear_message():
+    root = tempfile.mkdtemp()
+    db = zenar.VectorDB(root)
+    db.create_collection("docs", dimension=3)
+    db.close()
+    catalog = pathlib.Path(root, "catalog.json")
+    data = json.loads(catalog.read_text())
+    data["version"] = 1
+    catalog.write_text(json.dumps(data))
+    with pytest.raises(zenar.RecoveryError, match="Databases written by earlier releases cannot be read"):
+        zenar.VectorDB(root)

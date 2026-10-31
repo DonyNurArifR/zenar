@@ -351,7 +351,7 @@ mod tests {
     fn sync_and_load_roundtrip_keeps_logical_dimension() {
         let dir = std::env::temp_dir().join(format!("zenar-storage-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("idx.tvim");
+        let path = dir.join("idx.zvec");
         let mut store = VectorStore::new(3, 4).unwrap();
         store.add(&[1.0, 2.0, 3.0], 9).unwrap();
         store.sync(&path).unwrap();

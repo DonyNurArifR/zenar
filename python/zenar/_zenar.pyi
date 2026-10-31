@@ -123,7 +123,7 @@ class Collection:
 
 @final
 class VectorDB:
-    def __new__(cls, path: str, durable: bool = False) -> "VectorDB": ...
+    def __new__(cls, path: str | None = None, durable: bool = False) -> "VectorDB": ...
     def create_collection(
         self,
         name: str,

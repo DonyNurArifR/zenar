@@ -1,5 +1,5 @@
 {
-  "version": 1,
+  "version": 3,
   "collections": [
     {
       "name": "docs",
@@ -15,7 +15,7 @@
           "float"
         ]
       ],
-      "durable_log_len": 18021,
+      "durable_log_len": 18621,
       "durable_vectors": 257
     }
   ]

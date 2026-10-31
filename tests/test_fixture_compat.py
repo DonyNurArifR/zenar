@@ -1,7 +1,8 @@
 """A database written by an earlier build must open and give the same answers.
 
-The fixture in tests/fixtures/db_turbovec_1_0_0 was written by Zenar 0.1.2 (TurboVec 1.0.0). If a change
-to the index or its file format breaks this test, the change must say so and bump the fixture on purpose.
+The fixture in tests/fixtures/db_fixture was written by a build with TurboVec 1.0.0 and the record format
+version that stores a 32-bit field count. Changing the index or the on-disk format must keep this test passing, or
+the change must regenerate the fixture on purpose and say so in the changelog.
 """
 
 import json
@@ -11,7 +12,7 @@ import tempfile
 
 import zenar
 
-FIXTURE = pathlib.Path(__file__).parent / "fixtures" / "db_turbovec_1_0_0"
+FIXTURE = pathlib.Path(__file__).parent / "fixtures" / "db_fixture"
 
 
 def _copy_fixture():

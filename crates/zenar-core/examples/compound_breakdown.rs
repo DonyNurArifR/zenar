@@ -50,7 +50,7 @@ fn main() {
         ("price".to_string(), FieldKind::Float),
     ];
     let categories = ["faq", "product", "tools", "electronics", "appliances"];
-    let mut docs = DocStore::create(&dir.join("docs.log"), schema).unwrap();
+    let mut docs = DocStore::create(&dir.join("docs.zdocs"), schema).unwrap();
     let mut vectors = VectorStore::new(dim, 4).unwrap();
 
     let ids: Vec<u64> = (0..rows).collect();
@@ -86,11 +86,11 @@ fn main() {
             vectors.add(&vector(i, dim), i).unwrap();
         }
     }
-    vectors.sync(dir.join("vectors.tvim")).unwrap();
+    vectors.sync(dir.join("vectors.zvec")).unwrap();
     drop(docs);
     let t = Instant::now();
     let docs = DocStore::open(
-        &dir.join("docs.log"),
+        &dir.join("docs.zdocs"),
         vec![
             ("tenant".to_string(), FieldKind::Text),
             ("category".to_string(), FieldKind::Text),

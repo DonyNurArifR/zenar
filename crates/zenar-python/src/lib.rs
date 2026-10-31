@@ -87,6 +87,12 @@ fn panic_message(payload: &Box<dyn std::any::Any + Send>) -> String {
 // ----- Python <-> core value conversion --------------------------------------
 
 fn py_to_meta(value: &Bound<'_, PyAny>) -> PyResult<MetaValue> {
+    // numpy scalars (int64, bool_, ...) are not Python ints or bools. Their `item()` is the
+    // plain Python value, which is then checked like any other.
+    if value.get_type().module()?.to_str()? == "numpy" && value.hasattr("item")? {
+        let plain = value.call_method0("item")?;
+        return py_to_meta(&plain);
+    }
     if value.is_instance_of::<PyBool>() {
         return Ok(MetaValue::Boolean(value.extract()?));
     }
@@ -203,7 +209,9 @@ fn metadata_from_py(metadata: Option<&Bound<'_, PyDict>>) -> PyResult<Vec<(Strin
     let Some(dict) = metadata else {
         return Ok(Vec::new());
     };
+    // A None value means the field is absent, which is how NULL is stored.
     dict.iter()
+        .filter(|(_, v)| !v.is_none())
         .map(|(k, v)| {
             let key: String = k.extract().map_err(|_| {
                 to_py_err(CoreError::InvalidMetadata(
@@ -709,6 +717,9 @@ fn build_filter(
     }
 }
 
+/// Default database folder when `VectorDB` is called without a path.
+const DEFAULT_PATH: &str = "./zenar";
+
 #[pyclass(name = "VectorDB", module = "zenar._zenar")]
 pub struct PyVectorDB {
     inner: Option<Arc<core::VectorDB>>,
@@ -727,9 +738,11 @@ impl PyVectorDB {
     /// `durable=True` syncs the index and the document log on every add: power-safe per add, at a
     /// much lower ingest rate. The default syncs at sync boundaries. `flush()` makes everything before it durable.
     #[new]
-    #[pyo3(signature = (path, durable=false))]
-    fn new(py: Python<'_>, path: &str, durable: bool) -> PyResult<Self> {
-        let path = path.to_string();
+    /// `path` is the database folder. When it is omitted, the default is `./zenar` in the current
+    /// directory, as Chroma's default is `./chroma`. The folder is created if it does not exist.
+    #[pyo3(signature = (path=None, durable=false))]
+    fn new(py: Python<'_>, path: Option<&str>, durable: bool) -> PyResult<Self> {
+        let path = path.unwrap_or(DEFAULT_PATH).to_string();
         let sync = if durable {
             core::MetadataSync::Full
         } else {

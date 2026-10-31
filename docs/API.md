@@ -14,7 +14,7 @@ with VectorDB("./data") as db:                       # flushes and releases the 
 
 | Method | Notes |
 |---|---|
-| `VectorDB(path, durable=False)` | Opens or creates a database directory. Raises `DatabaseLockedError` if already open. `durable=True` syncs the index and the document log on every add. Power-safe per add, at about 7 ms per row. Use `add_many` batches instead when you can. |
+| `VectorDB(path=None, durable=False)` | Opens or creates a database directory. With no `path`, the database lives in `./zenar` in the current directory, created if missing. An explicit `path` is used exactly as given, and created if missing. Raises `DatabaseLockedError` if already open. `durable=True` syncs the index and the document log on every add. Power-safe per add, at about 7 ms per row. Use `add_many` batches instead when you can. |
 | `create_collection(name, dimension=None, bit_width=4)` | `dimension=None` is inferred from the first `add`. `bit_width` is 2, 3 or 4. |
 | `get_collection(name)` / `list_collections()` | |
 | `drop_collection(name)` | Deletes documents and the vector file. |
@@ -161,7 +161,22 @@ case-sensitive. An empty object matches everything. `and`, `or` and `not` cannot
 field with many values. The `where` schema uses `enum` for short value lists, so the model is steered to values that
 exist. Range bounds (`gt`, `gte`, `lt`, `lte`) are not restricted to existing values.
 
+The schema is the same one the parser checks, at every level of `and`, `or` and `not`. Every `where` the schema accepts,
+the parser accepts. The reverse is not true: a value outside the `enum` is accepted by the parser, with a warning, so
+a call that matches nothing still returns zero hits, not an error.
+
+The tool's `parameters` carry the shared `where` definition under `$defs`, and nested filters refer to it with `$ref`.
+Some function-calling APIs do not support `$ref`. Check this with the provider you use before relying on nested filters.
+
+The tool name must be 1 to 64 letters, digits, `_` or `-`. Any other name is refused by `tool_spec`.
+
 ### Limits and things your application must do
+
+- Metadata values: `str`, `int` (64-bit), `float` (finite), `bool`, timezone-aware `datetime`, and numpy scalars (converted
+  to their Python value). A `None` value means the field is absent. Other types are rejected.
+- Metadata: a field name is added to the schema the first time a record uses it, with the type of that first value.
+  A field keeps its type: a later value of another type is rejected. The number of fields is not limited. A document's
+  field count is stored as 32 bits. Each field costs memory only for the documents that have it.
 
 - Document text is data. If it can contain instructions written by someone else, do not present it to the model as
   instructions. Keep it inside a clearly marked data section.

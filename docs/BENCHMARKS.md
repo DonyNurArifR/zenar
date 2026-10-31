@@ -44,10 +44,13 @@ collection size. `delete_many` pays them once per batch. Use it for bulk removal
 
 | Case | p50 | p95 | p99 |
 |---|---|---|---|
-| No filter | 0.38 ms | 0.49 ms | 0.93 ms |
-| `tenant = A` (10%) | 2.90 ms | 3.34 ms | 3.50 ms |
-| Compound: `tenant = A AND category IN (faq, product) AND price >= 100` (~4%) | 2.96 ms | 3.41 ms | 3.67 ms |
-| `price = 5` (0.1%) | 0.30 ms | 0.32 ms | 0.34 ms |
+| No filter | 0.38 ms | 0.53 ms | 1.02 ms |
+| `tenant = A` (10%) | 2.87 ms | 3.34 ms | 3.56 ms |
+| Compound: `tenant = A AND category IN (faq, product) AND price >= 100` (~4%) | 3.84 ms | 4.20 ms | 4.50 ms |
+| `price = 5` (0.1%) | 0.29 ms | 0.31 ms | 0.33 ms |
+
+Measured on the sparse-code build (fields store codes only for rows that have them). The compound row was 2.96 ms
+before that change, see the note on compound filters below.
 
 Measured with TurboVec 1.1.2. The 1.0.0 numbers, from the same day, are in the comparison below.
 
@@ -63,8 +66,8 @@ Measured with TurboVec 1.1.2. The 1.0.0 numbers, from the same day, are in the c
 | Case | p50 | p95 | p99 |
 |---|---|---|---|
 | Open with reconciliation | 0.44 s | | |
-| No filter | 0.36 ms | 0.40 ms | 0.44 ms |
-| `tenant = A` (10%) | 2.89 ms | 3.40 ms | 3.62 ms |
+| No filter | 0.36 ms | 0.41 ms | 0.44 ms |
+| `tenant = A` (10%) | 2.86 ms | 3.41 ms | 3.54 ms |
 
 Open time is the replay of the log into the in-memory indexes, plus loading the vector index. Replay is about 0.3 s of
 the 0.45 s at 1M rows. It grows linearly with the log.
@@ -81,15 +84,21 @@ was slower than on the earlier days, which is why ingest differs from the 0.011 
 | Compound, p50 | 3.51 ms | 2.96 ms |
 | `price = 5` (0.1%), p50 | 0.31 ms | 0.30 ms |
 | Peak RSS, 100K rows | 52.6 MB | 61.8 MB |
-| Peak RSS, 1M rows | 410 MB | 418 MB |
+| Peak RSS, 1M rows | 410 MB | 415 MB |
 
 The on-disk format is unchanged for this fixture: a database written by 1.0.0 opens under 1.1.2 and returns the same
 top results (`tests/test_fixture_compat.py`). The memory rise is largest at small sizes and about 2% at 1M rows.
 
+### Metadata memory after open (1M documents, 3 fields, tiny vectors)
+
+Current resident memory in a fresh process: 225 MB before the presence list was removed, 206 MB after. The on-disk log
+was 257 MB, about 270 bytes per document. The largest remaining in-memory item is a second id map: Zenar keeps one from
+id to row, and TurboVec keeps its own. Removing either needs a change to the library or the layout.
+
 ### Memory, 1M rows, dim 384
 
 Measured with `/usr/bin/time -l` around the `bench` example (ingest, then all searches, same process). Peak resident
-set size was 418 MB with TurboVec 1.1.2 (410 MB with 1.0.0). The vectors are 4-bit TurboVec codes, about 192 MB at this size (1M × 384 × 4 bits). Each indexed
+set size was 415 MB with TurboVec 1.1.2 (410 MB with 1.0.0). The vectors are 4-bit TurboVec codes, about 192 MB at this size (1M × 384 × 4 bits). Each indexed
 field also keeps a 4-byte code per row, about 4 MB per field at 1M rows. The rest is the document log index, the
 in-memory field indexes and the per-row bookkeeping. Raw float32 vectors would need about 1.5 GB for the same rows.
 The breakdown of the remainder has not been measured by component.
@@ -120,6 +129,10 @@ row through their value codes. The standalone leaves still materialize their ful
 was 3.6 ms.
 
 ### What the numbers say
+
+- Field codes are stored only for rows that have the field. A collection with thousands of fields no longer costs
+  fields times documents: 877 MB became 54 MB for 5,000 fields and 20,000 documents. The price is about 0.9 ms on the
+  compound filter at 1M rows, from 2.96 ms to 3.84 ms.
 
 - Unfiltered and selective (0.1%) search are close to pure TurboVec cost. The 0.1% filter is faster than the unfiltered
   search at 10K rows, because it returns few candidates.

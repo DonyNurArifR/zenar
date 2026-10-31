@@ -4,9 +4,9 @@
 
 ```text
 <root>/LOCK                  advisory lock, held while the database is open
-<root>/catalog.json          collections: dimension, bit width, metadata schema
-<root>/docs/<name>.log       document log: text and metadata, append-only
-<root>/vectors/<name>.tvim   TurboVec index for each collection
+<root>/catalog.json          format version, collections: dimension, bit width, metadata schema
+<root>/docs/<name>.zdocs     document store: text and metadata, append-only
+<root>/vectors/<name>.zvec   vector index (TurboVec) for each collection
 ```
 
 The document log is the source of truth for documents. TurboVec holds the vectors. The log holds no vectors, so
@@ -48,8 +48,8 @@ open. Drop the handle first, then drop the collection.
 
 ### `add`
 
-1. Validate the record. Extend the schema in the catalog if the record introduces fields. The catalog is written first,
-   so a record that uses a new field never reaches the log before the catalog knows the field.
+1. Validate the record. A field name the schema lacks extends the schema, with the type of its first value. The catalog
+   is written first, so a record that uses a new field never reaches the log before the catalog knows the field.
 2. Write the PUT frame to the log (not yet visible to readers).
 3. Add the vector to the in-memory index.
 4. At a sync boundary (every 1000 adds, or every add with `durable=True`), sync the index file and the log. If that
@@ -61,7 +61,7 @@ open. Drop the handle first, then drop the collection.
 A batch is all-or-nothing:
 
 1. Validate every record: ids, vectors, metadata, duplicates within the batch and against stored documents.
-   If the batch introduces metadata fields, the new schema is written to the catalog. No document is written yet.
+   If the batch introduces fields, the new schema is written to the catalog. No document is written yet.
 2. Write every PUT frame to the log, in one write.
 3. Add every vector to the index.
 4. Sync the index file, then the log.
@@ -99,7 +99,7 @@ The index file and the log can disagree after a crash. On open, each collection 
 Both kinds of repair are durable after reconciliation. `db.recovery_report()` returns the counts. A non-zero count after a
 crash is expected when adds were not flushed. It means the unsynced window was discarded, not that data was corrupted.
 
-Reconciliation only repairs the unsynced tail. The catalog also records the log length and the vector count at each sync.
+Reconciliation only repairs the unsynced tail. The catalog also records the log length and the vector count at each flush and close, and at each delete.
 If the log or the index is found shorter than that, something outside Zenar truncated or removed it. Opening then fails
 with `RecoveryError` and changes nothing, instead of dropping the documents that were already synced. A file that is
 damaged in its middle fails the same way, with its own named error. Databases created before this rule have no recorded

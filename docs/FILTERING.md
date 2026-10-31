@@ -36,6 +36,11 @@ and they are fixed so that filters never match rows they should exclude:
 
 A NULL row is never "not equal to v". If you need that behavior, store an explicit default value instead of relying on a missing field.
 
+A metadata value of `None` stores no value for that field, so the document is NULL for it.
+
+A filter value of NaN is refused with `InvalidFilterError`, for `==`, `!=`, ordering and `isin`. NaN has no order, so
+`field < NaN` would otherwise match every document. Metadata cannot hold NaN or infinity either.
+
 ## Tenant isolation
 
 Filtering happens before vector search. The candidate ids come from the document store's indexes, and TurboVec searches only those.

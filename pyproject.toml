@@ -4,7 +4,7 @@ build-backend = "maturin"
 
 [project]
 name = "zenar"
-version = "0.1.2"
+version = "0.2.0"
 description = "Embedded vector database with typed metadata filtering (TurboVec + document log)"
 readme = "README.md"
 license = { text = "MIT OR Apache-2.0" }

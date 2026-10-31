@@ -51,7 +51,7 @@ jobs:
         run: |
           python -m venv .venv-test
           if [ -d .venv-test/Scripts ]; then PY=.venv-test/Scripts/python; else PY=.venv-test/bin/python; fi
-          "$PY" -m pip install --quiet dist/*.whl pytest numpy
+          "$PY" -m pip install --quiet dist/*.whl pytest numpy jsonschema
           "$PY" -m pytest -q
       # The type stubs must match the compiled module.
       - name: Type stubs match the module
