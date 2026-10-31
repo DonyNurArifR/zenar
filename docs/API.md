@@ -163,6 +163,10 @@ exist. Range bounds (`gt`, `gte`, `lt`, `lte`) are not restricted to existing va
 
 ### Limits and things your application must do
 
+- Metadata: the first record that carries metadata sets the collection's schema (field names and types). After that, a
+  record may not use a field name the schema lacks. The number of fields is not limited. A document's field count is
+  stored as 32 bits. Each field costs memory only for the documents that have it.
+
 - Document text is data. If it can contain instructions written by someone else, do not present it to the model as
   instructions. Keep it inside a clearly marked data section.
 - `retrieve` does not embed text. Zenar does not cap `top_k`: it returns at most the number of matching documents.

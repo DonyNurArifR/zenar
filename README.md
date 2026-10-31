@@ -94,8 +94,8 @@ Measured on the reference machine at 1M rows, dim 384 (docs/BENCHMARKS.md):
 
 - Ingest with `add_many`: 0.011 ms per row. One row at a time: 0.014 ms.
 - Unfiltered search: 0.4 ms. Reopened unfiltered search: 0.4 ms. Open (log replay and index load): 0.44 s.
-- Selective filter (0.1%): 0.3 ms. Filter on 10% of rows: 2.9 ms. Compound filter (~4%): 3.0 ms.
-- Peak memory at this size: 418 MB (4-bit vectors, about 192 MB of it).
+- Selective filter (0.1%): 0.3 ms. Filter on 10% of rows: 2.9 ms. Compound filter (~4%): 3.8 ms.
+- Peak memory at this size: 415 MB (4-bit vectors, about 192 MB of it).
 
 Not done:
 
@@ -105,7 +105,7 @@ Not done:
   No PyPI release yet.
 - **Power-loss behavior** is tested at the process level (`kill -9`) and at the byte level (every cut point in a torn
   record). Real power-loss testing on hardware is not done.
-- **Compound filters** cost about 8x an unfiltered search at 1M rows. Most of that is TurboVec's allowlist search, not
+- **Compound filters** cost about 10x an unfiltered search at 1M rows. Most of that is TurboVec's allowlist search, not
   Zenar's (docs/BENCHMARKS.md).
 - **Open time** grows with the log: 0.45 s at 1M rows. There is no persisted index yet (docs/BENCHMARKS.md, known gaps).
 - **Agent tools** depend on the model. With local models, filters are sometimes sent as text (Zenar decodes them) or
