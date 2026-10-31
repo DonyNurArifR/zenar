@@ -3,7 +3,7 @@
 ## Setup
 
 ```sh
-rustup toolchain install stable     # MSRV is 1.90
+rustup toolchain install stable     # MSRV is 1.89
 python3 -m venv .venv && . .venv/bin/activate
 pip install maturin pytest numpy
 maturin develop --release           # builds the extension into .venv

@@ -1,8 +1,8 @@
 # Filtering
 
 A filter is compiled to a typed AST, validated against the collection's metadata schema, and
-translated to parameterized SQL. Values are always bound as parameters, never interpolated.
-Field names are checked against the schema before they appear in SQL.
+evaluated by the document store against its in-memory field indexes. No SQL is built, so filter values
+and field names cannot inject anything. Field names are checked against the schema before evaluation.
 
 ## Operators
 
@@ -26,7 +26,7 @@ Nesting depth is capped at 16. Deeper filters raise `InvalidFilterError`.
 
 ## NULL semantics
 
-A document with no value for a field has SQL NULL in that column. The rules are the SQL-standard ones,
+A document with no value for a field is NULL for that field. The rules follow SQL's three-valued logic,
 and they are fixed so that filters never match rows they should exclude:
 
 - `f.x == v`, `f.x != v`, `f.x > v`, ... never match a NULL row. This includes `!=`.
@@ -38,7 +38,7 @@ A NULL row is never "not equal to v". If you need that behavior, store an explic
 
 ## Tenant isolation
 
-Filtering happens before vector search. The candidate ids come from SQL, and TurboVec searches only those.
+Filtering happens before vector search. The candidate ids come from the document store's indexes, and TurboVec searches only those.
 A result from another tenant cannot appear in a filtered search. The test
 `tenant_isolation_never_leaks` (Rust) and `test_tenant_isolation_from_python` (Python) check this on
 100 documents split across two tenants.
