@@ -348,6 +348,7 @@ impl DocStore {
     /// Encodes and writes documents to the end of the log, without making them visible.
     /// On failure the file is truncated back to its previous length.
     pub fn stage_puts(&mut self, docs: &[DocRef<'_>]) -> Result<Staged, ZenarError> {
+        check_row_capacity(self.rows.len(), docs.len())?;
         let old_len = self.len;
         let mut buf = Vec::new();
         let mut puts = Vec::with_capacity(docs.len());
@@ -1070,6 +1071,17 @@ enum Cmp {
 
 /// Index key for a value of a field with this kind. Integers are widened for float fields.
 /// Other mismatches return an error, and the caller uses a scan for mixed numeric comparisons.
+/// Refuses a write that would take the row count past `MAX_ROWS`. Row numbers are stored as `u32`,
+/// and a wrapped row number would point at the wrong document. Dead rows count, until compaction.
+fn check_row_capacity(rows: usize, incoming: usize) -> Result<(), ZenarError> {
+    match rows.checked_add(incoming) {
+        Some(total) if total <= MAX_ROWS => Ok(()),
+        _ => Err(ZenarError::InvalidArgument(format!(
+            "the collection would exceed {MAX_ROWS} rows; delete documents to make room, or use a new collection"
+        ))),
+    }
+}
+
 fn key_for(kind: FieldKind, value: &MetaValue) -> Result<Key, ZenarError> {
     match (kind, value) {
         (FieldKind::Text, MetaValue::Text(s)) => Ok(Key::Text(s.clone())),
@@ -1474,6 +1486,16 @@ mod tests {
         // The standard check value for CRC-32/IEEE is 0xCBF43926 for "123456789".
         assert_eq!(crc32(b"123456789"), 0xCBF4_3926);
         assert_eq!(crc32(b""), 0);
+    }
+
+    #[test]
+    fn row_capacity_is_checked_at_the_edges() {
+        assert!(check_row_capacity(0, 1).is_ok());
+        assert!(check_row_capacity(MAX_ROWS - 1, 1).is_ok());
+        assert!(check_row_capacity(MAX_ROWS - 1, 2).is_err());
+        assert!(check_row_capacity(MAX_ROWS, 1).is_err());
+        assert!(check_row_capacity(0, MAX_ROWS + 1).is_err());
+        assert!(check_row_capacity(usize::MAX, 1).is_err());
     }
 
     #[test]
