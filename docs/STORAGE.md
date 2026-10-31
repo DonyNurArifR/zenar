@@ -99,6 +99,13 @@ The index file and the log can disagree after a crash. On open, each collection 
 Both kinds of repair are durable after reconciliation. `db.recovery_report()` returns the counts. A non-zero count after a
 crash is expected when adds were not flushed. It means the unsynced window was discarded, not that data was corrupted.
 
+Reconciliation only repairs the unsynced tail. The catalog also records the log length and the vector count at each sync.
+If the log or the index is found shorter than that, something outside Zenar truncated or removed it. Opening then fails
+with `RecoveryError` and changes nothing, instead of dropping the documents that were already synced. A file that is
+damaged in its middle fails the same way, with its own named error. Databases created before this rule have no recorded
+lengths, so the check does not apply to them. A delete clears the recorded lengths before it changes anything on disk, and records them again once it is
+synced, so a crash in the middle of a delete cannot leave a recorded length larger than the file.
+
 ## Durability policy
 
 | Operation | Durability |

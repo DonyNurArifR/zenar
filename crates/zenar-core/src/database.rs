@@ -77,6 +77,17 @@ impl VectorDB {
                     None => VectorStore::new_lazy(entry.bit_width)?,
                 }
             };
+            if docs.log_len() < entry.durable_log_len || store.len() < entry.durable_vectors {
+                return Err(ZenarError::RecoveryError(format!(
+                    "collection {name:?}: the document log or the vector index is shorter than at its \
+                     last sync (log {} of {} bytes, vectors {} of {}); a file was truncated or removed \
+                     outside Zenar",
+                    docs.log_len(),
+                    entry.durable_log_len,
+                    store.len(),
+                    entry.durable_vectors,
+                )));
+            }
             let collection = Collection::new(
                 &name,
                 index_path,
@@ -137,6 +148,8 @@ impl VectorDB {
             None => VectorStore::new_lazy(bit_width)?,
         };
         self.catalog.insert(Entry {
+            durable_log_len: 0,
+            durable_vectors: 0,
             name: name.to_string(),
             dimension,
             bit_width,

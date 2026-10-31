@@ -1,6 +1,7 @@
 """Bad inputs get a named error, and concurrent use keeps the collection consistent."""
 
 import math
+import pathlib
 import random
 import tempfile
 import threading
@@ -110,3 +111,40 @@ def test_concurrent_writers_and_readers_keep_the_collection_consistent():
     reopened = zenar.VectorDB(root)
     assert reopened.get_collection("docs").count() == len(live)
     reopened.close()
+
+
+def _saved_collection(root):
+    db = zenar.VectorDB(root)
+    c = db.create_collection("docs", dimension=8)
+    c.add_many([
+        {"id": i, "vector": [float(i % 7 + 1)] * 8, "text": f"t{i}", "metadata": {"tenant": "A"}}
+        for i in range(200)
+    ])
+    db.close()
+
+
+@pytest.mark.parametrize("damage", ["log_deleted", "log_emptied", "log_cut_in_half", "vectors_deleted"])
+def test_a_file_shortened_outside_zenar_is_refused_not_silently_dropped(damage):
+    root = tempfile.mkdtemp()
+    _saved_collection(root)
+    log = pathlib.Path(root, "docs", "docs.log")
+    vectors = pathlib.Path(root, "vectors", "docs.tvim")
+    if damage == "log_deleted":
+        log.unlink()
+    elif damage == "log_emptied":
+        log.write_bytes(b"")
+    elif damage == "log_cut_in_half":
+        data = log.read_bytes()
+        log.write_bytes(data[: len(data) // 2])
+    else:
+        vectors.unlink()
+    with pytest.raises(zenar.ZenarError):
+        zenar.VectorDB(root)
+
+
+def test_a_clean_reopen_still_keeps_every_document():
+    root = tempfile.mkdtemp()
+    _saved_collection(root)
+    db = zenar.VectorDB(root)
+    assert db.get_collection("docs").count() == 200
+    db.close()

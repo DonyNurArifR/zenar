@@ -22,6 +22,13 @@ pub struct Entry {
     pub bit_width: usize,
     /// (field name, kind name), in schema order.
     pub fields: Vec<(String, String)>,
+    /// Log length in bytes, and vector count, at the last sync. A file found shorter than these
+    /// was truncated or removed outside Zenar, so opening refuses to continue. Entries written
+    /// before this field existed read as 0, which disables the check for them.
+    #[serde(default)]
+    pub durable_log_len: u64,
+    #[serde(default)]
+    pub durable_vectors: usize,
 }
 
 impl Entry {
