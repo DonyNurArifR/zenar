@@ -268,3 +268,15 @@ def test_a_new_metadata_field_extends_the_schema_and_keeps_its_type():
     assert [h["id"] for h in c.search([1.0, 0.0, 0.0], top_k=5, filter=zenar.field.price >= 9)] == [2]
     assert c.count() == 2
     reopened.close()
+
+
+def test_numpy_scalars_and_none_are_metadata_values():
+    np = pytest.importorskip("numpy")
+    db = zenar.VectorDB(tempfile.mkdtemp())
+    c = db.create_collection("docs", dimension=3)
+    c.add(id=1, vector=[1.0, 0.0, 0.0], text="a",
+          metadata={"n": np.int64(7), "flag": np.bool_(True), "ratio": np.float64(0.5), "gone": None})
+    assert c.get(1)["metadata"] == {"n": 7, "flag": True, "ratio": 0.5}
+    hits = c.search([1.0, 0.0, 0.0], top_k=5, filter=zenar.field.n == np.int64(7))
+    assert [h["id"] for h in hits] == [1]
+    db.close()

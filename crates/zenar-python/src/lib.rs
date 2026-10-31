@@ -87,6 +87,12 @@ fn panic_message(payload: &Box<dyn std::any::Any + Send>) -> String {
 // ----- Python <-> core value conversion --------------------------------------
 
 fn py_to_meta(value: &Bound<'_, PyAny>) -> PyResult<MetaValue> {
+    // numpy scalars (int64, bool_, ...) are not Python ints or bools. Their `item()` is the
+    // plain Python value, which is then checked like any other.
+    if value.get_type().module()?.to_str()? == "numpy" && value.hasattr("item")? {
+        let plain = value.call_method0("item")?;
+        return py_to_meta(&plain);
+    }
     if value.is_instance_of::<PyBool>() {
         return Ok(MetaValue::Boolean(value.extract()?));
     }
@@ -203,7 +209,9 @@ fn metadata_from_py(metadata: Option<&Bound<'_, PyDict>>) -> PyResult<Vec<(Strin
     let Some(dict) = metadata else {
         return Ok(Vec::new());
     };
+    // A None value means the field is absent, which is how NULL is stored.
     dict.iter()
+        .filter(|(_, v)| !v.is_none())
         .map(|(k, v)| {
             let key: String = k.extract().map_err(|_| {
                 to_py_err(CoreError::InvalidMetadata(

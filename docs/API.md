@@ -163,6 +163,8 @@ exist. Range bounds (`gt`, `gte`, `lt`, `lte`) are not restricted to existing va
 
 ### Limits and things your application must do
 
+- Metadata values: `str`, `int` (64-bit), `float` (finite), `bool`, timezone-aware `datetime`, and numpy scalars (converted
+  to their Python value). A `None` value means the field is absent. Other types are rejected.
 - Metadata: a field name is added to the schema the first time a record uses it, with the type of that first value.
   A field keeps its type: a later value of another type is rejected. The number of fields is not limited. A document's
   field count is stored as 32 bits. Each field costs memory only for the documents that have it.
