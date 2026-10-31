@@ -13,6 +13,10 @@ project follows [semantic versioning](https://semver.org/) while it is pre-1.0.
 - `top_k` is no longer capped at 1000. A result is at most the number of matching documents.
 
 ### Fixed
+- The per-document field count is 32 bits (it was 16, and truncated silently above 65,535 fields).
+- Each indexed field stores a code only for the rows that have it. A collection with thousands of fields used to cost
+  fields times documents times 4 bytes: 877 MB for 5,000 fields and 20,000 documents. It is now 54 MB. A typical
+  three-field collection at 1M rows is unchanged in peak memory, and compound search there is about 0.9 ms slower.
 - A collection handle can no longer write after its database is closed or its collection is dropped. Such a write
   looked successful and was lost on reopen. It now raises `CollectionClosedError`.
 - A filter that compares with NaN is refused with `InvalidFilterError`. `field < NaN` used to match every document.
