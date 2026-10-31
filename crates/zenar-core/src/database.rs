@@ -161,6 +161,12 @@ impl VectorDB {
         if log.exists() {
             fs::remove_file(&log).map_err(io_err)?;
         }
+        // The same goes for a vector index left behind by an interrupted drop. Loading it would
+        // bring back the old collection's vectors, and reconciliation would then have to remove them.
+        let index = index_path(&self.root, name);
+        if index.exists() {
+            fs::remove_file(&index).map_err(io_err)?;
+        }
         let docs = match DocStore::create(&log, Vec::new()) {
             Ok(docs) => docs,
             Err(e) => {

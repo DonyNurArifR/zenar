@@ -148,3 +148,24 @@ def test_a_clean_reopen_still_keeps_every_document():
     db = zenar.VectorDB(root)
     assert db.get_collection("docs").count() == 200
     db.close()
+
+
+def test_a_stale_index_from_an_interrupted_drop_is_not_loaded_by_a_new_collection():
+    root = tempfile.mkdtemp()
+    db = zenar.VectorDB(root)
+    c = db.create_collection("a", dimension=8)
+    c.add_many([{"id": i, "vector": [1.0] * 8, "text": "t", "metadata": {}} for i in range(20)])
+    db.close()
+    index = pathlib.Path(root, "vectors", "a.tvim")
+    stale = index.read_bytes()
+    db = zenar.VectorDB(root)
+    db.drop_collection("a")
+    db.close()
+    index.write_bytes(stale)  # the leftover an interrupted drop could leave behind
+    db = zenar.VectorDB(root)
+    db.create_collection("a")  # no dimension: nothing is written to disk until the first add
+    db.close()
+    db = zenar.VectorDB(root)
+    assert db.get_collection("a").count() == 0
+    assert db.recovery_report()["orphaned_vectors_removed"] == 0
+    db.close()
