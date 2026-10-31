@@ -5,8 +5,10 @@ core built on [TurboVec](https://github.com/RyanCodrai/turbovec) for vector
 search and a document log with in-memory indexes for metadata filtering.
 
 **Status: 0.1.0, not yet published.** The core, Python API, persistence and
-crash recovery are implemented and tested. Filtered search at 1M rows does not
-yet meet its performance target. See [Project Status](#project-status).
+crash recovery are implemented and tested. At 1M rows, filtered search takes
+0.3 to 3.5 ms against 1.2 ms unfiltered, depending on the filter. The design
+spec makes the filter path a pass/fail gate but sets no numeric threshold, so
+this is measured, not yet judged. See [Project Status](#project-status).
 
 ## Why Zenar
 
