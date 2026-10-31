@@ -116,12 +116,61 @@ fn key_to_value(key: &Key) -> MetaValue {
 }
 
 /// Index for one metadata field.
+/// Rows that share one value of a field.
+struct Group {
+    /// Dense number for the value. It indexes the bitsets that leaf predicates build.
+    code: u32,
+    /// Rows holding this value, ascending. Dead rows are filtered out when read.
+    rows: Vec<u32>,
+}
+
+/// Code of a row that lacks the field.
+const NO_CODE: u32 = u32::MAX;
+
+/// A leaf predicate turned into the set of value codes it accepts. A row satisfies the predicate
+/// when its code for the field is in the set. A row without the field has `NO_CODE` and never does.
+struct Selector<'a> {
+    fi: usize,
+    /// Bit `c` is set when code `c` is accepted.
+    bits: Vec<u64>,
+    /// The groups behind the set. A selector that drives a search lists its rows through them.
+    groups: Vec<&'a Group>,
+    /// Postings the selector covers. An upper bound, used to choose the driver.
+    covered: usize,
+}
+
+impl Selector<'_> {
+    fn has(&self, code: u32) -> bool {
+        (self.bits[(code >> 6) as usize] >> (code & 63)) & 1 == 1
+    }
+
+    fn accepts(&self, code: u32) -> bool {
+        code != NO_CODE && self.has(code)
+    }
+}
+
 struct FieldIndex {
     kind: FieldKind,
-    /// Value to rows, ascending by row. Rows marked dead are filtered out when read.
-    values: BTreeMap<Key, Vec<u32>>,
+    /// Value to rows. Rows marked dead are filtered out when read.
+    values: BTreeMap<Key, Group>,
+    /// Each row's value code for this field, or `NO_CODE`. One entry per row, in row order.
+    codes: Vec<u32>,
+    /// Codes handed out so far. Codes are never reused, so this bounds every code.
+    code_count: u32,
     /// Rows where the field is present, ascending. Dead rows are filtered out when read.
     present: Vec<u32>,
+}
+
+impl FieldIndex {
+    fn new(kind: FieldKind, rows: usize) -> Self {
+        Self {
+            kind,
+            values: BTreeMap::new(),
+            codes: vec![NO_CODE; rows],
+            code_count: 0,
+            present: Vec::new(),
+        }
+    }
 }
 
 /// One staged write, not yet visible to readers.
@@ -189,11 +238,7 @@ impl DocStore {
     ) -> Self {
         let index = fields
             .iter()
-            .map(|(_, kind)| FieldIndex {
-                kind: *kind,
-                values: BTreeMap::new(),
-                present: Vec::new(),
-            })
+            .map(|(_, kind)| FieldIndex::new(*kind, 0))
             .collect();
         Self {
             path,
@@ -213,11 +258,7 @@ impl DocStore {
     pub fn extend_fields(&mut self, new_fields: &[(String, FieldKind)]) {
         for (name, kind) in new_fields {
             self.fields.push((name.clone(), *kind));
-            self.index.push(FieldIndex {
-                kind: *kind,
-                values: BTreeMap::new(),
-                present: Vec::new(),
-            });
+            self.index.push(FieldIndex::new(*kind, self.rows.len()));
         }
     }
 
@@ -262,8 +303,8 @@ impl DocStore {
                 let mut present = 0usize;
                 let (mut min, mut max): (Option<MetaValue>, Option<MetaValue>) = (None, None);
                 // BTreeMap order is value order, so the first and last kept keys are the range.
-                for (key, rows) in &index.values {
-                    let kept = rows.iter().filter(|&&r| keep(r)).count();
+                for (key, group) in &index.values {
+                    let kept = group.rows.iter().filter(|&&r| keep(r)).count();
                     if kept == 0 {
                         continue;
                     }
@@ -387,20 +428,7 @@ impl DocStore {
     /// Makes a staged write visible to readers. Infallible, and must run after the write is durable.
     pub fn commit(&mut self, staged: Staged) {
         for put in staged.puts {
-            let row = self.rows.len() as u32;
-            self.rows.push(Row {
-                id: put.id,
-                payload_off: put.payload_off,
-                payload_len: put.payload_len,
-                live: true,
-            });
-            self.by_id.insert(put.id, row);
-            self.live += 1;
-            for (fi, key) in put.keys {
-                let index = &mut self.index[fi];
-                index.values.entry(key).or_default().push(row);
-                index.present.push(row);
-            }
+            self.index_put(put.id, put.payload_off, put.payload_len, put.keys);
         }
         for id in staged.dels {
             if let Some(row) = self.by_id.remove(&id) {
@@ -408,6 +436,37 @@ impl DocStore {
                 self.live -= 1;
                 self.dead += 1;
             }
+        }
+    }
+
+    /// Adds one live document to the row list and to every index it has a value for.
+    fn index_put(&mut self, id: u64, payload_off: u64, payload_len: u32, keys: Vec<(usize, Key)>) {
+        let row = self.rows.len() as u32;
+        self.rows.push(Row {
+            id,
+            payload_off,
+            payload_len,
+            live: true,
+        });
+        self.by_id.insert(id, row);
+        self.live += 1;
+        for index in &mut self.index {
+            index.codes.push(NO_CODE);
+        }
+        for (fi, key) in keys {
+            let index = &mut self.index[fi];
+            let next_code = index.code_count;
+            let group = index.values.entry(key).or_insert_with(|| Group {
+                code: next_code,
+                rows: Vec::new(),
+            });
+            let code = group.code;
+            group.rows.push(row);
+            if code == next_code {
+                index.code_count += 1;
+            }
+            index.codes[row as usize] = code;
+            index.present.push(row);
         }
     }
 
@@ -526,6 +585,9 @@ impl DocStore {
             Filter::And(children) => {
                 if children.is_empty() {
                     return Ok((self.live_rows(), Vec::new()));
+                }
+                if !need_false {
+                    return Ok((self.and_true_rows(children)?, Vec::new()));
                 }
                 let mut trues: Vec<Vec<u32>> = Vec::with_capacity(children.len());
                 let mut f: Vec<u32> = Vec::new();
@@ -661,11 +723,15 @@ impl DocStore {
             .collect()
     }
 
-    /// Live rows whose value of field `fi` matches `cmp value`.
-    fn matching(&self, fi: usize, cmp: &Cmp, value: &MetaValue) -> Result<Vec<u32>, ZenarError> {
+    /// The groups whose value satisfies `cmp value`. Dead rows are not filtered here.
+    fn groups_matching(
+        &self,
+        fi: usize,
+        cmp: &Cmp,
+        value: &MetaValue,
+    ) -> Result<Vec<&Group>, ZenarError> {
         let index = &self.index[fi];
-        let kind = index.kind;
-        let mut out: Vec<u32> = match key_for(kind, value) {
+        match key_for(index.kind, value) {
             Ok(key) => {
                 let range: (Bound<&Key>, Bound<&Key>) = match cmp {
                     Cmp::Eq => (Bound::Included(&key), Bound::Included(&key)),
@@ -674,37 +740,11 @@ impl DocStore {
                     Cmp::Lt => (Bound::Unbounded, Bound::Excluded(&key)),
                     Cmp::Lte => (Bound::Unbounded, Bound::Included(&key)),
                 };
-                let groups: Vec<&Vec<u32>> = index
+                Ok(index
                     .values
                     .range::<Key, _>(range)
-                    .map(|(_, rows)| rows)
-                    .collect();
-                match groups.as_slice() {
-                    [] => Vec::new(),
-                    // One value: its postings are already in row order.
-                    [only] => only.iter().copied().filter(|&r| self.is_live(r)).collect(),
-                    // Several values: set bits in a bitmap over the rows, then read them back in order.
-                    // That is linear in the matches, where sorting them is not.
-                    _ => {
-                        let mut bits = vec![0u64; self.rows.len() / 64 + 1];
-                        for rows in groups {
-                            for &r in rows {
-                                if self.is_live(r) {
-                                    bits[(r >> 6) as usize] |= 1u64 << (r & 63);
-                                }
-                            }
-                        }
-                        let mut out = Vec::new();
-                        for (word_index, &word) in bits.iter().enumerate() {
-                            let mut w = word;
-                            while w != 0 {
-                                out.push((word_index as u32) * 64 + w.trailing_zeros());
-                                w &= w - 1;
-                            }
-                        }
-                        out
-                    }
-                }
+                    .map(|(_, g)| g)
+                    .collect())
             }
             // Mixed integer and float comparisons: scan the distinct values of this field.
             Err(_) => {
@@ -714,34 +754,200 @@ impl DocStore {
                     _ => {
                         return Err(ZenarError::InvalidFilter(format!(
                             "value {value:?} cannot be compared with a {} field",
-                            kind.as_str()
+                            index.kind.as_str()
                         )));
                     }
                 };
-                let mut rows = Vec::new();
-                for (k, rs) in &index.values {
-                    let x = match k {
-                        Key::Int(i) => *i as f64,
-                        Key::Float(f) => *f,
-                        _ => continue,
-                    };
-                    let ok = match cmp {
-                        Cmp::Eq => x == as_f64,
-                        Cmp::Gt => x > as_f64,
-                        Cmp::Gte => x >= as_f64,
-                        Cmp::Lt => x < as_f64,
-                        Cmp::Lte => x <= as_f64,
-                    };
-                    if ok {
-                        rows.extend(rs.iter().copied().filter(|&r| self.is_live(r)));
-                    }
-                }
-                rows.sort_unstable();
-                rows
+                let holds = |x: f64| match cmp {
+                    Cmp::Eq => x == as_f64,
+                    Cmp::Gt => x > as_f64,
+                    Cmp::Gte => x >= as_f64,
+                    Cmp::Lt => x < as_f64,
+                    Cmp::Lte => x <= as_f64,
+                };
+                Ok(index
+                    .values
+                    .iter()
+                    .filter(|(k, _)| match k {
+                        Key::Int(i) => holds(*i as f64),
+                        Key::Float(f) => holds(*f),
+                        _ => false,
+                    })
+                    .map(|(_, g)| g)
+                    .collect())
             }
+        }
+    }
+
+    /// Live rows of the given groups, ascending. Several groups are merged through a bitmap over
+    /// the rows, which is linear in the matches where sorting them is not.
+    fn live_rows_of(&self, groups: &[&Group]) -> Vec<u32> {
+        let postings: usize = groups.iter().map(|g| g.rows.len()).sum();
+        let mut bits = vec![0u64; self.rows.len() / 64 + 1];
+        for group in groups {
+            for &r in &group.rows {
+                if self.is_live(r) {
+                    bits[(r >> 6) as usize] |= 1u64 << (r & 63);
+                }
+            }
+        }
+        let mut out = Vec::with_capacity(postings);
+        for (word_index, &word) in bits.iter().enumerate() {
+            let mut w = word;
+            while w != 0 {
+                out.push((word_index as u32) * 64 + w.trailing_zeros());
+                w &= w - 1;
+            }
+        }
+        out
+    }
+
+    /// Live rows whose value of field `fi` matches `cmp value`, ascending.
+    fn matching(&self, fi: usize, cmp: &Cmp, value: &MetaValue) -> Result<Vec<u32>, ZenarError> {
+        let groups = self.groups_matching(fi, cmp, value)?;
+        Ok(match groups.as_slice() {
+            [] => Vec::new(),
+            // One value: its postings are already in row order.
+            [only] => only
+                .rows
+                .iter()
+                .copied()
+                .filter(|&r| self.is_live(r))
+                .collect(),
+            _ => self.live_rows_of(&groups),
+        })
+    }
+
+    /// Builds a selector from groups. The groups are deduplicated, so a value named twice counts once.
+    fn make_selector<'a>(&self, fi: usize, mut groups: Vec<&'a Group>) -> Selector<'a> {
+        groups.sort_by_key(|g| g.code);
+        groups.dedup_by_key(|g| g.code);
+        let mut bits = vec![0u64; self.index[fi].code_count as usize / 64 + 1];
+        let mut covered = 0;
+        for group in &groups {
+            bits[(group.code >> 6) as usize] |= 1u64 << (group.code & 63);
+            covered += group.rows.len();
+        }
+        Selector {
+            fi,
+            bits,
+            groups,
+            covered,
+        }
+    }
+
+    /// The selector for every value of field `fi` that `excluded` does not name. Rows lacking the
+    /// field are not covered, since they have no code.
+    fn complement<'a>(&'a self, fi: usize, excluded: &Selector<'_>) -> Selector<'a> {
+        let groups = self.index[fi]
+            .values
+            .values()
+            .filter(|g| !excluded.has(g.code))
+            .collect();
+        self.make_selector(fi, groups)
+    }
+
+    /// The selector for a leaf predicate, or `None` when the filter is not a leaf.
+    fn selector(&self, filter: &Filter) -> Result<Option<Selector<'_>>, ZenarError> {
+        let leaf = |field: &str, cmp: Cmp, value: &MetaValue| -> Result<Selector<'_>, ZenarError> {
+            let (fi, _) = self.resolve(field)?;
+            let groups = self.groups_matching(fi, &cmp, value)?;
+            Ok(self.make_selector(fi, groups))
         };
-        out.dedup();
-        Ok(out)
+        Ok(Some(match filter {
+            Filter::Eq { field, value } => leaf(field, Cmp::Eq, value)?,
+            Filter::Gt { field, value } => leaf(field, Cmp::Gt, value)?,
+            Filter::Gte { field, value } => leaf(field, Cmp::Gte, value)?,
+            Filter::Lt { field, value } => leaf(field, Cmp::Lt, value)?,
+            Filter::Lte { field, value } => leaf(field, Cmp::Lte, value)?,
+            Filter::In { field, values } => {
+                let (fi, _) = self.resolve(field)?;
+                let mut groups = Vec::new();
+                for value in values {
+                    groups.extend(self.groups_matching(fi, &Cmp::Eq, value)?);
+                }
+                self.make_selector(fi, groups)
+            }
+            Filter::Ne { field, value } => {
+                let (fi, _) = self.resolve(field)?;
+                let equal = self.make_selector(fi, self.groups_matching(fi, &Cmp::Eq, value)?);
+                self.complement(fi, &equal)
+            }
+            Filter::Nin { field, values } => {
+                let (fi, _) = self.resolve(field)?;
+                let mut groups = Vec::new();
+                for value in values {
+                    groups.extend(self.groups_matching(fi, &Cmp::Eq, value)?);
+                }
+                let listed = self.make_selector(fi, groups);
+                self.complement(fi, &listed)
+            }
+            Filter::And(_) | Filter::Or(_) | Filter::Not(_) => return Ok(None),
+        }))
+    }
+
+    /// TRUE rows of an `And` whose children are evaluated together. The leaf with the fewest
+    /// postings drives: its rows become the candidates, each other leaf is checked per candidate
+    /// through its codes, and compound children are intersected last. No leaf's full result is
+    /// materialized unless it drives.
+    fn and_true_rows(&self, children: &[Filter]) -> Result<Vec<u32>, ZenarError> {
+        let mut leaves = Vec::new();
+        let mut compound = Vec::new();
+        for child in children {
+            match self.selector(child)? {
+                Some(selector) => leaves.push(selector),
+                None => compound.push(child),
+            }
+        }
+        if leaves.is_empty() {
+            // No leaves: intersect the compound children's TRUE sets, smallest first.
+            let mut sets = Vec::with_capacity(compound.len());
+            for child in compound {
+                sets.push(self.eval(child, false)?.0);
+            }
+            sets.sort_by_key(Vec::len);
+            let mut sets = sets.into_iter();
+            let mut t = sets.next().unwrap_or_default();
+            for next in sets {
+                if t.is_empty() {
+                    break;
+                }
+                t = intersect(&t, &next);
+            }
+            return Ok(t);
+        }
+        let driver = leaves
+            .iter()
+            .enumerate()
+            .min_by_key(|(_, s)| s.covered)
+            .map(|(i, _)| i)
+            .unwrap_or(0);
+        let driver = leaves.swap_remove(driver);
+        let mut candidates = match driver.groups.as_slice() {
+            [] => Vec::new(),
+            [only] => only
+                .rows
+                .iter()
+                .copied()
+                .filter(|&r| self.is_live(r))
+                .collect(),
+            many => self.live_rows_of(many),
+        };
+        for leaf in &leaves {
+            let codes = &self.index[leaf.fi].codes;
+            candidates.retain(|&r| leaf.accepts(codes[r as usize]));
+            if candidates.is_empty() {
+                return Ok(candidates);
+            }
+        }
+        for child in compound {
+            if candidates.is_empty() {
+                break;
+            }
+            let (child_true, _) = self.eval(child, false)?;
+            candidates = intersect(&candidates, &child_true);
+        }
+        Ok(candidates)
     }
 
     /// Replays the log bytes into indexes. Returns the offset just past the last valid frame.
@@ -819,29 +1025,17 @@ impl DocStore {
     fn apply_replayed(&mut self, payload: &[u8], payload_off: u64) -> Result<(), ZenarError> {
         match payload.first() {
             Some(&PUT) => {
-                let doc = decode_put(payload, &self.fields)?;
-                if self.by_id.contains_key(&doc.id) {
+                let (id, metadata) = decode_for_replay(payload, &self.fields)?;
+                if self.by_id.contains_key(&id) {
                     return Err(ZenarError::RecoveryError(format!(
-                        "duplicate live id {} in log",
-                        doc.id
+                        "duplicate live id {id} in log"
                     )));
                 }
-                let mut keys = Vec::with_capacity(doc.metadata.len());
-                for (name, value) in &doc.metadata {
-                    let fi = self.field_position(name)?;
-                    keys.push((fi, key_for(self.index[fi].kind, value)?));
+                let mut keys = Vec::with_capacity(metadata.len());
+                for (fi, value) in &metadata {
+                    keys.push((*fi, key_for(self.index[*fi].kind, value)?));
                 }
-                let staged = Staged {
-                    old_len: 0,
-                    puts: vec![StagedPut {
-                        id: doc.id,
-                        payload_off,
-                        payload_len: payload.len() as u32,
-                        keys,
-                    }],
-                    dels: Vec::new(),
-                };
-                self.commit(staged);
+                self.index_put(id, payload_off, payload.len() as u32, keys);
                 Ok(())
             }
             Some(&DEL) => {
@@ -1014,6 +1208,31 @@ fn encode_put(doc: &DocRef<'_>, fields: &[(String, FieldKind)]) -> Result<Vec<u8
     Ok(out)
 }
 
+/// Reads one metadata value. Shared by the full decoder and the replay decoder.
+fn read_value(r: &mut Reader<'_>) -> Result<MetaValue, ZenarError> {
+    Ok(match r.u8()? {
+        1 => {
+            let len = r.u32()? as usize;
+            MetaValue::Text(
+                String::from_utf8(r.bytes(len)?.to_vec())
+                    .map_err(|_| ZenarError::RecoveryError("text value is not UTF-8".into()))?,
+            )
+        }
+        2 => MetaValue::Integer(r.i64()?),
+        3 => MetaValue::Float(f64::from_bits(r.u64()?)),
+        4 => MetaValue::Boolean(r.u8()? != 0),
+        5 => MetaValue::Timestamp(
+            chrono::DateTime::from_timestamp_micros(r.i64()?)
+                .ok_or_else(|| ZenarError::RecoveryError("timestamp out of range".into()))?,
+        ),
+        tag => {
+            return Err(ZenarError::RecoveryError(format!(
+                "unknown value tag {tag}"
+            )));
+        }
+    })
+}
+
 fn decode_put(payload: &[u8], fields: &[(String, FieldKind)]) -> Result<DocumentRow, ZenarError> {
     let mut r = Reader {
         buf: payload,
@@ -1034,27 +1253,7 @@ fn decode_put(payload: &[u8], fields: &[(String, FieldKind)]) -> Result<Document
         let name_len = r.u8()? as usize;
         let name = String::from_utf8(r.bytes(name_len)?.to_vec())
             .map_err(|_| ZenarError::RecoveryError("field name is not UTF-8".into()))?;
-        let value = match r.u8()? {
-            1 => {
-                let len = r.u32()? as usize;
-                MetaValue::Text(
-                    String::from_utf8(r.bytes(len)?.to_vec())
-                        .map_err(|_| ZenarError::RecoveryError("text value is not UTF-8".into()))?,
-                )
-            }
-            2 => MetaValue::Integer(r.i64()?),
-            3 => MetaValue::Float(f64::from_bits(r.u64()?)),
-            4 => MetaValue::Boolean(r.u8()? != 0),
-            5 => MetaValue::Timestamp(
-                chrono::DateTime::from_timestamp_micros(r.i64()?)
-                    .ok_or_else(|| ZenarError::RecoveryError("timestamp out of range".into()))?,
-            ),
-            tag => {
-                return Err(ZenarError::RecoveryError(format!(
-                    "unknown value tag {tag}"
-                )));
-            }
-        };
+        let value = read_value(&mut r)?;
         if !fields.iter().any(|(fname, _)| *fname == name) {
             return Err(ZenarError::RecoveryError(format!(
                 "record uses unknown field {name:?}"
@@ -1063,6 +1262,39 @@ fn decode_put(payload: &[u8], fields: &[(String, FieldKind)]) -> Result<Document
         metadata.push((name, value));
     }
     Ok(DocumentRow { id, text, metadata })
+}
+
+/// Reads a record for replay: its id and metadata, keyed by field position. The text is skipped,
+/// because indexing never needs it, and field names are matched against the schema without
+/// allocating. The record's CRC has already been checked by the caller.
+fn decode_for_replay(
+    payload: &[u8],
+    fields: &[(String, FieldKind)],
+) -> Result<(u64, Vec<(usize, MetaValue)>), ZenarError> {
+    let mut r = Reader {
+        buf: payload,
+        pos: 0,
+    };
+    if r.u8()? != PUT {
+        return Err(ZenarError::RecoveryError(
+            "expected a document record".into(),
+        ));
+    }
+    let id = r.u64()?;
+    let text_len = r.u32()? as usize;
+    r.bytes(text_len)?;
+    let n = r.u16()? as usize;
+    let mut metadata = Vec::with_capacity(n);
+    for _ in 0..n {
+        let name_len = r.u8()? as usize;
+        let name = r.bytes(name_len)?;
+        let fi = fields
+            .iter()
+            .position(|(fname, _)| fname.as_bytes() == name)
+            .ok_or_else(|| ZenarError::RecoveryError("record uses unknown field".into()))?;
+        metadata.push((fi, read_value(&mut r)?));
+    }
+    Ok((id, metadata))
 }
 
 struct Reader<'a> {
@@ -1118,14 +1350,31 @@ fn push_frame(buf: &mut Vec<u8>, payload: &[u8]) {
 pub fn crc32(data: &[u8]) -> u32 {
     let mut crc = 0xFFFF_FFFFu32;
     for &byte in data {
-        crc ^= byte as u32;
-        for _ in 0..8 {
-            let mask = (crc & 1).wrapping_neg();
-            crc = (crc >> 1) ^ (0xEDB8_8320 & mask);
-        }
+        crc = (crc >> 8) ^ CRC_TABLE[((crc ^ byte as u32) & 0xFF) as usize];
     }
     !crc
 }
+
+/// Table for the reflected CRC-32 polynomial 0xEDB88320, one entry per byte value.
+const CRC_TABLE: [u32; 256] = {
+    let mut table = [0u32; 256];
+    let mut i = 0;
+    while i < 256 {
+        let mut crc = i as u32;
+        let mut bit = 0;
+        while bit < 8 {
+            crc = if crc & 1 == 1 {
+                (crc >> 1) ^ 0xEDB8_8320
+            } else {
+                crc >> 1
+            };
+            bit += 1;
+        }
+        table[i] = crc;
+        i += 1;
+    }
+    table
+};
 
 #[cfg(unix)]
 fn read_exact_at(file: &File, buf: &mut [u8], offset: u64) -> Result<(), ZenarError> {

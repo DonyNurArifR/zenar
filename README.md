@@ -90,9 +90,10 @@ or flips every byte of the last log record; Python: 60 tests, including repeated
 
 Measured on the reference machine at 1M rows, dim 384 (BENCHMARKS.md):
 
-- Ingest with `add_many`: 0.012 ms per row. One row at a time: 0.014 ms.
-- Unfiltered search: 1.2 ms. Reopened unfiltered search: 1.2 ms. Open (log replay): 0.8 s.
-- Selective filter (0.1%): 0.3 ms. Filter on 10% of rows: 3.7 ms. Compound filter (~4%): 15 ms.
+- Ingest with `add_many`: 0.011 ms per row. One row at a time: 0.014 ms.
+- Unfiltered search: 1.2 ms. Reopened unfiltered search: 1.2 ms. Open (log replay and index load): 0.45 s.
+- Selective filter (0.1%): 0.3 ms. Filter on 10% of rows: 3.5 ms. Compound filter (~4%): 3.5 ms.
+- Peak memory at this size: 430 MB (4-bit vectors, about 192 MB of it).
 
 Not done:
 
