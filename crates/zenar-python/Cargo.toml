@@ -3,11 +3,18 @@ name = "zenar-python"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.89"
+license = "MIT OR Apache-2.0"
 
 [lib]
-name = "zenar"
+name = "_zenar"
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
-zenar-core = { path = "../zenar-core" }
-pyo3 = { version = "0.29", features = ["extension-module", "abi3-py310"] }
+zenar-core = { version = "0.1.0", path = "../zenar-core" }
+chrono = "0.4"
+pyo3 = { version = "0.29", features = ["abi3-py310"] }
+
+[features]
+# Enabled by maturin for wheels. Leaves Python symbols to the interpreter, so a
+# plain `cargo build` of the workspace links (see CONTRIBUTING.md).
+extension-module = ["pyo3/extension-module"]

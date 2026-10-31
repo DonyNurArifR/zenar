@@ -2,11 +2,11 @@
 
 Embedded, lightweight, high-performance vector database for Python — a Rust
 core built on [TurboVec](https://github.com/RyanCodrai/turbovec) for vector
-search and [Stoolap](https://github.com/stoolap/stoolap) for metadata/SQL
-filtering.
+search and a document log with in-memory indexes for metadata filtering.
 
-**Status: pre-alpha.** Not yet installable, not yet functional. See
-[Project Status](#project-status).
+**Status: 0.1.0, not yet published.** The core, Python API, persistence and
+crash recovery are implemented and tested. Filtered search at 1M rows does not
+yet meet its performance target. See [Project Status](#project-status).
 
 ## Why Zenar
 
@@ -31,7 +31,7 @@ Zenar (Rust, PyO3)
   +----------------------+
   |                       |
   v                       v
-TurboVec               Stoolap
+TurboVec          doc log + indexes
 vectors / ANN          metadata / SQL
 ```
 
@@ -40,50 +40,68 @@ integration layer over two purpose-built Rust crates, plus the coordination
 logic (ID mapping, consistency, query planning) needed to make them behave
 like one database.
 
-## Target API
+## Usage
 
-This is the API Zenar is being built toward — shown so it's clear what shape
-the project is aiming for. **Not runnable yet.**
+Build the extension from a checkout (PyPI wheels come with the first release):
 
-```python
-from zenar import VectorDB
-
-db = VectorDB("./my_vectors")
-
-docs = db.create_collection("documents")  # dimension inferred from your first add()
-
-docs.add(
-    id=1,
-    vector=embedding,
-    text="Hello world",
-    metadata={"tenant": "A", "category": "faq"},
-)
-
-results = docs.search(query_embedding, top_k=5, tenant="A")
+```sh
+python -m venv .venv && . .venv/bin/activate
+pip install maturin pytest numpy
+maturin develop --release
 ```
 
-No dimension to look up or configure — `create_collection` learns it from
-whatever your first `add()` stores. Pass `dimension=1536` explicitly if you'd
-rather have that locked in upfront.
-
-Filtering has two layers: plain keyword arguments for simple equality (no
-import needed, as above), and `field` objects with real Python operators for
-anything else — comparisons, OR, NOT:
-
 ```python
-from zenar import field as f
+from zenar import VectorDB, field as f
 
-results = docs.search(
-    query_embedding,
-    top_k=5,
-    filter=(f.price >= 100) & ((f.category == "faq") | (f.category == "product")),
-)
+with VectorDB("./my_vectors") as db:
+    docs = db.create_collection("documents", dimension=3)
+
+    docs.add(id=1, vector=[1.0, 0.0, 0.0], text="Hello world",
+             metadata={"tenant": "A", "category": "faq", "price": 150.0})
+
+    docs.search([1.0, 0.0, 0.0], top_k=5, tenant="A")                  # keyword equality
+    docs.search([1.0, 0.0, 0.0], top_k=5,
+                filter=(f.price >= 100) & ((f.category == "faq") | (f.category == "product")))
 ```
+
+- `dimension` is optional. Omit it and Zenar takes it from the first `add()`.
+- Dimensions that are not multiples of 8 are accepted. Zenar pads them internally, and scores are unchanged.
+- Every comparison in a `filter=` expression must be parenthesized when combined with `&`, `|`, `~`.
+
+Full reference: [API.md](API.md). Filter semantics: [FILTERING.md](FILTERING.md).
+Durability and recovery: [STORAGE.md](STORAGE.md). Design: [ARCHITECTURE.md](ARCHITECTURE.md).
+Measurements: [BENCHMARKS.md](BENCHMARKS.md).
 
 ## Project Status
 
-Zenar is in early development. Nothing is published to PyPI or crates.io
-yet, and the core add/search path isn't wired up. Not ready for use.
+Implemented and tested (Rust: 41 unit and 19 integration tests, including a reference-checked three-valued filter
+oracle, a model-based test with reopens, a random-filter fuzz test and a concurrent read/write test; Python: 41 tests,
+including repeated `kill -9` crash cycles):
+
+- Collections, add, add_many (atomic), delete, delete_many (atomic), get, search, with the query planner and stale-ID handling.
+- Typed metadata, the full filter operator set, NULL and type rules, tenant isolation.
+- A Zenar-owned document log with in-memory indexes; torn-tail and corruption handling; reconciliation on open.
+- Process locking, `flush()`, `durable=True`, and a poisoning rule for collections that cannot be made consistent.
+- `bit_width` and `calibrate()`.
+- Python bindings with a complete exception hierarchy, GIL release, numpy input, and a panic guard.
+
+Measured on the reference machine at 1M rows, dim 384 (BENCHMARKS.md):
+
+- Ingest with `add_many`: 0.012 ms per row. One row at a time: 0.014 ms.
+- Unfiltered search: 1.2 ms. Reopened unfiltered search: 1.2 ms. Open (log replay): 0.8 s.
+- Selective filter (0.1%): 0.3 ms. Filter on 10% of rows: 3.7 ms. Compound filter (~4%): 15 ms.
+
+Not done:
+
+- **Cross-platform wheels and CI** are written (`.github/workflows/`) but have not run on GitHub or on every target.
+  Verified on this machine: macOS arm64 only. `zenar-core` compiles and passes clippy for Windows (MSVC target),
+  but its tests have not run there.
+- **Power-loss behavior** is designed and tested only at the process level (`kill -9`). Real power-loss testing is not done.
+- **Compound filters** are the slowest case. Merging many postings is not tuned yet (BENCHMARKS.md, known gaps).
+
+## Contributing
+
+See [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## License
 
@@ -93,12 +111,6 @@ Zenar is dual-licensed under the MIT license
 with either one.
 
 Zenar's compiled distribution statically links [TurboVec](https://github.com/RyanCodrai/turbovec)
-(MIT) and [Stoolap](https://github.com/stoolap/stoolap) (Apache-2.0). Their
-full license texts are reproduced in [THIRD_PARTY_NOTICES](THIRD_PARTY_NOTICES),
-as required by their own license terms. Zenar is not affiliated with either
-project.
-
-## Contributing
-
-Not yet set up for external contributions — this will change as the core
-API stabilizes.
+(MIT). Its license text, and the license texts of every other shipped crate, are
+reproduced in [THIRD_PARTY_NOTICES](THIRD_PARTY_NOTICES), as required by their terms. Zenar is not affiliated
+with any of these projects.

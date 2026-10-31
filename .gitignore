@@ -23,9 +23,15 @@ venv/
 *.db
 /data/
 
-# Markdown — ignore all except README.md
+# Markdown — ignore all except the public project docs
 *.md
 !README.md
+!API.md
+!FILTERING.md
+!STORAGE.md
+!ARCHITECTURE.md
+!BENCHMARKS.md
+!CONTRIBUTING.md
 
 # IDE / OS
 .DS_Store
@@ -34,3 +40,11 @@ venv/
 
 # Claude Code local settings — must never be committed (see global CLAUDE.md)
 .claude/
+
+# Generated knowledge graph (graphify)
+graphify-out/
+
+# Compiled extension copied in by `maturin develop`
+*.so
+*.pyd
+*.dylib
