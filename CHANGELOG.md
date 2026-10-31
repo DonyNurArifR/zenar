@@ -5,17 +5,19 @@ project follows [semantic versioning](https://semver.org/) while it is pre-1.0.
 
 ## Unreleased
 
+### Changed
+- `VectorDB()` with no path uses `./zenar`, created if missing. An explicit path is used as given.
+- Metadata fields per collection are not limited. The per-document field count is stored as 32 bits, not 16. Records
+  written before this change cannot be read; no database has been released to PyPI, so none exist outside development.
+- TurboVec is 1.1.2 (was 1.0.0). Unfiltered search is about 3x faster at 1M rows. The vector index file format is the same as 1.0.0, and it gives the same answers.
+- `top_k` is no longer capped at 1000. A result is at most the number of matching documents.
+
 ### Fixed
 - A collection handle can no longer write after its database is closed or its collection is dropped. Such a write
   looked successful and was lost on reopen. It now raises `CollectionClosedError`.
 - A filter that compares with NaN is refused with `InvalidFilterError`. `field < NaN` used to match every document.
 - A two-dimensional numpy array is refused as a vector. It used to be flattened and accepted.
 - A non-object `scope` names the scope argument in its error, not `where`.
-
-### Changed
-- TurboVec is 1.1.2 (was 1.0.0). Unfiltered search is about 3x faster at 1M rows. A database written by 1.0.0 opens
-  unchanged and gives the same answers.
-- `top_k` is no longer capped at 1000. A result is at most the number of matching documents.
 
 ## 0.1.2
 

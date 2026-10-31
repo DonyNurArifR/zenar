@@ -1184,7 +1184,7 @@ fn encode_put(doc: &DocRef<'_>, fields: &[(String, FieldKind)]) -> Result<Vec<u8
     out.extend_from_slice(&doc.id.to_le_bytes());
     out.extend_from_slice(&(doc.text.len() as u32).to_le_bytes());
     out.extend_from_slice(doc.text.as_bytes());
-    out.extend_from_slice(&(doc.metadata.len() as u16).to_le_bytes());
+    out.extend_from_slice(&(doc.metadata.len() as u32).to_le_bytes());
     for (name, value) in doc.metadata {
         if !fields.iter().any(|(n, _)| n == name) {
             return Err(ZenarError::InvalidMetadata(format!(
@@ -1264,7 +1264,7 @@ fn decode_put(payload: &[u8], fields: &[(String, FieldKind)]) -> Result<Document
     let text_len = r.u32()? as usize;
     let text = String::from_utf8(r.bytes(text_len)?.to_vec())
         .map_err(|_| ZenarError::RecoveryError("document text is not UTF-8".into()))?;
-    let n = r.u16()? as usize;
+    let n = r.u32()? as usize;
     let mut metadata = Vec::with_capacity(n);
     for _ in 0..n {
         let name_len = r.u8()? as usize;
@@ -1300,7 +1300,7 @@ fn decode_for_replay(
     let id = r.u64()?;
     let text_len = r.u32()? as usize;
     r.bytes(text_len)?;
-    let n = r.u16()? as usize;
+    let n = r.u32()? as usize;
     let mut metadata = Vec::with_capacity(n);
     for _ in 0..n {
         let name_len = r.u8()? as usize;
@@ -1334,9 +1334,6 @@ impl<'a> Reader<'a> {
     }
     fn u8(&mut self) -> Result<u8, ZenarError> {
         Ok(self.array::<1>()?[0])
-    }
-    fn u16(&mut self) -> Result<u16, ZenarError> {
-        Ok(u16::from_le_bytes(self.array()?))
     }
     fn u32(&mut self) -> Result<u32, ZenarError> {
         Ok(u32::from_le_bytes(self.array()?))

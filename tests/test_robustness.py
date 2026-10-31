@@ -230,3 +230,25 @@ def test_a_non_object_scope_names_the_scope_argument():
     with pytest.raises(zenar.InvalidFilterError, match="scope must be a JSON object"):
         c.describe(scope="A")
     db.close()
+
+
+def test_calling_without_a_path_uses_a_default_folder_in_the_current_directory(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    db = zenar.VectorDB()
+    db.create_collection("docs", dimension=3).add(id=1, vector=[1.0, 0.0, 0.0], text="a")
+    db.close()
+    assert (tmp_path / "zenar" / "catalog.json").is_file()
+    reopened = zenar.VectorDB()
+    assert reopened.get_collection("docs").count() == 1
+    reopened.close()
+
+
+def test_a_document_may_have_more_fields_than_a_16_bit_count_holds():
+    db = zenar.VectorDB(tempfile.mkdtemp())
+    c = db.create_collection("wide", dimension=3)
+    fields = {f"f{i}": i for i in range(70_000)}
+    c.add(id=1, vector=[1.0, 0.0, 0.0], text="wide", metadata=fields)
+    assert c.get(1)["metadata"]["f69999"] == 69_999
+    hits = c.search([1.0, 0.0, 0.0], top_k=1, filter=zenar.field.f69999 == 69_999)
+    assert [h["id"] for h in hits] == [1]
+    db.close()

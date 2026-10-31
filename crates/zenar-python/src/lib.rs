@@ -709,6 +709,9 @@ fn build_filter(
     }
 }
 
+/// Default database folder when `VectorDB` is called without a path.
+const DEFAULT_PATH: &str = "./zenar";
+
 #[pyclass(name = "VectorDB", module = "zenar._zenar")]
 pub struct PyVectorDB {
     inner: Option<Arc<core::VectorDB>>,
@@ -727,9 +730,11 @@ impl PyVectorDB {
     /// `durable=True` syncs the index and the document log on every add: power-safe per add, at a
     /// much lower ingest rate. The default syncs at sync boundaries. `flush()` makes everything before it durable.
     #[new]
-    #[pyo3(signature = (path, durable=false))]
-    fn new(py: Python<'_>, path: &str, durable: bool) -> PyResult<Self> {
-        let path = path.to_string();
+    /// `path` is the database folder. When it is omitted, the default is `./zenar` in the current
+    /// directory, as Chroma's default is `./chroma`. The folder is created if it does not exist.
+    #[pyo3(signature = (path=None, durable=false))]
+    fn new(py: Python<'_>, path: Option<&str>, durable: bool) -> PyResult<Self> {
+        let path = path.unwrap_or(DEFAULT_PATH).to_string();
         let sync = if durable {
             core::MetadataSync::Full
         } else {

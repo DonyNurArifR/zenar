@@ -14,7 +14,7 @@ with VectorDB("./data") as db:                       # flushes and releases the 
 
 | Method | Notes |
 |---|---|
-| `VectorDB(path, durable=False)` | Opens or creates a database directory. Raises `DatabaseLockedError` if already open. `durable=True` syncs the index and the document log on every add. Power-safe per add, at about 7 ms per row. Use `add_many` batches instead when you can. |
+| `VectorDB(path=None, durable=False)` | Opens or creates a database directory. With no `path`, the database lives in `./zenar` in the current directory, created if missing. An explicit `path` is used exactly as given, and created if missing. Raises `DatabaseLockedError` if already open. `durable=True` syncs the index and the document log on every add. Power-safe per add, at about 7 ms per row. Use `add_many` batches instead when you can. |
 | `create_collection(name, dimension=None, bit_width=4)` | `dimension=None` is inferred from the first `add`. `bit_width` is 2, 3 or 4. |
 | `get_collection(name)` / `list_collections()` | |
 | `drop_collection(name)` | Deletes documents and the vector file. |
