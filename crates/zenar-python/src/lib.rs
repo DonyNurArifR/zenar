@@ -45,17 +45,15 @@ fn to_py_err(e: CoreError) -> PyErr {
         CoreError::CollectionNotFound(_) => CollectionNotFoundError::new_err(msg),
         CoreError::CollectionAlreadyExists(_) => CollectionAlreadyExistsError::new_err(msg),
         CoreError::InvalidCollectionName(_) => InvalidCollectionNameError::new_err(msg),
-        CoreError::DimensionMismatch { .. } | CoreError::InvalidDimension(_) => {
-            DimensionMismatchError::new_err(msg)
-        }
+        CoreError::DimensionMismatch { .. } => DimensionMismatchError::new_err(msg),
         CoreError::DuplicateId(_) => DuplicateIdError::new_err(msg),
         CoreError::VectorNotFound(_) => VectorNotFoundError::new_err(msg),
         CoreError::InvalidVector(_) => InvalidVectorError::new_err(msg),
         CoreError::InvalidMetadata(_) => InvalidMetadataError::new_err(msg),
         CoreError::InvalidFilter(_) => InvalidFilterError::new_err(msg),
-        CoreError::InvalidArgument(_) | CoreError::InvalidConfig(_) => {
-            InvalidArgumentError::new_err(msg)
-        }
+        CoreError::InvalidArgument(_)
+        | CoreError::InvalidConfig(_)
+        | CoreError::InvalidDimension(_) => InvalidArgumentError::new_err(msg),
         CoreError::DatabaseLocked(_) => DatabaseLockedError::new_err(msg),
         CoreError::VectorStoreError(_) | CoreError::Panic(_) => VectorStoreError::new_err(msg),
         CoreError::MetadataStoreError(_) => MetadataStoreError::new_err(msg),

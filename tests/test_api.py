@@ -149,7 +149,7 @@ def test_lazy_dimension_inferred_from_first_add(db):
 def test_invalid_names_and_config(db):
     with pytest.raises(zenar.InvalidCollectionNameError):
         db.create_collection("../../etc/passwd", dimension=8)
-    with pytest.raises(zenar.DimensionMismatchError):
+    with pytest.raises(zenar.InvalidArgumentError):
         db.create_collection("huge", dimension=20000)
     with pytest.raises(zenar.InvalidArgumentError):
         db.create_collection("bits", dimension=8, bit_width=5)
