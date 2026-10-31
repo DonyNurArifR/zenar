@@ -74,8 +74,8 @@ Measurements: [BENCHMARKS.md](BENCHMARKS.md).
 
 ## Project Status
 
-Implemented and tested (Rust: 41 unit and 19 integration tests, including a reference-checked three-valued filter
-oracle, a model-based test with reopens, a random-filter fuzz test and a concurrent read/write test; Python: 41 tests,
+Implemented and tested (Rust: 55 unit and 27 integration tests, including a reference-checked three-valued filter
+oracle, a model-based test with reopens, a random-filter fuzz test and a concurrent read/write test; Python: 59 tests,
 including repeated `kill -9` crash cycles):
 
 - Collections, add, add_many (atomic), delete, delete_many (atomic), get, search, with the query planner and stale-ID handling.
@@ -96,9 +96,9 @@ Measured on the reference machine at 1M rows, dim 384 (BENCHMARKS.md):
 
 Not done:
 
-- **Cross-platform wheels and CI** are written (`.github/workflows/`) but have not run on GitHub or on every target.
-  Verified on this machine: macOS arm64 only. `zenar-core` compiles and passes clippy for Windows (MSVC target),
-  but its tests have not run there.
+- **Cross-platform CI** runs on GitHub Actions for Ubuntu, macOS and Windows: Rust tests on Rust 1.89 and stable,
+  Python wheel tests in a fresh venv on all three OS, plus a dependency audit and license check. All green on the
+  current branch. Wheels are built in CI only; no PyPI release yet.
 - **Power-loss behavior** is designed and tested only at the process level (`kill -9`). Real power-loss testing is not done.
 - **Compound filters** are the slowest case. Merging many postings is not tuned yet (BENCHMARKS.md, known gaps).
 
