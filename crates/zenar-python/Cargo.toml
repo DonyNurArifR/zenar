@@ -19,3 +19,6 @@ pyo3 = { version = "0.29", features = ["abi3-py310"] }
 # Enabled by maturin for wheels. Leaves Python symbols to the interpreter, so a
 # plain `cargo build` of the workspace links (see docs/CONTRIBUTING.md).
 extension-module = ["pyo3/extension-module"]
+# Test-only hook that raises a panic inside a guarded call. Off in every shipped wheel; CI builds
+# one with it on to check the panic guard.
+test-hooks = []

@@ -844,7 +844,8 @@ fn report_to_py<'py>(py: Python<'py>, r: core::RecoveryReport) -> PyResult<Bound
 }
 
 /// Test hook: raises a panic inside a guarded core call, to verify that a
-/// panic becomes a Python exception instead of aborting the process.
+/// panic becomes a Python exception instead of aborting the process. Built only with `test-hooks`.
+#[cfg(feature = "test-hooks")]
 #[pyfunction]
 fn _panic_for_test(py: Python<'_>) -> PyResult<()> {
     guarded(py, || -> Result<(), CoreError> {
@@ -909,6 +910,7 @@ fn _zenar(m: &Bound<'_, PyModule>) -> PyResult<()> {
     )?;
     m.add("PersistenceError", m.py().get_type::<PersistenceError>())?;
     m.add("RecoveryError", m.py().get_type::<RecoveryError>())?;
+    #[cfg(feature = "test-hooks")]
     m.add_function(wrap_pyfunction!(_panic_for_test, m)?)?;
     Ok(())
 }

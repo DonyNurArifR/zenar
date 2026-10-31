@@ -184,6 +184,9 @@ def test_sql_injection_text_is_data(db):
 
 
 def test_panic_at_boundary_becomes_exception(db):
+    # The hook exists only in builds made with the test-hooks feature (see CI).
+    if not hasattr(zenar._zenar, "_panic_for_test"):
+        pytest.skip("built without the test-hooks feature")
     with pytest.raises(zenar.VectorStoreError, match="deliberate panic"):
         zenar._zenar._panic_for_test()
 
