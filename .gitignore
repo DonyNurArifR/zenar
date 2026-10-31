@@ -26,7 +26,9 @@ venv/
 # Markdown — ignore all except the public project docs
 *.md
 !README.md
+!CODE_OF_CONDUCT.md
 !docs/*.md
+!.github/**/*.md
 
 # IDE / OS
 .DS_Store
