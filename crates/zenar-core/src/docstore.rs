@@ -1475,7 +1475,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("zenar-docstore-{tag}-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
-        dir.join("docs.log")
+        dir.join("docs.zdocs")
     }
 
     /// Writes and commits a batch of documents.

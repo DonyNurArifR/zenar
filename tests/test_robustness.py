@@ -128,8 +128,8 @@ def _saved_collection(root):
 def test_a_file_shortened_outside_zenar_is_refused_not_silently_dropped(damage):
     root = tempfile.mkdtemp()
     _saved_collection(root)
-    log = pathlib.Path(root, "docs", "docs.log")
-    vectors = pathlib.Path(root, "vectors", "docs.tvim")
+    log = pathlib.Path(root, "docs", "docs.zdocs")
+    vectors = pathlib.Path(root, "vectors", "docs.zvec")
     if damage == "log_deleted":
         log.unlink()
     elif damage == "log_emptied":
@@ -157,7 +157,7 @@ def test_a_stale_index_from_an_interrupted_drop_is_not_loaded_by_a_new_collectio
     c = db.create_collection("a", dimension=8)
     c.add_many([{"id": i, "vector": [1.0] * 8, "text": "t", "metadata": {}} for i in range(20)])
     db.close()
-    index = pathlib.Path(root, "vectors", "a.tvim")
+    index = pathlib.Path(root, "vectors", "a.zvec")
     stale = index.read_bytes()
     db = zenar.VectorDB(root)
     db.drop_collection("a")

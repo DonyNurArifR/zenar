@@ -20,7 +20,7 @@ fn main() {
         ("price".to_string(), FieldKind::Float),
     ];
     let categories = ["faq", "product", "tools", "electronics", "appliances"];
-    let mut store = DocStore::create(&dir.join("docs.log"), schema).unwrap();
+    let mut store = DocStore::create(&dir.join("docs.zdocs"), schema).unwrap();
     for chunk in (0..rows).collect::<Vec<_>>().chunks(10_000) {
         let metas: Vec<Vec<(String, MetaValue)>> = chunk
             .iter()

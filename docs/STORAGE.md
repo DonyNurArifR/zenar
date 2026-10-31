@@ -5,8 +5,8 @@
 ```text
 <root>/LOCK                  advisory lock, held while the database is open
 <root>/catalog.json          format version, collections: dimension, bit width, metadata schema
-<root>/docs/<name>.log       document log: text and metadata, append-only
-<root>/vectors/<name>.tvim   TurboVec index for each collection
+<root>/docs/<name>.zdocs     document store: text and metadata, append-only
+<root>/vectors/<name>.zvec   vector index (TurboVec) for each collection
 ```
 
 The document log is the source of truth for documents. TurboVec holds the vectors. The log holds no vectors, so

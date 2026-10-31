@@ -12,8 +12,8 @@
 
 | Component | Module | Holds | Persistence |
 |---|---|---|---|
-| Vector index | `storage.rs` (TurboVec) | one vector per id | `vectors/<name>.tvim`, synced at boundaries |
-| Document store | `docstore.rs` | text and metadata per id; per-field indexes | `docs/<name>.log`, append-only |
+| Vector index | `storage.rs` (TurboVec) | one vector per id | `vectors/<name>.zvec`, synced at boundaries |
+| Document store | `docstore.rs` | text and metadata per id; per-field indexes | `docs/<name>.zdocs`, append-only |
 | Catalog | `catalog.rs` | collection config and schema | `catalog.json`, replaced atomically |
 | Collection | `collection.rs` | the write and read protocol across the three | none (orchestration) |
 
@@ -88,7 +88,7 @@ measurement. They are listed here so they are not rediscovered later.
 
 | Spec | Implemented | Reason |
 |---|---|---|
-| Section 4.2: one `documents` table in Stoolap | One log per collection (`docs/<name>.log`), with indexes in memory | Filtered search and ingest were limited by the metadata engine (BENCHMARKS.md). |
+| Section 4.2: one `documents` table in Stoolap | One document store per collection (`docs/<name>.zdocs`), with indexes in memory | Filtered search and ingest were limited by the metadata engine (BENCHMARKS.md). |
 | Section 9/10: filter compiled to SQL | Filter AST evaluated by the document store | No SQL is built from user input at all. Injection is impossible by construction, not only by parameterization. |
 | Section 13: index on frequently filtered fields | An index per metadata field, held in memory | Same result as a database index, with no per-row table reads. |
 | Section 25/65: a separate lock | `LOCK` file, held for the life of the handle | Same as spec. |

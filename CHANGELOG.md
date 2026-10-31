@@ -6,6 +6,9 @@ project follows [semantic versioning](https://semver.org/) while it is pre-1.0.
 ## Unreleased
 
 ### Changed
+- Database files have Zenar's own extensions, so they are not mistaken for logs: `docs/<name>.zdocs` (document store)
+  and `vectors/<name>.zvec` (vector index). The catalog format is version 3. A database with the old names is refused
+  with the usual message; create a new one.
 - A batch writes the catalog once, at flush or close, not at every sync. A 50-document `add_many` took 16 ms; it now takes
   9 ms on macOS, where a full flush is the main cost. Deletes still record their lengths at once.
 - Less memory per document. The per-field presence list held the same rows as the codes list, so it is gone. A million

@@ -19,7 +19,8 @@ venv/
 
 # Zenar runtime data (created by running examples/tests locally, not source)
 *.tv
-*.tvim
+*.zvec
+*.zdocs
 *.db
 /data/
 # The compatibility fixture is a real database, so its files are tracked.

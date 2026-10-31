@@ -32,8 +32,8 @@ pub enum MetadataSync {
 /// ```text
 /// <root>/LOCK                 advisory lock held while the database is open
 /// <root>/catalog.json        collections: dimension, bit width, metadata schema
-/// <root>/docs/<name>.log      document log (text and metadata) with its indexes in memory
-/// <root>/vectors/<name>.tvim  TurboVec index for each collection
+/// <root>/docs/<name>.zdocs    document store (text and metadata), with its indexes in memory
+/// <root>/vectors/<name>.zvec  vector index (TurboVec) for each collection
 /// ```
 pub struct VectorDB {
     root: PathBuf,
@@ -290,11 +290,11 @@ fn acquire_lock(root: &Path) -> Result<File, ZenarError> {
 }
 
 fn index_path(root: &Path, name: &str) -> PathBuf {
-    root.join("vectors").join(format!("{name}.tvim"))
+    root.join("vectors").join(format!("{name}.zvec"))
 }
 
 fn docs_path(root: &Path, name: &str) -> PathBuf {
-    root.join("docs").join(format!("{name}.log"))
+    root.join("docs").join(format!("{name}.zdocs"))
 }
 
 fn absolute(path: &Path) -> Result<PathBuf, ZenarError> {

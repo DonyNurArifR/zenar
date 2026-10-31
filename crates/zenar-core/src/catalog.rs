@@ -60,7 +60,7 @@ pub struct Catalog {
 
 /// On-disk format version of `catalog.json`. It also versions the record format in the logs: version 2
 /// stores each document's field count as 32 bits. Bump it for any change that an older build cannot read.
-pub const CATALOG_VERSION: u32 = 2;
+pub const CATALOG_VERSION: u32 = 3;
 
 impl Catalog {
     pub fn open(path: &Path) -> Result<Self, ZenarError> {
