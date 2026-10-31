@@ -16,9 +16,6 @@ pub const MAX_ID: u64 = i64::MAX as u64;
 /// Scopes whose statistics are kept between calls.
 const SCOPE_CACHE_ENTRIES: usize = 16;
 
-/// Largest `top_k` a model may request. Larger values cost more than a tool call should.
-pub const MAX_TOP_K: usize = 1000;
-
 /// Statistics for one scope, as cached by `Collection::stats_for_scope`.
 struct ScopedEntry {
     key: String,
@@ -543,11 +540,6 @@ impl Collection {
         where_: Option<&serde_json::Value>,
         scope: Option<&serde_json::Value>,
     ) -> Result<Retrieval, ZenarError> {
-        if top_k > MAX_TOP_K {
-            return Err(ZenarError::InvalidArgument(format!(
-                "top_k is {top_k}; the limit for retrieve is {MAX_TOP_K}"
-            )));
-        }
         let (where_filter, scope_filter, warnings) = {
             // One read lock for parsing. It is released before the search takes its own.
             let state = self.read_state()?;

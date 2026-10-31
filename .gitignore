@@ -22,6 +22,8 @@ venv/
 *.tvim
 *.db
 /data/
+# The compatibility fixture is a real database, so its files are tracked.
+!tests/fixtures/**
 
 # Markdown — ignore all except the public project docs
 *.md

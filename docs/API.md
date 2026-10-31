@@ -34,7 +34,7 @@ with VectorDB("./data") as db:                       # flushes and releases the 
 | `delete(id)` | Removes the vector from the index and syncs before returning. Raises `VectorNotFoundError` if absent. |
 | `delete_many(ids)` | Deletes many ids atomically with one index sync and one log sync: all of them are deleted, or none is. Use this for bulk deletes. |
 | `search(vector, top_k=10, filter=None, **equality)` | Returns `[{id, score, text, metadata}]`, best first. |
-| `count()`, `stats()`, `dimension`, `bit_width` | |
+| `name`, `count()`, `stats()`, `dimension`, `bit_width` | `name` is the collection's name. |
 | `calibrate(sample)` | Fits the quantizer from a flat sample of `n * dimension` floats. See below. |
 
 `vector` may be a list of floats or a numpy array (float32 or float64).
@@ -161,8 +161,9 @@ exist. Range bounds (`gt`, `gte`, `lt`, `lte`) are not restricted to existing va
 
 - Document text is data. If it can contain instructions written by someone else, do not present it to the model as
   instructions. Keep it inside a clearly marked data section.
-- `retrieve` does not embed text. Your integration embeds the model's `query`, so an unbounded `top_k` is your
-  responsibility. Cap it when you forward the model's arguments.
+- `retrieve` does not embed text. Zenar does not cap `top_k`: it returns at most the number of matching documents.
+  A very large result is still expensive to send to a model, so cap `top_k` in your application when you forward the
+  model's arguments.
 - A scope is only as strong as the value you pass. Derive it from the authenticated user, not from the model's output.
 - Discovery over a large scope costs more than retrieval. `describe` on a 5% scope of 1M documents takes about 14 ms,
   and it is not cached. Cache the spec per session if the data changes slowly.

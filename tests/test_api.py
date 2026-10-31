@@ -633,10 +633,10 @@ def test_warnings_inside_a_scope_name_no_other_tenant(db):
     assert "globex" not in r["warnings"][0]
 
 
-def test_retrieve_caps_top_k_for_model_calls(db):
+def test_retrieve_accepts_a_large_top_k_and_returns_the_matches(db):
     c = _two_tenants(db)
-    with pytest.raises(zenar.InvalidArgumentError, match="limit for retrieve is 1000"):
-        c.retrieve([1.0] * 8, top_k=5000, scope=None)
+    r = c.retrieve([1.0] * 8, top_k=5000, scope=None)
+    assert len(r["hits"]) == r["matched"]
 
 
 def test_retrieve_reports_the_applied_filter_in_words(db):

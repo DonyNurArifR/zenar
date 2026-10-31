@@ -557,8 +557,8 @@ pub fn tool_spec(name: &str, collection: &str, documents: usize, stats: &[FieldS
         "type": "object",
         "properties": {
             "query": {"type": "string", "description": "What to search for, in natural language."},
-            "top_k": {"type": "integer", "minimum": 1, "maximum": 100, "default": 10,
-                      "description": "How many results to return."},
+            "top_k": {"type": "integer", "minimum": 1, "default": 10,
+                      "description": "How many results to return, best first. At most the number of matching documents."},
             "where": where_parameter(stats)
         },
         "required": ["query"],
