@@ -9,11 +9,26 @@ description = "Embedded vector database with typed metadata filtering (TurboVec 
 readme = "README.md"
 license = { text = "MIT OR Apache-2.0" }
 requires-python = ">=3.10"
+keywords = ["vector database", "embedded", "filtering", "rag", "turbovec"]
 classifiers = [
+    "Development Status :: 3 - Alpha",
+    "License :: OSI Approved :: MIT License",
+    "License :: OSI Approved :: Apache Software License",
+    "Operating System :: MacOS",
+    "Operating System :: Microsoft :: Windows",
+    "Operating System :: POSIX :: Linux",
     "Programming Language :: Rust",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3 :: Only",
+    "Topic :: Database",
+    "Typing :: Typed",
 ]
+
+[project.urls]
+Homepage = "https://github.com/DonyNurArifR/zenar"
+Repository = "https://github.com/DonyNurArifR/zenar"
+Issues = "https://github.com/DonyNurArifR/zenar/issues"
+Changelog = "https://github.com/DonyNurArifR/zenar/blob/main/README.md#project-status"
 
 [project.optional-dependencies]
 test = ["pytest>=8", "numpy>=1.24"]
