@@ -163,9 +163,9 @@ exist. Range bounds (`gt`, `gte`, `lt`, `lte`) are not restricted to existing va
 
 ### Limits and things your application must do
 
-- Metadata: the first record that carries metadata sets the collection's schema (field names and types). After that, a
-  record may not use a field name the schema lacks. The number of fields is not limited. A document's field count is
-  stored as 32 bits. Each field costs memory only for the documents that have it.
+- Metadata: a field name is added to the schema the first time a record uses it, with the type of that first value.
+  A field keeps its type: a later value of another type is rejected. The number of fields is not limited. A document's
+  field count is stored as 32 bits. Each field costs memory only for the documents that have it.
 
 - Document text is data. If it can contain instructions written by someone else, do not present it to the model as
   instructions. Keep it inside a clearly marked data section.

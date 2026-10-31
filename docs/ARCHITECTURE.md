@@ -102,10 +102,10 @@ measurement. They are listed here so they are not rediscovered later.
 
 ## Metadata schema rules
 
-- The first `add` (or the first record of an `add_many`) that carries metadata defines the schema: each field's name and type.
+- A field name joins the schema the first time a record uses it. Its type is that first value's type.
 - Later adds may use any subset of those fields. Missing fields are NULL.
 - A new field name, or a value of a different type, raises `InvalidMetadataError`. Integers widen to floats. Mixed numeric
   comparisons in filters are allowed, and evaluated by value.
 - Field and collection names: lowercase letters, digits and `_`, starting with a letter, at most 64 characters.
 
-Once the schema is set, a new field name is rejected. A field keeps its type for the life of the collection.
+A field keeps its type for the life of the collection. A value of another type for that field is rejected.

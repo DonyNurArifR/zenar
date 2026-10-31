@@ -916,14 +916,11 @@ fn resolve_metadata(
             .map(|(_, k)| *k);
         let value = match declared {
             Some(kind) => coerce(&name, kind, value)?,
-            None if schema.is_empty() => {
+            // A new field name extends the schema, with the type of its first value. A field keeps
+            // that type for the life of the collection (see `coerce`).
+            None => {
                 new_fields.push((name.clone(), FieldKind::of(&value)));
                 value
-            }
-            None => {
-                return Err(ZenarError::InvalidMetadata(format!(
-                    "field {name:?} is not part of this collection's metadata schema"
-                )));
             }
         };
         values.push((name, value));
@@ -960,13 +957,23 @@ mod tests {
     }
 
     #[test]
-    fn unknown_field_after_schema_lock_rejected() {
+    fn unknown_field_extends_the_schema() {
         let schema = vec![("tenant".to_string(), FieldKind::Text)];
-        let r = resolve_metadata(
+        let (new_fields, values) = resolve_metadata(
             &schema,
             vec![("color".into(), MetaValue::Text("red".into()))],
-        );
-        assert!(matches!(r, Err(ZenarError::InvalidMetadata(_))));
+        )
+        .unwrap();
+        assert_eq!(new_fields, vec![("color".to_string(), FieldKind::Text)]);
+        assert_eq!(values[0].0, "color");
+    }
+
+    #[test]
+    fn a_new_field_keeps_the_type_of_its_first_value() {
+        let schema = vec![("tenant".to_string(), FieldKind::Text)];
+        let (new_fields, _) =
+            resolve_metadata(&schema, vec![("price".into(), MetaValue::Float(9.5))]).unwrap();
+        assert_eq!(new_fields, vec![("price".to_string(), FieldKind::Float)]);
     }
 
     #[test]

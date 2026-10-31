@@ -6,6 +6,8 @@ project follows [semantic versioning](https://semver.org/) while it is pre-1.0.
 ## Unreleased
 
 ### Changed
+- A metadata field name the schema lacks extends the schema, with the type of its first value. Before, it was
+  rejected after the first insert. A field keeps its type; a value of another type is still rejected.
 - `VectorDB()` with no path uses `./zenar`, created if missing. An explicit path is used as given.
 - Metadata fields per collection are not limited. The per-document field count is stored as 32 bits, not 16. Records
   written before this change cannot be read; no database has been released to PyPI, so none exist outside development.

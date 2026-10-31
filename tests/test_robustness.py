@@ -252,3 +252,19 @@ def test_a_document_may_have_more_fields_than_a_16_bit_count_holds():
     hits = c.search([1.0, 0.0, 0.0], top_k=1, filter=zenar.field.f69999 == 69_999)
     assert [h["id"] for h in hits] == [1]
     db.close()
+
+
+def test_a_new_metadata_field_extends_the_schema_and_keeps_its_type():
+    root = tempfile.mkdtemp()
+    db = zenar.VectorDB(root)
+    c = db.create_collection("docs", dimension=3)
+    c.add(id=1, vector=[1.0, 0.0, 0.0], text="a", metadata={"tenant": "A"})
+    c.add(id=2, vector=[1.0, 0.0, 0.0], text="b", metadata={"tenant": "A", "price": 9.5})
+    with pytest.raises(zenar.InvalidMetadataError):
+        c.add(id=3, vector=[1.0, 0.0, 0.0], text="c", metadata={"price": "cheap"})
+    db.close()
+    reopened = zenar.VectorDB(root)
+    c = reopened.get_collection("docs")
+    assert [h["id"] for h in c.search([1.0, 0.0, 0.0], top_k=5, filter=zenar.field.price >= 9)] == [2]
+    assert c.count() == 2
+    reopened.close()
