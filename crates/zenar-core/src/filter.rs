@@ -104,6 +104,13 @@ fn check_value(
     schema: &[(String, FieldKind)],
     ordered: bool,
 ) -> Result<(), ZenarError> {
+    // NaN compares equal to nothing and orders before everything in the index, so `< NaN` would
+    // match every document. A NaN filter value is refused, as NaN metadata already is.
+    if matches!(value, MetaValue::Float(f) if f.is_nan()) {
+        return Err(ZenarError::InvalidFilter(format!(
+            "filter on field {field:?} compares with NaN, which has no order"
+        )));
+    }
     let kind = kind_of(field, schema)?;
     let value_kind = FieldKind::of(value);
     let comparable = value_kind == kind || (kind.is_numeric() && value_kind.is_numeric());

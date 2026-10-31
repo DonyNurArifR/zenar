@@ -5,6 +5,13 @@ project follows [semantic versioning](https://semver.org/) while it is pre-1.0.
 
 ## Unreleased
 
+### Fixed
+- A collection handle can no longer write after its database is closed or its collection is dropped. Such a write
+  looked successful and was lost on reopen. It now raises `CollectionClosedError`.
+- A filter that compares with NaN is refused with `InvalidFilterError`. `field < NaN` used to match every document.
+- A two-dimensional numpy array is refused as a vector. It used to be flattened and accepted.
+- A non-object `scope` names the scope argument in its error, not `where`.
+
 ### Changed
 - TurboVec is 1.1.2 (was 1.0.0). Unfiltered search is about 3x faster at 1M rows. A database written by 1.0.0 opens
   unchanged and gives the same answers.

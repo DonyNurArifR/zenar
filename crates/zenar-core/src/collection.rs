@@ -82,6 +82,9 @@ struct State {
     /// operation then fails until the database is reopened, which replays the
     /// durable state.
     poisoned: Option<String>,
+    /// Set when the database is closed or the collection is dropped. A handle that
+    /// outlives either must not write: the write would look successful and then be lost.
+    closed: bool,
 }
 
 /// A named set of vectors plus their documents and metadata.
@@ -117,6 +120,7 @@ impl Collection {
             catalog,
             durable,
             state: RwLock::new(State {
+                closed: false,
                 store,
                 docs,
                 unsynced: 0,
@@ -652,6 +656,12 @@ impl Collection {
         let Some(value) = scope else {
             return Ok(None);
         };
+        // The scope is parsed by the same code as `where`, so the message must name the argument.
+        if !value.is_object() {
+            return Err(ZenarError::InvalidFilter(
+                "scope must be a JSON object, for example {\"tenant\": \"A\"}".into(),
+            ));
+        }
         let stats = self.cached_stats(state)?;
         let filter = crate::agent::parse(value, state.docs.fields(), &stats)?
             .filter
@@ -776,9 +786,28 @@ impl Collection {
     }
 
     fn read_state(&self) -> Result<RwLockReadGuard<'_, State>, ZenarError> {
-        self.state
+        let guard = self
+            .state
             .read()
-            .map_err(|_| ZenarError::VectorStoreError("collection lock poisoned".into()))
+            .map_err(|_| ZenarError::VectorStoreError("collection lock poisoned".into()))?;
+        self.not_closed(&guard)?;
+        Ok(guard)
+    }
+
+    fn not_closed(&self, state: &State) -> Result<(), ZenarError> {
+        if state.closed {
+            return Err(ZenarError::CollectionClosed(self.name.clone()));
+        }
+        Ok(())
+    }
+
+    /// Marks the collection closed, so that no handle to it can read or write it any more.
+    pub(crate) fn close(&self) {
+        let mut state = match self.state.write() {
+            Ok(state) => state,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        state.closed = true;
     }
 
     fn write_state(&self) -> Result<RwLockWriteGuard<'_, State>, ZenarError> {
@@ -786,6 +815,7 @@ impl Collection {
             .state
             .write()
             .map_err(|_| ZenarError::VectorStoreError("collection lock poisoned".into()))?;
+        self.not_closed(&guard)?;
         // Every mutation takes the write lock first, so clearing here means no reader can store
         // statistics computed before the mutation after it has been cleared.
         if let Ok(mut cache) = self.stats.lock() {
