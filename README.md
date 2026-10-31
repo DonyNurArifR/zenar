@@ -4,7 +4,7 @@ Embedded, lightweight, high-performance vector database for Python — a Rust
 core built on [TurboVec](https://github.com/RyanCodrai/turbovec) for vector
 search and a document log with in-memory indexes for metadata filtering.
 
-**Status: 0.1.0, not yet published.** The core, Python API, persistence and
+**Status: 0.1.2, released on GitHub with wheels attached; not yet on PyPI.** The core, Python API, persistence and
 crash recovery are implemented and tested. At 1M rows, filtered search takes
 0.3 to 3.5 ms against 1.2 ms unfiltered, depending on the filter. The design
 spec makes the filter path a pass/fail gate but sets no numeric threshold, so
@@ -100,11 +100,16 @@ Measured on the reference machine at 1M rows, dim 384 (docs/BENCHMARKS.md):
 Not done:
 
 - **Cross-platform CI** runs on GitHub Actions for Ubuntu, macOS and Windows: Rust tests on Rust 1.89 and stable,
-  Python wheel tests in a fresh venv on all three OS, plus a dependency audit and license check. All green on the
-  current branch. Wheels are built in CI only; no PyPI release yet.
+  Python wheel tests in a fresh venv on all three OS, plus a dependency audit and license check. Each release builds
+  five wheels and an sdist, and smoke-tests them on three OS. The Intel macOS wheel is built but has not been run.
+  No PyPI release yet.
 - **Power-loss behavior** is tested at the process level (`kill -9`) and at the byte level (every cut point in a torn
   record). Real power-loss testing on hardware is not done.
-- **Compound filters** are the slowest case. Merging many postings is not tuned yet (docs/BENCHMARKS.md, known gaps).
+- **Compound filters** cost about 3x an unfiltered search at 1M rows. The rest of that cost is TurboVec's allowlist
+  search, not Zenar's (docs/BENCHMARKS.md).
+- **Open time** grows with the log: 0.45 s at 1M rows. There is no persisted index yet (docs/BENCHMARKS.md, known gaps).
+- **Agent tools** depend on the model. With local models, filters are sometimes sent as text (Zenar decodes them) or
+  drop conditions. Accuracy against hosted models is not measured (docs/API.md, Agent tools).
 
 ## Contributing
 
