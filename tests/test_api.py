@@ -480,6 +480,16 @@ def test_retrieve_with_where_operators_and_counts(db):
     assert r["warnings"] == []
 
 
+def test_retrieve_decodes_a_where_sent_as_a_json_string(db):
+    c = _shop(db)
+    as_object = c.retrieve([1.0] * 8, top_k=10, where={"tenant": "A", "price": {"gte": 10}}, scope=None)
+    as_string = c.retrieve([1.0] * 8, top_k=10, where='{"tenant": "A", "price": {"gte": 10}}', scope=None)
+    assert as_string["hits"] == as_object["hits"]
+    assert as_string["matched"] == as_object["matched"]
+    with pytest.raises(zenar.InvalidFilterError):
+        c.retrieve([1.0] * 8, top_k=10, where='"tenant"', scope=None)
+
+
 def test_retrieve_warns_when_a_value_matches_nothing(db):
     c = _shop(db)
     r = c.retrieve([1.0] * 8, top_k=5, where={"tenant": "Z"}, scope=None)

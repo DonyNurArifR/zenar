@@ -138,7 +138,8 @@ A JSON object. Each key is a field name. A plain value means equality. An object
 
 Operators: `eq`, `ne`, `gt`, `gte`, `lt`, `lte`, `in`, `nin`. Timestamps are RFC 3339 strings. Field names are
 case-sensitive. An empty object matches everything. `and`, `or` and `not` cannot be field names. A `where` larger than
-16 KB is refused.
+16 KB is refused. A `where` sent as a JSON-encoded string is decoded first, so `'{"tenant": "A"}'` works the same as
+`{"tenant": "A"}`; a string that does not decode to an object is refused.
 
 ### Errors that help a model fix the filter
 

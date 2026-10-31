@@ -59,6 +59,18 @@ pub fn parse(
             "where is {size} bytes; the limit is {MAX_WHERE_BYTES}. Use fewer conditions."
         )));
     }
+    // Some models send the object as a JSON-encoded string. Decode it once here; anything that
+    // does not decode to an object is still refused below.
+    let decoded;
+    let where_ = match where_ {
+        Value::String(text) => {
+            decoded = serde_json::from_str::<Value>(text).map_err(|_| {
+                invalid("where must be a JSON object, for example {\"tenant\": \"A\"}")
+            })?;
+            &decoded
+        }
+        other => other,
+    };
     let object = where_
         .as_object()
         .ok_or_else(|| invalid("where must be a JSON object, for example {\"tenant\": \"A\"}"))?;
@@ -728,6 +740,27 @@ mod tests {
         let tenant = &schema["properties"]["tenant"]["anyOf"][0];
         assert_eq!(tenant["enum"], json!(["A", "B"]));
         assert!(schema["properties"]["and"].is_object());
+    }
+
+    #[test]
+    fn where_sent_as_a_json_string_is_decoded() {
+        let encoded = json!("{\"tenant\": \"A\"}");
+        let parsed = parse(&encoded, &schema(), &stats()).unwrap();
+        let direct = parse(&json!({"tenant": "A"}), &schema(), &stats()).unwrap();
+        assert_eq!(parsed.filter, direct.filter);
+    }
+
+    #[test]
+    fn where_string_that_is_not_an_object_is_refused() {
+        for bad in [
+            json!("not json"),
+            json!("[1, 2]"),
+            json!("\"A\""),
+            json!(""),
+        ] {
+            let err = parse(&bad, &schema(), &stats()).unwrap_err().to_string();
+            assert!(err.contains("must be a JSON object"), "{bad}: {err}");
+        }
     }
 
     #[test]
