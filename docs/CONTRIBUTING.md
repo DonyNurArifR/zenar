@@ -32,3 +32,12 @@ The Python binding needs an interpreter (3.10 or newer) at build time. Point PyO
 - Changes that affect performance need a `bench` or `filter_probe` run recorded in BENCHMARKS.md.
 - TurboVec is pinned with `=`. Upgrading it means re-running the Rust and
   Python test suites and the benchmarks.
+
+## Releasing
+
+1. Bump the version in `pyproject.toml`, `python/zenar/__init__.py`, and both `Cargo.toml` manifests, and refresh
+   `Cargo.lock` with `cargo build`. Add the release to `CHANGELOG.md`.
+2. Merge it to `main` with a commit message that does **not** contain `[skip ci]`. GitHub skips every workflow for a
+   push whose head commit has that marker, and a tag push counts. The release workflow then never runs.
+3. Tag the merge commit as `vX.Y.Z` and push the tag. The release workflow builds, smoke-tests, and creates the
+   GitHub release. Publishing to PyPI stays off until the `PYPI_PUBLISH` repository variable is `true`.
