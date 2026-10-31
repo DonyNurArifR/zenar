@@ -87,6 +87,8 @@ Every error inherits from `zenar.ZenarError`:
 `InvalidMetadataError`, `InvalidFilterError`, `InvalidArgumentError`, `DatabaseLockedError`,
 `VectorStoreError`, `MetadataStoreError`, `PersistenceError`, `RecoveryError`.
 
+`DimensionMismatchError` means a vector's length differs from the collection's dimension. A dimension argument that is out of range (zero, or above the limit) raises `InvalidArgumentError`.
+
 Catch `ZenarError` to handle any library error.
 
 ## Agent tools

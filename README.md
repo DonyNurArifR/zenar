@@ -78,7 +78,7 @@ Measurements: [docs/BENCHMARKS.md](docs/BENCHMARKS.md).
 
 Implemented and tested (Rust: 58 unit and 27 integration tests, including a reference-checked three-valued filter
 oracle, a model-based test with reopens, a random-filter fuzz test, a concurrent read/write test, and a test that cuts
-or flips every byte of the last log record; Python: 60 tests, including repeated `kill -9` crash cycles):
+or flips every byte of the last log record; Python: 79 tests, including repeated `kill -9` crash cycles):
 
 - Collections, add, add_many (atomic), delete, delete_many (atomic), get, search, with the query planner and stale-ID handling.
 - Typed metadata, the full filter operator set, NULL and type rules, tenant isolation.
