@@ -1325,6 +1325,57 @@ mod tests {
         fs::remove_dir_all(path.parent().unwrap()).ok();
     }
 
+    /// A crash can leave the last record cut at any byte. For every cut point, and for every
+    /// single-byte corruption inside that record, reopening must succeed and must show either
+    /// the earlier records alone or all records. It must never show a partial record.
+    #[test]
+    fn every_cut_and_flip_in_the_last_record_recovers_cleanly() {
+        let path = temp_log("every-cut");
+        let before;
+        {
+            let mut store = DocStore::create(&path, schema()).unwrap();
+            put(&mut store, &[(1, "kept", vec![]), (2, "also kept", vec![])]);
+            before = fs::metadata(&path).unwrap().len();
+            put(&mut store, &[(3, "the last record", vec![])]);
+        }
+        let full = fs::read(&path).unwrap();
+        let scratch = path.with_file_name("scratch.log");
+
+        let mut check = |bytes: &[u8], what: String| {
+            fs::write(&scratch, bytes).unwrap();
+            let store = DocStore::open(&scratch, schema())
+                .unwrap_or_else(|e| panic!("{what}: open failed: {e}"));
+            let last = store.fetch(&[3]).unwrap().len();
+            assert_eq!(
+                store.live_count(),
+                2 + last,
+                "{what}: partial record visible"
+            );
+            assert_eq!(
+                store.fetch(&[1]).unwrap().len(),
+                1,
+                "{what}: earlier record lost"
+            );
+            assert_eq!(
+                store.fetch(&[2]).unwrap().len(),
+                1,
+                "{what}: earlier record lost"
+            );
+            drop(store);
+            fs::remove_file(&scratch).ok();
+        };
+
+        for cut in before as usize..full.len() {
+            check(&full[..cut], format!("cut at byte {cut}"));
+        }
+        for at in before as usize..full.len() {
+            let mut flipped = full.clone();
+            flipped[at] ^= 0xFF;
+            check(&flipped, format!("flip at byte {at}"));
+        }
+        fs::remove_dir_all(path.parent().unwrap()).ok();
+    }
+
     #[test]
     fn zero_filled_tail_is_treated_as_torn() {
         let path = temp_log("zeros");
