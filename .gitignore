@@ -26,6 +26,7 @@ venv/
 # Markdown — ignore all except the public project docs
 *.md
 !README.md
+!CHANGELOG.md
 !CODE_OF_CONDUCT.md
 !SECURITY.md
 !docs/*.md
