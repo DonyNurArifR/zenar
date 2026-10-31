@@ -23,6 +23,12 @@ manifest-path = "crates/zenar-python/Cargo.toml"
 module-name = "zenar._zenar"
 python-source = "python"
 features = ["extension-module"]
+# The source distribution must carry the license texts and the third-party notices.
+include = [
+    { path = "LICENSE-MIT", format = "sdist" },
+    { path = "LICENSE-APACHE", format = "sdist" },
+    { path = "THIRD_PARTY_NOTICES", format = "sdist" },
+]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
