@@ -283,7 +283,7 @@ fn py_usize(value: &Bound<'_, PyAny>, what: &str) -> PyResult<usize> {
 // ----- filter expressions (spec sections 9, 10) ------------------------------
 
 /// A compiled filter. Built from `field` comparisons, kwargs, or `&`, `|`, `~`.
-#[pyclass(name = "Filter", module = "zenar._zenar", frozen, skip_from_py_object)]
+#[pyclass(name = "Filter", module = "zenar._zenar", frozen)]
 #[derive(Clone)]
 pub struct PyFilter {
     inner: Filter,
