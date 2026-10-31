@@ -34,7 +34,6 @@ __all__ = [
     "MetadataStoreError",
     "PersistenceError",
     "RecoveryError",
-    "_panic_for_test",
 ]
 
 class ZenarError(Exception): ...
@@ -142,4 +141,3 @@ class VectorDB:
         self, _exc_type: object = None, _exc: object = None, _tb: object = None
     ) -> Literal[False]: ...
 
-def _panic_for_test() -> None: ...
