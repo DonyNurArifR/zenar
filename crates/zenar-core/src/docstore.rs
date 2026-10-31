@@ -158,8 +158,6 @@ struct FieldIndex {
     codes: Vec<(u32, u32)>,
     /// Codes handed out so far. Codes are never reused, so this bounds every code.
     code_count: u32,
-    /// Rows where the field is present, ascending. Dead rows are filtered out when read.
-    present: Vec<u32>,
 }
 
 impl FieldIndex {
@@ -169,7 +167,6 @@ impl FieldIndex {
             values: BTreeMap::new(),
             codes: Vec::new(),
             code_count: 0,
-            present: Vec::new(),
         }
     }
 }
@@ -470,7 +467,6 @@ impl DocStore {
                 index.code_count += 1;
             }
             index.codes.push((row, code));
-            index.present.push(row);
         }
     }
 
@@ -717,12 +713,13 @@ impl DocStore {
         Ok((fi, self.fields[fi].1))
     }
 
-    /// Rows where field `fi` is present and live.
+    /// Rows where field `fi` is present and live. The codes list holds exactly the rows that have the
+    /// field, in row order, so it doubles as the presence list.
     fn present_live(&self, fi: usize) -> Vec<u32> {
         self.index[fi]
-            .present
+            .codes
             .iter()
-            .copied()
+            .map(|&(row, _)| row)
             .filter(|&r| self.is_live(r))
             .collect()
     }
