@@ -44,3 +44,15 @@ with VectorDB("./my_vectors") as db:
 - [Storage and recovery](STORAGE.md): what survives a crash, and what does not.
 - [Benchmarks](BENCHMARKS.md): measured numbers at 10K, 100K and 1M rows.
 - [Contributing](CONTRIBUTING.md): setup, tests and the rules for changes.
+
+```{toctree}
+:maxdepth: 1
+:hidden:
+
+API
+FILTERING
+STORAGE
+ARCHITECTURE
+BENCHMARKS
+CONTRIBUTING
+```
