@@ -74,9 +74,9 @@ Measurements: [BENCHMARKS.md](BENCHMARKS.md).
 
 ## Project Status
 
-Implemented and tested (Rust: 55 unit and 27 integration tests, including a reference-checked three-valued filter
-oracle, a model-based test with reopens, a random-filter fuzz test and a concurrent read/write test; Python: 59 tests,
-including repeated `kill -9` crash cycles):
+Implemented and tested (Rust: 58 unit and 27 integration tests, including a reference-checked three-valued filter
+oracle, a model-based test with reopens, a random-filter fuzz test, a concurrent read/write test, and a test that cuts
+or flips every byte of the last log record; Python: 60 tests, including repeated `kill -9` crash cycles):
 
 - Collections, add, add_many (atomic), delete, delete_many (atomic), get, search, with the query planner and stale-ID handling.
 - Typed metadata, the full filter operator set, NULL and type rules, tenant isolation.
@@ -99,7 +99,8 @@ Not done:
 - **Cross-platform CI** runs on GitHub Actions for Ubuntu, macOS and Windows: Rust tests on Rust 1.89 and stable,
   Python wheel tests in a fresh venv on all three OS, plus a dependency audit and license check. All green on the
   current branch. Wheels are built in CI only; no PyPI release yet.
-- **Power-loss behavior** is designed and tested only at the process level (`kill -9`). Real power-loss testing is not done.
+- **Power-loss behavior** is tested at the process level (`kill -9`) and at the byte level (every cut point in a torn
+  record). Real power-loss testing on hardware is not done.
 - **Compound filters** are the slowest case. Merging many postings is not tuned yet (BENCHMARKS.md, known gaps).
 
 ## Contributing
