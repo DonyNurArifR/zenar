@@ -1,0 +1,33 @@
+name: Bug report
+description: Something does not work the way the docs say.
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: "Thanks for the report. Please do not include secrets or private data in the example."
+  - type: input
+    id: version
+    attributes:
+      label: Zenar version
+      placeholder: "0.1.0"
+    validations:
+      required: true
+  - type: input
+    id: platform
+    attributes:
+      label: Platform and Python version
+      placeholder: "macOS 15, Python 3.12"
+    validations:
+      required: true
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened, and what did you expect?
+    validations:
+      required: true
+  - type: textarea
+    id: repro
+    attributes:
+      label: Minimal reproduction
+      description: The smallest code that shows the problem.
+      render: python
