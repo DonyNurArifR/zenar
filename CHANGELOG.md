@@ -3,7 +3,27 @@
 All notable changes to Zenar. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the
 project follows [semantic versioning](https://semver.org/) while it is pre-1.0.
 
-## Unreleased
+## 0.2.0
+
+First release since 0.1.1. It changes the on-disk format, so databases written by 0.1.x cannot be opened and must
+be recreated. Breaking changes are listed first.
+
+### Breaking
+- Database files have new names: `docs/<name>.zdocs` and `vectors/<name>.zvec`. The catalog format is version 3.
+  Databases from earlier releases are refused with a message that says so.
+- A collection handle raises `CollectionClosedError` after its database is closed or its collection is dropped.
+  It used to write, and the write was lost on reopen.
+- A metadata value of `None` is an absent field, not an error.
+- `top_k` is no longer capped at 1000.
+
+### Highlights
+- Metadata fields are unlimited, and a new field name extends the schema.
+- Unfiltered search is about 3x faster, with TurboVec 1.1.2.
+- Field codes are stored only for rows that have the field, so wide schemas use far less memory.
+- Batches write the catalog once, not per sync.
+- Agent tool schemas are checked against the parser, and nested filters are typed.
+
+Release 0.1.2 was tagged but never released; its changes are included here.
 
 ### Changed
 - Database files have Zenar's own extensions, so they are not mistaken for logs: `docs/<name>.zdocs` (document store)
@@ -42,7 +62,7 @@ project follows [semantic versioning](https://semver.org/) while it is pre-1.0.
 
 ## 0.1.2
 
-Tagged. The release workflow has not run for this tag, so there is no GitHub release yet.
+Tagged only. Never released; see 0.2.0.
 
 ### Fixed
 - A database whose document log or vector index was emptied, deleted or truncated outside Zenar now fails to open
