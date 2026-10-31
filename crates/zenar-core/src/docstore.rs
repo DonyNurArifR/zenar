@@ -758,8 +758,8 @@ impl DocStore {
             }
             let mut header = [0u8; FRAME_HEADER];
             reader.read_exact(&mut header).map_err(io_err)?;
-            let len = u32::from_le_bytes(header[0..4].try_into().unwrap()) as u64;
-            let crc = u32::from_le_bytes(header[4..8].try_into().unwrap());
+            let len = u32::from_le_bytes([header[0], header[1], header[2], header[3]]) as u64;
+            let crc = u32::from_le_bytes([header[4], header[5], header[6], header[7]]);
             if header == [0u8; FRAME_HEADER] {
                 // A zero header is never a record. It is a torn tail if only zeros follow.
                 return self.zeros_or_corrupt(&mut reader, pos, file_len);
@@ -1079,27 +1079,33 @@ impl<'a> Reader<'a> {
         self.pos += n;
         Ok(out)
     }
+    fn array<const N: usize>(&mut self) -> Result<[u8; N], ZenarError> {
+        <[u8; N]>::try_from(self.bytes(N)?)
+            .map_err(|_| ZenarError::RecoveryError("record is truncated".into()))
+    }
     fn u8(&mut self) -> Result<u8, ZenarError> {
-        Ok(self.bytes(1)?[0])
+        Ok(self.array::<1>()?[0])
     }
     fn u16(&mut self) -> Result<u16, ZenarError> {
-        Ok(u16::from_le_bytes(self.bytes(2)?.try_into().unwrap()))
+        Ok(u16::from_le_bytes(self.array()?))
     }
     fn u32(&mut self) -> Result<u32, ZenarError> {
-        Ok(u32::from_le_bytes(self.bytes(4)?.try_into().unwrap()))
+        Ok(u32::from_le_bytes(self.array()?))
     }
     fn u64(&mut self) -> Result<u64, ZenarError> {
-        Ok(u64::from_le_bytes(self.bytes(8)?.try_into().unwrap()))
+        Ok(u64::from_le_bytes(self.array()?))
     }
     fn i64(&mut self) -> Result<i64, ZenarError> {
-        Ok(i64::from_le_bytes(self.bytes(8)?.try_into().unwrap()))
+        Ok(i64::from_le_bytes(self.array()?))
     }
 }
 
 fn read_u64(buf: &[u8], at: usize) -> Result<u64, ZenarError> {
-    buf.get(at..at + 8)
-        .map(|b| u64::from_le_bytes(b.try_into().unwrap()))
-        .ok_or_else(|| ZenarError::RecoveryError("tombstone is truncated".into()))
+    let truncated = || ZenarError::RecoveryError("tombstone is truncated".into());
+    let end = at.checked_add(8).ok_or_else(truncated)?;
+    let bytes =
+        <[u8; 8]>::try_from(buf.get(at..end).ok_or_else(truncated)?).map_err(|_| truncated())?;
+    Ok(u64::from_le_bytes(bytes))
 }
 
 fn push_frame(buf: &mut Vec<u8>, payload: &[u8]) {
@@ -1341,7 +1347,7 @@ mod tests {
         let full = fs::read(&path).unwrap();
         let scratch = path.with_file_name("scratch.log");
 
-        let mut check = |bytes: &[u8], what: String| {
+        let check = |bytes: &[u8], what: String| {
             fs::write(&scratch, bytes).unwrap();
             let store = DocStore::open(&scratch, schema())
                 .unwrap_or_else(|e| panic!("{what}: open failed: {e}"));

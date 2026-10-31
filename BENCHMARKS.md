@@ -77,11 +77,32 @@ Open time is the replay of the log into the in-memory indexes. It grows linearly
 - The gate in the design spec (section 90) asks that the metadata step not dominate filtered search at 1M rows. Selective
   filters pass it. Broad and compound filters pass it at 10%, and compound filters are the remaining case.
 
+### Memory, 1M rows, dim 384
+
+Measured with `/usr/bin/time -l` around the `bench` example (ingest, then all searches, same process). Peak resident
+set size was 418 MB. The vectors are 4-bit TurboVec codes, about 192 MB at this size (1M × 384 × 4 bits). The rest is
+the document log index, the in-memory field indexes and the per-row bookkeeping. Raw float32 vectors would need about
+1.5 GB for the same rows. The breakdown of the remainder has not been measured by component.
+
+### Document store, filter steps only (`filter_profile`, 1M rows, document store alone)
+
+| Step | Time | Matches |
+|---|---|---|
+| `tenant = A` | 0.29 ms | 100,000 |
+| `category IN (faq, product)` | 1.17 ms | 400,000 |
+| `price >= 100` | 2.86 ms | 900,000 |
+| Compound (all three) | 3.88 ms | 90,000 |
+
+The compound filter's 3.9 ms is about half of its 7.5 ms end-to-end cost in `bench`. The other ~3.6 ms (vector search
+over the candidates, and result assembly) is not broken down further.
+
 ### Known gaps
 
-- Compound filters are not tuned. The merge of many postings sorts the matches. A k-way merge would be cheaper.
+- Compound filters: the document-store step is about half of the end-to-end cost. A k-way merge would help only that
+  half. Breaking down the other half is the next measurement.
 - Open time for large logs is linear. A persisted index would avoid the replay. It would also need its own recovery.
-- Memory is not measured here. The indexes hold one list entry per (row, field) and one entry per distinct value.
+- The per-component memory breakdown is not measured. The indexes hold one list entry per (row, field) and one entry per
+  distinct value.
 
 ## History
 
