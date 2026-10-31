@@ -1,0 +1,22 @@
+{
+  "version": 1,
+  "collections": [
+    {
+      "name": "docs",
+      "dimension": 16,
+      "bit_width": 4,
+      "fields": [
+        [
+          "tenant",
+          "text"
+        ],
+        [
+          "price",
+          "float"
+        ]
+      ],
+      "durable_log_len": 18021,
+      "durable_vectors": 257
+    }
+  ]
+}
