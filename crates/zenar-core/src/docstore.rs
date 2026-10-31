@@ -266,6 +266,11 @@ impl DocStore {
         &self.fields
     }
 
+    /// Length of the log file in bytes, as written. Used to record how far it is synced.
+    pub fn log_len(&self) -> u64 {
+        self.len
+    }
+
     pub fn live_count(&self) -> usize {
         self.live
     }

@@ -276,6 +276,7 @@ impl Collection {
         }
         // From here on the in-memory state is ahead of the durable state until the delete is
         // logged and synced. Any failure poisons the collection, since it cannot be undone safely.
+        self.clear_recorded_lengths()?;
         if !state.store.remove(id) {
             return Err(ZenarError::VectorNotFound(id));
         }
@@ -297,6 +298,9 @@ impl Collection {
             if let Err(e) = state.docs.compact() {
                 return Err(poison(&mut state, e));
             }
+        }
+        if let Err(e) = self.record_durable(&state) {
+            return Err(poison(&mut state, e));
         }
         Ok(())
     }
@@ -321,6 +325,7 @@ impl Collection {
             }
         }
         // From here, see `delete`: any failure poisons the collection.
+        self.clear_recorded_lengths()?;
         for &id in ids {
             state.store.remove(id);
         }
@@ -339,6 +344,9 @@ impl Collection {
         if state.docs.should_compact()
             && let Err(e) = state.docs.compact()
         {
+            return Err(poison(&mut state, e));
+        }
+        if let Err(e) = self.record_durable(&state) {
             return Err(poison(&mut state, e));
         }
         Ok(ids.len())
@@ -735,8 +743,31 @@ impl Collection {
     fn sync_both(&self, state: &mut State) -> Result<(), ZenarError> {
         state.store.sync(&self.index_path)?;
         state.docs.sync()?;
+        self.record_durable(state)?;
         state.unsynced = 0;
         Ok(())
+    }
+
+    /// Clears the recorded lengths before a delete. A delete can shrink the vector index (synced
+    /// before the delete is logged) and the log (when compaction runs). A crash in between would
+    /// leave recorded values larger than the files. Zero is always safe: it disables the
+    /// shortened-file check until the next record.
+    fn clear_recorded_lengths(&self) -> Result<(), ZenarError> {
+        self.catalog.update(&self.name, |entry| {
+            entry.durable_log_len = 0;
+            entry.durable_vectors = 0;
+        })
+    }
+
+    /// Records how far the log and the vector index are synced. Call it right after a successful
+    /// sync, and after compaction, since both change what is durable.
+    fn record_durable(&self, state: &State) -> Result<(), ZenarError> {
+        let log_len = state.docs.log_len();
+        let vectors = state.store.len();
+        self.catalog.update(&self.name, |entry| {
+            entry.durable_log_len = log_len;
+            entry.durable_vectors = vectors;
+        })
     }
 
     /// Undoes a batch that failed before it became visible: removes its vectors from memory,
