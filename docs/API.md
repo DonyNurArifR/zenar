@@ -34,7 +34,7 @@ with VectorDB("./data") as db:                       # flushes and releases the 
 | `delete(id)` | Removes the vector from the index and syncs before returning. Raises `VectorNotFoundError` if absent. |
 | `delete_many(ids)` | Deletes many ids atomically with one index sync and one log sync: all of them are deleted, or none is. Use this for bulk deletes. |
 | `search(vector, top_k=10, filter=None, **equality)` | Returns `[{id, score, text, metadata}]`, best first. |
-| `count()`, `stats()`, `dimension`, `bit_width` | |
+| `name`, `count()`, `stats()`, `dimension`, `bit_width` | `name` is the collection's name. |
 | `calibrate(sample)` | Fits the quantizer from a flat sample of `n * dimension` floats. See below. |
 
 `vector` may be a list of floats or a numpy array (float32 or float64).
