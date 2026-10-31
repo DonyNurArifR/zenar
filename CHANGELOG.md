@@ -6,6 +6,9 @@ project follows [semantic versioning](https://semver.org/) while it is pre-1.0.
 ## Unreleased
 
 ### Changed
+- The catalog format is version 2. Version 2 also marks the record format with 32-bit field counts. A database from an
+  earlier release is refused with a message that says so, instead of being misread. No database has been released to
+  PyPI. Releases 0.1.1 and 0.1.2 on GitHub wrote version 1, and they cannot be read by this version.
 - A metadata field name the schema lacks extends the schema, with the type of its first value. Before, it was
   rejected after the first insert. A field keeps its type; a value of another type is still rejected.
 - `VectorDB()` with no path uses `./zenar`, created if missing. An explicit path is used as given.

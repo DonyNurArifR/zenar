@@ -4,7 +4,7 @@
 
 ```text
 <root>/LOCK                  advisory lock, held while the database is open
-<root>/catalog.json          collections: dimension, bit width, metadata schema
+<root>/catalog.json          format version, collections: dimension, bit width, metadata schema
 <root>/docs/<name>.log       document log: text and metadata, append-only
 <root>/vectors/<name>.tvim   TurboVec index for each collection
 ```

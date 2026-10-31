@@ -1,5 +1,6 @@
 """Bad inputs get a named error, and concurrent use keeps the collection consistent."""
 
+import json
 import math
 import pathlib
 import random
@@ -280,3 +281,16 @@ def test_numpy_scalars_and_none_are_metadata_values():
     hits = c.search([1.0, 0.0, 0.0], top_k=5, filter=zenar.field.n == np.int64(7))
     assert [h["id"] for h in hits] == [1]
     db.close()
+
+
+def test_a_database_with_an_older_catalog_version_is_refused_with_a_clear_message():
+    root = tempfile.mkdtemp()
+    db = zenar.VectorDB(root)
+    db.create_collection("docs", dimension=3)
+    db.close()
+    catalog = pathlib.Path(root, "catalog.json")
+    data = json.loads(catalog.read_text())
+    data["version"] = 1
+    catalog.write_text(json.dumps(data))
+    with pytest.raises(zenar.RecoveryError, match="Databases written by earlier releases cannot be read"):
+        zenar.VectorDB(root)
