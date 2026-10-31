@@ -1,0 +1,8 @@
+# Known, deliberate differences between python/zenar/_zenar.pyi and the compiled module.
+# Type aliases exist only for type checkers, so they are not present at runtime.
+zenar._zenar.Vector
+zenar._zenar.Metadata
+zenar._zenar.Hit
+zenar._zenar.Document
+# __getattr__ is defined in Rust (tp_getattro), so it does not appear on the class at runtime.
+zenar._zenar.FieldNamespace.__getattr__

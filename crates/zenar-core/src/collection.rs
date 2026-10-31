@@ -1,9 +1,9 @@
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
-use std::sync::{Arc, RwLock, RwLockReadGuard, RwLockWriteGuard};
+use std::sync::{Arc, Mutex, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 use crate::catalog::Catalog;
-use crate::docstore::{DocRef, DocStore, DocumentRow};
+use crate::docstore::{DocRef, DocStore, DocumentRow, FieldStats};
 use crate::error::ZenarError;
 use crate::filter::{Filter, validate};
 use crate::names::is_valid_field_name;
@@ -12,6 +12,19 @@ use crate::value::{FieldKind, MetaValue};
 
 /// Largest id the store accepts. Ids are stored as i64 in the index files.
 pub const MAX_ID: u64 = i64::MAX as u64;
+
+/// Scopes whose statistics are kept between calls.
+const SCOPE_CACHE_ENTRIES: usize = 16;
+
+/// Largest `top_k` a model may request. Larger values cost more than a tool call should.
+pub const MAX_TOP_K: usize = 1000;
+
+/// Statistics for one scope, as cached by `Collection::stats_for_scope`.
+struct ScopedEntry {
+    key: String,
+    stats: Arc<Vec<FieldStats>>,
+    documents: usize,
+}
 
 /// Adds between index syncs (spec section 86). Syncing on every add made ingest quadratic.
 /// Adds since the last sync can be lost on a crash. Recovery removes their documents or
@@ -25,6 +38,18 @@ pub struct Hit {
     pub score: f32,
     pub text: String,
     pub metadata: Vec<(String, MetaValue)>,
+}
+
+/// Result of `Collection::retrieve`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Retrieval {
+    pub hits: Vec<Hit>,
+    /// The model's filter in plain language, or "no filter". Lets the model check what was applied.
+    pub applied: String,
+    /// Documents that matched the filter, before `top_k` cut the list.
+    pub matched: usize,
+    /// Notes for the caller, such as a value no document has.
+    pub warnings: Vec<String>,
 }
 
 /// One document for `Collection::add_many`.
@@ -67,6 +92,10 @@ struct State {
 /// Writes are serialized behind one lock. Reads run concurrently with each other.
 pub struct Collection {
     name: String,
+    /// Field statistics for discovery. Cleared by every write, see `write_state`.
+    stats: Mutex<Option<Arc<Vec<FieldStats>>>>,
+    /// Statistics for scoped calls, keyed by the scope, most recent last. Cleared by every write.
+    scoped: Mutex<Vec<ScopedEntry>>,
     index_path: PathBuf,
     catalog: Arc<Catalog>,
     /// Sync the document log on every commit, not only at sync boundaries.
@@ -85,6 +114,8 @@ impl Collection {
     ) -> Self {
         Self {
             name: name.to_string(),
+            stats: Mutex::new(None),
+            scoped: Mutex::new(Vec::new()),
             index_path,
             catalog,
             durable,
@@ -364,6 +395,17 @@ impl Collection {
         top_k: usize,
         filter: Option<&Filter>,
     ) -> Result<Vec<Hit>, ZenarError> {
+        Ok(self.search_counted(query, top_k, filter)?.0)
+    }
+
+    /// Like `search`, and also returns how many documents matched the filter before `top_k`
+    /// cut the list. A caller can tell "no match" apart from "more matches than requested".
+    pub fn search_counted(
+        &self,
+        query: &[f32],
+        top_k: usize,
+        filter: Option<&Filter>,
+    ) -> Result<(Vec<Hit>, usize), ZenarError> {
         if top_k == 0 {
             return Err(ZenarError::InvalidArgument(
                 "top_k must be greater than 0".into(),
@@ -372,17 +414,19 @@ impl Collection {
         let state = self.read_state()?;
         healthy(&state)?;
         if state.store.dim().is_none() {
-            return Ok(Vec::new());
+            return Ok((Vec::new(), 0));
         }
         validate_vector(query, state.store.dim())?;
 
-        let (scores, ids) = match filter {
+        let (scores, ids, matched) = match filter {
             None => {
+                let matched = state.docs.live_count();
                 if state.store.is_empty() {
-                    return Ok(Vec::new());
+                    return Ok((Vec::new(), 0));
                 }
                 let k = top_k.min(state.store.len());
-                state.store.search(query, k, None)?
+                let (scores, ids) = state.store.search(query, k, None)?;
+                (scores, ids, matched)
             }
             Some(filter) => {
                 validate(filter, state.docs.fields())?;
@@ -391,15 +435,17 @@ impl Collection {
                     .into_iter()
                     .filter(|id| state.store.contains(*id))
                     .collect();
+                let matched = live.len();
                 if live.is_empty() {
-                    return Ok(Vec::new());
+                    return Ok((Vec::new(), 0));
                 }
                 let k = top_k.min(live.len());
-                state.store.search(query, k, Some(&live))?
+                let (scores, ids) = state.store.search(query, k, Some(&live))?;
+                (scores, ids, matched)
             }
         };
         if ids.is_empty() {
-            return Ok(Vec::new());
+            return Ok((Vec::new(), matched));
         }
         let mut docs: HashMap<u64, DocumentRow> = state
             .docs
@@ -407,7 +453,7 @@ impl Collection {
             .into_iter()
             .map(|d| (d.id, d))
             .collect();
-        Ok(ids
+        let hits = ids
             .into_iter()
             .zip(scores)
             .filter_map(|(id, score)| {
@@ -418,7 +464,200 @@ impl Collection {
                     metadata: doc.metadata,
                 })
             })
+            .collect();
+        Ok((hits, matched))
+    }
+
+    /// Discovery: every field with its type, the documents that carry it, and its values with
+    /// counts. `scope` limits both the documents counted and the values listed. `None` means
+    /// the whole collection, and should only be used by trusted code.
+    pub fn describe(
+        &self,
+        scope: Option<&serde_json::Value>,
+    ) -> Result<serde_json::Value, ZenarError> {
+        let state = self.read_state()?;
+        healthy(&state)?;
+        let (fields, documents) = self.stats_for_scope(&state, scope)?;
+        let fields: Vec<serde_json::Value> = fields
+            .iter()
+            .map(|stat| crate::agent::field_json(stat, documents))
+            .collect();
+        Ok(serde_json::json!({
+            "name": self.name,
+            "dimension": state.store.dim(),
+            "bit_width": state.store.bit_width(),
+            "documents": documents,
+            "fields": fields,
+        }))
+    }
+
+    /// Finds values of one field that contain `text` (case-insensitive), most frequent first,
+    /// within `scope`. For fields with many distinct values, where listing them is not useful.
+    pub fn find_values(
+        &self,
+        field: &str,
+        text: &str,
+        limit: usize,
+        scope: Option<&serde_json::Value>,
+    ) -> Result<Vec<serde_json::Value>, ZenarError> {
+        let state = self.read_state()?;
+        healthy(&state)?;
+        let (stats, _) = self.stats_for_scope(&state, scope)?;
+        let stat = stats.iter().find(|s| s.name == field).ok_or_else(|| {
+            let names: Vec<&str> = stats.iter().map(|s| s.name.as_str()).collect();
+            ZenarError::InvalidFilter(format!(
+                "unknown field {field:?}; filterable fields: {}",
+                names.join(", ")
+            ))
+        })?;
+        let needle = text.to_lowercase();
+        Ok(stat
+            .values
+            .iter()
+            .filter(|(value, _)| crate::agent::value_text(value).to_lowercase().contains(&needle))
+            .take(limit)
+            .map(|(value, count)| {
+                serde_json::json!({"value": crate::agent::value_json(value), "count": count})
+            })
             .collect())
+    }
+
+    /// Retrieval for an agent.
+    ///
+    /// `where_` is the model's filter. `scope` is the caller's fixed filter, such as the tenant.
+    /// The two are ANDed on the server, so the model cannot widen the scope with `or` or `not`.
+    /// Returns the hits, how many documents matched before `top_k`, and warnings about the model's
+    /// values. Warnings about `scope` are not reported.
+    pub fn retrieve(
+        &self,
+        query: &[f32],
+        top_k: usize,
+        where_: Option<&serde_json::Value>,
+        scope: Option<&serde_json::Value>,
+    ) -> Result<Retrieval, ZenarError> {
+        if top_k > MAX_TOP_K {
+            return Err(ZenarError::InvalidArgument(format!(
+                "top_k is {top_k}; the limit for retrieve is {MAX_TOP_K}"
+            )));
+        }
+        let (where_filter, scope_filter, warnings) = {
+            // One read lock for parsing. It is released before the search takes its own.
+            let state = self.read_state()?;
+            healthy(&state)?;
+            let fields = state.docs.fields();
+            // The model's values and the warnings about them must come from inside the scope, or a
+            // warning could name another tenant's values. Statistics are only needed for the model's
+            // `where`, so they are computed only then.
+            let (where_filter, warnings) = match where_ {
+                None => (None, Vec::new()),
+                Some(value) => {
+                    let (stats, _) = self.stats_for_scope(&state, scope)?;
+                    let parsed = crate::agent::parse(value, fields, &stats)?;
+                    (parsed.filter, parsed.warnings)
+                }
+            };
+            // The scope's own warnings are not reported, so its statistics are not needed.
+            let scope_filter = match scope {
+                None => None,
+                Some(value) => crate::agent::parse(value, fields, &[])?.filter,
+            };
+            (where_filter, scope_filter, warnings)
+        };
+        let applied = match &where_filter {
+            Some(f) => crate::agent::describe_filter(f),
+            None => "no filter (all documents in scope)".to_string(),
+        };
+        let filter = match (scope_filter, where_filter) {
+            (None, None) => None,
+            (Some(scope), None) => Some(scope),
+            (None, Some(model)) => Some(model),
+            (Some(scope), Some(model)) => Some(Filter::And(vec![scope, model])),
+        };
+        let (hits, matched) = self.search_counted(query, top_k, filter.as_ref())?;
+        Ok(Retrieval {
+            hits,
+            applied,
+            matched,
+            warnings,
+        })
+    }
+
+    /// Fields and their values as plain text, for a prompt, within `scope`.
+    pub fn fields_prompt(&self, scope: Option<&serde_json::Value>) -> Result<String, ZenarError> {
+        let state = self.read_state()?;
+        healthy(&state)?;
+        let (stats, _) = self.stats_for_scope(&state, scope)?;
+        Ok(crate::agent::fields_prompt(&stats))
+    }
+
+    /// Tool definition for this collection, within `scope` (see `agent::tool_spec`).
+    pub fn tool_spec(
+        &self,
+        tool_name: &str,
+        scope: Option<&serde_json::Value>,
+    ) -> Result<serde_json::Value, ZenarError> {
+        let state = self.read_state()?;
+        healthy(&state)?;
+        let (stats, documents) = self.stats_for_scope(&state, scope)?;
+        Ok(crate::agent::tool_spec(
+            tool_name, &self.name, documents, &stats,
+        ))
+    }
+
+    /// Statistics and document count for a scope. `None` is the whole collection. A scope is
+    /// computed once and reused until the next write, since discovery repeats the same scope.
+    fn stats_for_scope(
+        &self,
+        state: &State,
+        scope: Option<&serde_json::Value>,
+    ) -> Result<(Arc<Vec<FieldStats>>, usize), ZenarError> {
+        let Some(value) = scope else {
+            return Ok((self.cached_stats(state)?, state.docs.live_count()));
+        };
+        let key = value.to_string();
+        {
+            let scoped = self
+                .scoped
+                .lock()
+                .map_err(|_| ZenarError::VectorStoreError("scope cache poisoned".into()))?;
+            if let Some(entry) = scoped.iter().find(|e| e.key == key) {
+                return Ok((Arc::clone(&entry.stats), entry.documents));
+            }
+        }
+        let rows = self.scope_rows(state, Some(value))?.unwrap_or_default();
+        let stats = Arc::new(state.docs.field_stats_in(&rows));
+        let documents = rows.len();
+        let mut scoped = self
+            .scoped
+            .lock()
+            .map_err(|_| ZenarError::VectorStoreError("scope cache poisoned".into()))?;
+        if scoped.len() >= SCOPE_CACHE_ENTRIES {
+            scoped.remove(0);
+        }
+        scoped.push(ScopedEntry {
+            key,
+            stats: Arc::clone(&stats),
+            documents,
+        });
+        Ok((stats, documents))
+    }
+
+    /// The live rows that `scope` allows. `None` for no scope, meaning the whole collection.
+    /// An empty scope object allows every live document.
+    fn scope_rows(
+        &self,
+        state: &State,
+        scope: Option<&serde_json::Value>,
+    ) -> Result<Option<Vec<u32>>, ZenarError> {
+        let Some(value) = scope else {
+            return Ok(None);
+        };
+        let stats = self.cached_stats(state)?;
+        let filter = crate::agent::parse(value, state.docs.fields(), &stats)?
+            .filter
+            .unwrap_or(Filter::And(Vec::new()));
+        validate(&filter, state.docs.fields())?;
+        Ok(Some(state.docs.matching_rows(&filter)?))
     }
 
     /// Reconciles the document log and the vector index after a restart (spec section 26).
@@ -520,9 +759,33 @@ impl Collection {
     }
 
     fn write_state(&self) -> Result<RwLockWriteGuard<'_, State>, ZenarError> {
-        self.state
+        let guard = self
+            .state
             .write()
-            .map_err(|_| ZenarError::VectorStoreError("collection lock poisoned".into()))
+            .map_err(|_| ZenarError::VectorStoreError("collection lock poisoned".into()))?;
+        // Every mutation takes the write lock first, so clearing here means no reader can store
+        // statistics computed before the mutation after it has been cleared.
+        if let Ok(mut cache) = self.stats.lock() {
+            *cache = None;
+        }
+        if let Ok(mut scoped) = self.scoped.lock() {
+            scoped.clear();
+        }
+        Ok(guard)
+    }
+
+    /// Field statistics, cached until the next write.
+    fn cached_stats(&self, state: &State) -> Result<Arc<Vec<FieldStats>>, ZenarError> {
+        let mut cache = self
+            .stats
+            .lock()
+            .map_err(|_| ZenarError::VectorStoreError("stats cache poisoned".into()))?;
+        if let Some(stats) = cache.as_ref() {
+            return Ok(Arc::clone(stats));
+        }
+        let stats = Arc::new(state.docs.field_stats());
+        *cache = Some(Arc::clone(&stats));
+        Ok(stats)
     }
 }
 

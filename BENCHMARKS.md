@@ -3,32 +3,30 @@
 Reference machine: Apple arm64 laptop, macOS. Release build. Dimension 384, 4-bit TurboVec, top-10 results.
 Each search row is the p50 / p95 / p99 of 200 random queries. Each run uses a fresh database directory.
 
-Reproduce:
-
-```sh
-cargo run --release -p zenar-core --example bench -- 1000000 384           # ingest, then searches in-process
-cargo run --release -p zenar-core --example reopen_bench -- target/bench-data/1000000-384 1000000 384
-```
+The sections below give the current measurements. The other examples are `filter_profile` (filter steps alone) and
+`compound_breakdown` (compound filter split into its steps). Reproduction commands are in each section.
 
 ## Current backend: Zenar document store
 
 Reference machine: Apple arm64 laptop, macOS. Release build. Dimension 384, 4-bit TurboVec, top-10 results.
-Search rows are p50 / p95 / p99 over 200 random queries. Each run uses a fresh database directory.
+Search rows are p50 / p95 / p99 over 200 random queries. Each run uses a fresh database directory. The runs were made on an
+idle machine, one after another.
 
-Reproduce:
+Reproduce (the second command reopens the database that `bench` keeps in the directory it is given):
 
 ```sh
-cargo run --release -p zenar-core --example bench -- 1000000 384
-cargo run --release -p zenar-core --example reopen_bench -- target/bench-data/1000000-384 1000000 384
+D=$(mktemp -d)
+cargo run --release -p zenar-core --example bench -- 1000000 384 "$D"
+cargo run --release -p zenar-core --example reopen_bench -- "$D" 1000000 384
 ```
 
 ### Ingest (`add_many`, batches of 1000)
 
 | Rows | Total | Per row |
 |---|---|---|
-| 10,000 | 0.12 s | 0.012 ms |
-| 100,000 | 1.20 s | 0.012 ms |
-| 1,000,000 | 11.9 s | 0.012 ms |
+| 10,000 | 0.13 s | 0.013 ms |
+| 100,000 | 1.32 s | 0.013 ms |
+| 1,000,000 | 11.2 s | 0.011 ms |
 
 Each row has three metadata fields and one 384-dim vector. A batch writes its log frames in one write, adds its vectors,
 syncs the index and the log once, then makes the batch visible.
@@ -46,42 +44,78 @@ collection size. `delete_many` pays them once per batch. Use it for bulk removal
 
 | Case | p50 | p95 | p99 |
 |---|---|---|---|
-| No filter | 1.17 ms | 1.46 ms | 2.85 ms |
-| `tenant = A` (10%) | 3.65 ms | 4.24 ms | 6.22 ms |
-| Compound: `tenant = A AND category IN (faq, product) AND price >= 100` (~4%) | 15.2 ms | 16.1 ms | 25.2 ms |
-| `price = 5` (0.1%) | 0.32 ms | 0.41 ms | 0.43 ms |
+| No filter | 1.17 ms | 1.39 ms | 1.52 ms |
+| `tenant = A` (10%) | 3.50 ms | 4.01 ms | 4.24 ms |
+| Compound: `tenant = A AND category IN (faq, product) AND price >= 100` (~4%) | 3.54 ms | 3.94 ms | 4.38 ms |
+| `price = 5` (0.1%) | 0.30 ms | 0.42 ms | 0.46 ms |
 
 ### Search, in-process, smaller collections
 
 | Rows | No filter (p50) | 10% filter (p50) | Compound (p50) | 0.1% (p50) |
 |---|---|---|---|---|
-| 10,000 | 0.10 ms | 0.10 ms | 0.15 ms | 0.02 ms |
-| 100,000 | 0.24 ms | 0.39 ms | 1.22 ms | 0.08 ms |
+| 10,000 | 0.09 ms | 0.10 ms | 0.09 ms | 0.02 ms |
+| 100,000 | 0.24 ms | 0.40 ms | 0.39 ms | 0.08 ms |
 
 ### Search, after reopen (fresh process, existing 1M-row database)
 
 | Case | p50 | p95 | p99 |
 |---|---|---|---|
-| Open with reconciliation | 0.79 s | | |
-| No filter | 1.16 ms | 1.34 ms | 1.57 ms |
-| `tenant = A` (10%) | 3.61 ms | 4.22 ms | 4.88 ms |
+| Open with reconciliation | 0.45 s | | |
+| No filter | 1.16 ms | 1.26 ms | 1.35 ms |
+| `tenant = A` (10%) | 3.54 ms | 4.06 ms | 4.38 ms |
 
-Open time is the replay of the log into the in-memory indexes. It grows linearly with rows.
+Open time is the replay of the log into the in-memory indexes, plus loading the vector index. Replay is about 0.3 s of
+the 0.45 s at 1M rows. It grows linearly with the log.
+
+### Memory, 1M rows, dim 384
+
+Measured with `/usr/bin/time -l` around the `bench` example (ingest, then all searches, same process). Peak resident
+set size was 430 MB. The vectors are 4-bit TurboVec codes, about 192 MB at this size (1M × 384 × 4 bits). Each indexed
+field also keeps a 4-byte code per row, about 4 MB per field at 1M rows. The rest is the document log index, the
+in-memory field indexes and the per-row bookkeeping. Raw float32 vectors would need about 1.5 GB for the same rows.
+The breakdown of the remainder has not been measured by component.
+
+### Where the compound filter's time goes (`compound_breakdown`, 1M rows)
+
+| Step | Time |
+|---|---|
+| Document store: compound filter (90,000 candidates) | 0.37 ms |
+| Liveness check of the candidates against the vector index | 0.45 ms |
+| Vector search over the candidates (allowlist) | 1.95 ms |
+| Vector search, no filter, for comparison | 1.09 ms |
+
+The document-store step was 3.6 ms before the candidate-driven evaluation (see below). The vector search over the
+candidate allowlist is TurboVec's, and it costs more than the same search with no filter.
+
+### Document store, filter steps only (`filter_profile`, 1M rows)
+
+| Step | Time | Matches |
+|---|---|---|
+| `tenant = A` | 0.28 ms | 100,000 |
+| `category IN (faq, product)` | 1.20 ms | 400,000 |
+| `price >= 100` | 2.62 ms | 900,000 |
+| Compound (all three) | 0.51 ms | 90,000 |
+
+The compound row is the candidate-driven evaluation: the smallest leaf lists its rows, and the other leaves are checked per
+row through their value codes. The standalone leaves still materialize their full result. Before this change the compound
+was 3.6 ms.
 
 ### What the numbers say
 
 - Unfiltered and selective (0.1%) search are close to pure TurboVec cost. The 0.1% filter is faster than the unfiltered
   search at 10K rows, because it returns few candidates.
-- A broad filter costs what its matching rows cost: one posting per match, merged and intersected in memory. The compound
-  filter combines three predicates of which two are broad. It is the slowest case, at about 13x the unfiltered search.
-- The gate in the design spec (section 90) asks that the metadata step not dominate filtered search at 1M rows. Selective
-  filters pass it. Broad and compound filters pass it at 10%, and compound filters are the remaining case.
+- A broad filter costs what its matching rows cost in the vector search. The compound filter is now about 3x the unfiltered
+  search at 1M rows, down from about 6x. Most of what remains is the allowlist search.
+- The gate in the design spec (section 90) asks that the metadata step not dominate filtered search at 1M rows. The
+  document-store step of the compound filter is now a small part of its cost.
 
 ### Known gaps
 
-- Compound filters are not tuned. The merge of many postings sorts the matches. A k-way merge would be cheaper.
-- Open time for large logs is linear. A persisted index would avoid the replay. It would also need its own recovery.
-- Memory is not measured here. The indexes hold one list entry per (row, field) and one entry per distinct value.
+- The per-component memory breakdown is not measured.
+- Open time is linear in the log. A persisted index would avoid the replay. It would also need its own recovery, and it is
+  not built.
+- The allowlist search in TurboVec costs more per candidate than an unfiltered search. Changing that would mean changing
+  TurboVec.
 
 ## History
 

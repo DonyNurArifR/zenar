@@ -20,6 +20,11 @@ jobs:
         with:
           toolchain: ${{ matrix.toolchain }}
       - run: cargo test --locked -p zenar-core
+      - name: Format and lint (warnings are errors)
+        if: matrix.os == 'ubuntu-latest' && matrix.toolchain == 'stable'
+        run: |
+          cargo fmt --all -- --check
+          cargo clippy --locked --workspace --all-targets -- -D warnings
 
   python:
     name: Python (${{ matrix.os }})
@@ -43,6 +48,13 @@ jobs:
           if [ -d .venv-test/Scripts ]; then PY=.venv-test/Scripts/python; else PY=.venv-test/bin/python; fi
           "$PY" -m pip install --quiet dist/*.whl pytest numpy
           "$PY" -m pytest -q
+      # The type stubs must match the compiled module.
+      - name: Type stubs match the module
+        if: matrix.os == 'ubuntu-latest'
+        shell: bash
+        run: |
+          .venv-test/bin/python -m pip install --quiet mypy
+          .venv-test/bin/python -m mypy.stubtest zenar._zenar --allowlist tests/stubtest_allowlist.txt
 
   supply-chain:
     name: Audit and license check

@@ -5,8 +5,10 @@ core built on [TurboVec](https://github.com/RyanCodrai/turbovec) for vector
 search and a document log with in-memory indexes for metadata filtering.
 
 **Status: 0.1.0, not yet published.** The core, Python API, persistence and
-crash recovery are implemented and tested. Filtered search at 1M rows does not
-yet meet its performance target. See [Project Status](#project-status).
+crash recovery are implemented and tested. At 1M rows, filtered search takes
+0.3 to 3.5 ms against 1.2 ms unfiltered, depending on the filter. The design
+spec makes the filter path a pass/fail gate but sets no numeric threshold, so
+this is measured, not yet judged. See [Project Status](#project-status).
 
 ## Why Zenar
 
@@ -74,9 +76,9 @@ Measurements: [BENCHMARKS.md](BENCHMARKS.md).
 
 ## Project Status
 
-Implemented and tested (Rust: 41 unit and 19 integration tests, including a reference-checked three-valued filter
-oracle, a model-based test with reopens, a random-filter fuzz test and a concurrent read/write test; Python: 41 tests,
-including repeated `kill -9` crash cycles):
+Implemented and tested (Rust: 58 unit and 27 integration tests, including a reference-checked three-valued filter
+oracle, a model-based test with reopens, a random-filter fuzz test, a concurrent read/write test, and a test that cuts
+or flips every byte of the last log record; Python: 60 tests, including repeated `kill -9` crash cycles):
 
 - Collections, add, add_many (atomic), delete, delete_many (atomic), get, search, with the query planner and stale-ID handling.
 - Typed metadata, the full filter operator set, NULL and type rules, tenant isolation.
@@ -84,19 +86,24 @@ including repeated `kill -9` crash cycles):
 - Process locking, `flush()`, `durable=True`, and a poisoning rule for collections that cannot be made consistent.
 - `bit_width` and `calibrate()`.
 - Python bindings with a complete exception hierarchy, GIL release, numpy input, and a panic guard.
+- Agent tools: `describe` (fields, values and counts), `find_values`, `retrieve` with a JSON `where`
+  filter that suggests field names and explains empty results, and `tool_spec` for tool-calling models.
+  See API.md, "Agent tools".
 
 Measured on the reference machine at 1M rows, dim 384 (BENCHMARKS.md):
 
-- Ingest with `add_many`: 0.012 ms per row. One row at a time: 0.014 ms.
-- Unfiltered search: 1.2 ms. Reopened unfiltered search: 1.2 ms. Open (log replay): 0.8 s.
-- Selective filter (0.1%): 0.3 ms. Filter on 10% of rows: 3.7 ms. Compound filter (~4%): 15 ms.
+- Ingest with `add_many`: 0.011 ms per row. One row at a time: 0.014 ms.
+- Unfiltered search: 1.2 ms. Reopened unfiltered search: 1.2 ms. Open (log replay and index load): 0.45 s.
+- Selective filter (0.1%): 0.3 ms. Filter on 10% of rows: 3.5 ms. Compound filter (~4%): 3.5 ms.
+- Peak memory at this size: 430 MB (4-bit vectors, about 192 MB of it).
 
 Not done:
 
-- **Cross-platform wheels and CI** are written (`.github/workflows/`) but have not run on GitHub or on every target.
-  Verified on this machine: macOS arm64 only. `zenar-core` compiles and passes clippy for Windows (MSVC target),
-  but its tests have not run there.
-- **Power-loss behavior** is designed and tested only at the process level (`kill -9`). Real power-loss testing is not done.
+- **Cross-platform CI** runs on GitHub Actions for Ubuntu, macOS and Windows: Rust tests on Rust 1.89 and stable,
+  Python wheel tests in a fresh venv on all three OS, plus a dependency audit and license check. All green on the
+  current branch. Wheels are built in CI only; no PyPI release yet.
+- **Power-loss behavior** is tested at the process level (`kill -9`) and at the byte level (every cut point in a torn
+  record). Real power-loss testing on hardware is not done.
 - **Compound filters** are the slowest case. Merging many postings is not tuned yet (BENCHMARKS.md, known gaps).
 
 ## Contributing

@@ -206,6 +206,65 @@ fn metadata_from_py(metadata: Option<&Bound<'_, PyDict>>) -> PyResult<Vec<(Strin
         .collect()
 }
 
+/// Converts a JSON value to Python objects: dicts for objects, lists for arrays.
+fn json_to_py<'py>(py: Python<'py>, value: &serde_json::Value) -> PyResult<Bound<'py, PyAny>> {
+    use serde_json::Value;
+    Ok(match value {
+        Value::Null => py.None().into_bound(py),
+        Value::Bool(b) => PyBool::new(py, *b).to_owned().into_any(),
+        Value::Number(n) => {
+            if let Some(i) = n.as_i64() {
+                i.into_pyobject(py)?.into_any()
+            } else if let Some(u) = n.as_u64() {
+                u.into_pyobject(py)?.into_any()
+            } else {
+                n.as_f64().unwrap_or(f64::NAN).into_pyobject(py)?.into_any()
+            }
+        }
+        Value::String(s) => PyString::new(py, s).into_any(),
+        Value::Array(items) => {
+            let list = PyList::empty(py);
+            for item in items {
+                list.append(json_to_py(py, item)?)?;
+            }
+            list.into_any()
+        }
+        Value::Object(map) => {
+            let dict = PyDict::new(py);
+            for (k, v) in map {
+                dict.set_item(k, json_to_py(py, v)?)?;
+            }
+            dict.into_any()
+        }
+    })
+}
+
+/// Converts the `scope` argument. `None` means no scope; callers pass it explicitly.
+fn scope_json(
+    py: Python<'_>,
+    scope: Option<&Bound<'_, PyAny>>,
+) -> PyResult<Option<serde_json::Value>> {
+    match scope {
+        Some(s) if !s.is_none() => Ok(Some(py_to_json(py, s)?)),
+        _ => Ok(None),
+    }
+}
+
+/// Serializes a Python `where` object to JSON with the standard `json` module, so the same
+/// JSON-compatible values are accepted here as everywhere else.
+fn py_to_json(py: Python<'_>, value: &Bound<'_, PyAny>) -> PyResult<serde_json::Value> {
+    let text: String = py
+        .import("json")?
+        .call_method1("dumps", (value,))
+        .map_err(|_| {
+            InvalidFilterError::new_err(
+                "where must be JSON-compatible (strings, numbers, booleans, lists, dicts)",
+            )
+        })?
+        .extract()?;
+    serde_json::from_str(&text).map_err(|e| InvalidFilterError::new_err(format!("where: {e}")))
+}
+
 /// Converts a Python integer argument to u64. Negative, oversized, and non-integer
 /// values raise `InvalidArgumentError`, not PyO3's `OverflowError` or `TypeError`.
 fn py_u64(value: &Bound<'_, PyAny>, what: &str) -> PyResult<u64> {
@@ -447,6 +506,106 @@ impl PyCollection {
             .collect::<PyResult<Vec<u64>>>()?;
         let inner = Arc::clone(&self.inner);
         guarded(py, move || inner.delete_many(&ids))
+    }
+
+    /// Field-level description for discovery: every metadata field with its type, the number of
+    /// documents that carry it, and its distinct values with counts (or range for long lists).
+    /// `scope` is required. Pass a dict to limit what is listed, for example the tenant. Pass
+    /// `None` only from trusted code that may see the whole collection.
+    #[pyo3(signature = (*, scope))]
+    fn describe<'py>(
+        &self,
+        py: Python<'py>,
+        scope: Option<&Bound<'_, PyAny>>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let scope = scope_json(py, scope)?;
+        let inner = Arc::clone(&self.inner);
+        let info = guarded(py, move || inner.describe(scope.as_ref()))?;
+        json_to_py(py, &info)
+    }
+
+    /// Finds values of one field that contain `text` (case-insensitive), most frequent first,
+    /// within `scope`.
+    #[pyo3(signature = (field, text, limit=20, *, scope))]
+    fn find_values<'py>(
+        &self,
+        py: Python<'py>,
+        field: &str,
+        text: &str,
+        limit: usize,
+        scope: Option<&Bound<'_, PyAny>>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let scope = scope_json(py, scope)?;
+        let inner = Arc::clone(&self.inner);
+        let field = field.to_string();
+        let text = text.to_string();
+        let found = guarded(py, move || {
+            inner.find_values(&field, &text, limit, scope.as_ref())
+        })?;
+        json_to_py(py, &serde_json::Value::Array(found))
+    }
+
+    /// Filtered retrieval for an agent. `where` is the model's filter, a JSON-compatible dict such
+    /// as `{"tenant": "A", "price": {"gte": 100}}`. `scope` is the caller's fixed filter. The two
+    /// are combined on the server, so `where` cannot widen `scope`. `scope` is required.
+    /// Returns `{"hits", "matched", "warnings"}`. `matched` counts every document that matched,
+    /// before `top_k` cut the list.
+    #[pyo3(signature = (vector, top_k=10, r#where=None, *, scope))]
+    fn retrieve<'py>(
+        &self,
+        py: Python<'py>,
+        vector: &Bound<'_, PyAny>,
+        top_k: usize,
+        r#where: Option<&Bound<'_, PyAny>>,
+        scope: Option<&Bound<'_, PyAny>>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let vector = extract_vector(vector)?;
+        let where_json = match r#where {
+            Some(w) if !w.is_none() => Some(py_to_json(py, w)?),
+            _ => None,
+        };
+        let scope = scope_json(py, scope)?;
+        let inner = Arc::clone(&self.inner);
+        let retrieval = guarded(py, move || {
+            inner.retrieve(&vector, top_k, where_json.as_ref(), scope.as_ref())
+        })?;
+        let hits = PyList::empty(py);
+        for hit in &retrieval.hits {
+            hits.append(hit_to_py(py, hit)?)?;
+        }
+        let out = PyDict::new(py);
+        out.set_item("hits", hits)?;
+        out.set_item("matched", retrieval.matched)?;
+        out.set_item("applied", retrieval.applied)?;
+        out.set_item("warnings", retrieval.warnings)?;
+        Ok(out.into_any())
+    }
+
+    /// Tool definition for this collection within `scope`, in the `name` / `description` /
+    /// `parameters` shape, as a `zenar.agent.ToolSpec` (a dict with `create_prompt()`).
+    /// With `prompt_only=True`, returns just the fields and their values as text.
+    #[pyo3(signature = (name, prompt_only=false, *, scope))]
+    fn tool_spec<'py>(
+        &self,
+        py: Python<'py>,
+        name: &str,
+        prompt_only: bool,
+        scope: Option<&Bound<'_, PyAny>>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let scope = scope_json(py, scope)?;
+        if prompt_only {
+            let inner = Arc::clone(&self.inner);
+            let text = guarded(py, move || inner.fields_prompt(scope.as_ref()))?;
+            return Ok(PyString::new(py, &text).into_any());
+        }
+        let inner = Arc::clone(&self.inner);
+        let name = name.to_string();
+        let spec = guarded(py, move || inner.tool_spec(&name, scope.as_ref()))?;
+        // Wrap in zenar.agent.ToolSpec: a dict that also renders itself as a prompt.
+        let dict = json_to_py(py, &spec)?;
+        py.import("zenar.agent")?
+            .getattr("ToolSpec")?
+            .call1((dict,))
     }
 
     fn count(&self, py: Python<'_>) -> PyResult<usize> {
