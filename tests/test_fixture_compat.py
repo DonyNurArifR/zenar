@@ -27,5 +27,7 @@ def test_fixture_opens_with_the_same_count_and_answers():
     assert c.count() == expected["count"]
     for case in expected["queries"]:
         hits = c.search(case["query"], top_k=5, tenant="A")
-        assert [h["id"] for h in hits] == case["ids"]
+        # Compare the sets, not the order. Documents with near-identical scores can swap places
+        # between CPU paths (NEON, AVX2), and the expected file was written on Apple Silicon.
+        assert sorted(h["id"] for h in hits) == sorted(case["ids"])
     db.close()
