@@ -13,7 +13,6 @@ myst_enable_extensions = ["colon_fence"]
 myst_heading_anchors = 3
 
 html_theme = "pydata_sphinx_theme"
-html_title = "Zenar"
 html_theme_options = {
     "github_url": "https://github.com/DonyNurArifR/zenar",
     "navbar_end": ["theme-switcher", "navbar-icon-links"],
