@@ -1064,14 +1064,15 @@ fn scoped_discovery_is_fresh_after_a_write() {
 }
 
 #[test]
-fn retrieve_refuses_an_oversized_top_k() {
+fn retrieve_accepts_any_top_k_and_returns_at_most_the_matches() {
     let dir = temp_dir("topk");
     let db = VectorDB::open(&dir).unwrap();
     let c = db.create_collection("tk", None, 4).unwrap();
-    c.add_many(&[doc_with(1, "acme", "x", 1.0)]).unwrap();
-    let err = c.retrieve(&[1.0; 8], 5000, None, None).unwrap_err();
-    assert!(matches!(err, ZenarError::InvalidArgument(_)), "{err}");
-    assert!(c.retrieve(&[1.0; 8], 1000, None, None).is_ok());
+    c.add_many(&[doc_with(1, "acme", "x", 1.0), doc_with(2, "acme", "y", 2.0)])
+        .unwrap();
+    let big = c.retrieve(&[1.0; 8], 5000, None, None).unwrap();
+    assert_eq!(big.hits.len(), 2);
+    assert_eq!(big.matched, 2);
     fs::remove_dir_all(&dir).ok();
 }
 

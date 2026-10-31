@@ -161,8 +161,9 @@ exist. Range bounds (`gt`, `gte`, `lt`, `lte`) are not restricted to existing va
 
 - Document text is data. If it can contain instructions written by someone else, do not present it to the model as
   instructions. Keep it inside a clearly marked data section.
-- `retrieve` does not embed text. Your integration embeds the model's `query`, so an unbounded `top_k` is your
-  responsibility. Cap it when you forward the model's arguments.
+- `retrieve` does not embed text. Zenar does not cap `top_k`: it returns at most the number of matching documents.
+  A very large result is still expensive to send to a model, so cap `top_k` in your application when you forward the
+  model's arguments.
 - A scope is only as strong as the value you pass. Derive it from the authenticated user, not from the model's output.
 - Discovery over a large scope costs more than retrieval. `describe` on a 5% scope of 1M documents takes about 14 ms,
   and it is not cached. Cache the spec per session if the data changes slowly.
