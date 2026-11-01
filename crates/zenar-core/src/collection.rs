@@ -125,6 +125,9 @@ struct CompactionSlot {
 }
 
 /// A test observer of the compaction transitions.
+/// Test hook at each compaction transition (see `compaction_point`). It runs under the write guard, so it must not call
+/// into the collection: a call would take the state lock again. It receives only the transition's name. The type is
+/// compiled only in unit tests, so no release build or Python wheel contains it.
 #[cfg(test)]
 type CompactionHook = Arc<dyn Fn(&'static str) + Send + Sync>;
 
@@ -574,12 +577,19 @@ fn prepare_batch(state: &State, records: &[Record]) -> Result<PreparedBatch, Zen
     Ok((prepared, new_fields))
 }
 
-/// A named set of vectors plus their documents and metadata.
-///
-/// Writes are serialized behind one lock. Reads run concurrently with each other.
-pub struct Collection {
+/// The compaction's starting point under the read lock: the log path, the fields, and the committed length.
+type CompactionSnapshot = (PathBuf, Vec<(String, FieldKind)>, u64);
+
+/// The retrieval's parsed filters under the read lock: the model's, the scope's, and the warnings.
+type ParsedRetrieval = (Option<Filter>, Option<Filter>, Vec<String>);
+/// The parts of a collection that code running under a state guard may use. `Core` has no field that refers to
+/// `Collection` or to the state lock, so code that takes `&Core` has no route to the lock and cannot take it again.
+/// Guard-holding code is written as methods on `Core`, which receive the guard explicitly. Only `Collection` takes
+/// the lock, through `with_read` and `with_write`, and those pass `Core` and the guard to a function pointer. A
+/// function pointer cannot capture `Collection`.
+struct Core {
     name: String,
-    /// Field statistics for discovery. Cleared by every write, see `write_state`.
+    /// Field statistics for discovery. Cleared by every write, see `write_state_op`.
     stats: Mutex<Option<Arc<Vec<FieldStats>>>>,
     /// Statistics for scoped calls, keyed by the scope, most recent last. Cleared by every write.
     scoped: Mutex<Vec<ScopedEntry>>,
@@ -587,6 +597,45 @@ pub struct Collection {
     catalog: Arc<Catalog>,
     /// Sync the document log on every commit, not only at sync boundaries.
     durable: bool,
+    /// Counters for `write_stats`, and the lock trace.
+    counters: WriteCounters,
+    /// Test hook at each compaction transition: an observer, and one point that fails.
+    #[cfg(test)]
+    compaction_hook: Mutex<Option<CompactionHook>>,
+    #[cfg(test)]
+    fail_compaction_at: Mutex<Option<&'static str>>,
+    /// Test hook: the next staging of a batch fails with an injected error, as a failed log write would.
+    #[cfg(test)]
+    fail_stage: AtomicBool,
+    /// Test only: how many unfiltered searches retried with the full over-fetch.
+    #[cfg(test)]
+    search_retries: AtomicU64,
+}
+
+/// What a group's add stage leaves to do. A batch that needs a log sync is handed back, with the lock released,
+/// so the log can sync while readers run. The batch is then committed under the lock again.
+enum AddStep {
+    /// Nothing is left: the batch was committed, or rolled back, or it was empty.
+    Finished,
+    /// The index is synced. The log syncs through `log` next, and the batch commits after that.
+    Sync { batch: Batch, log: std::fs::File },
+}
+
+/// A delete staged under the lock. Its log syncs with the lock released, then it commits under the lock again.
+struct DeleteStep {
+    staged: Staged,
+    log: std::fs::File,
+}
+
+/// A named set of vectors plus their documents and metadata.
+///
+/// Writes are serialized behind one lock. Reads run concurrently with each other.
+///
+/// The lock is taken only in this impl block, in `read_state`, `write_state_op` and `close`. Code that runs under
+/// a guard lives on `Core`, see `with_read` and `with_write`.
+pub struct Collection {
+    /// Everything code under a state guard may use. See `Core`.
+    core: Core,
     /// Writes waiting for a leader. See `submit`.
     queue: Mutex<Queue>,
     /// The background compaction: whether one is running, and the structure it built for the swap.
@@ -596,27 +645,819 @@ pub struct Collection {
     /// Signalled when a leader finishes, so that a waiting writer can become the leader.
     ready: Condvar,
     state: RwLock<State>,
-    /// Counters for `write_stats`.
-    counters: WriteCounters,
     /// Test hook that runs while a write has released `state` and is syncing its log.
     #[cfg(test)]
     window_hook: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
-    /// Test hooks at each compaction transition: an observer, and one point that fails.
-    #[cfg(test)]
-    compaction_hook: Mutex<Option<CompactionHook>>,
-    #[cfg(test)]
-    fail_compaction_at: Mutex<Option<&'static str>>,
     /// Test hook: the next log sync fails with an injected error.
     #[cfg(test)]
-    fail_log_sync: std::sync::atomic::AtomicBool,
-    /// Test hook: the next staging of a batch fails with an injected error, as a failed log write would.
-    #[cfg(test)]
-    fail_stage: std::sync::atomic::AtomicBool,
-    /// Test only: how many unfiltered searches retried with the full over-fetch.
-    #[cfg(test)]
-    search_retries: AtomicU64,
+    fail_log_sync: AtomicBool,
     /// Writer-preference admission for `state`: see `Admission`.
     admission: Admission,
+}
+
+impl Core {
+    /// Stages a group of adds under the lock, and finishes the batch it leaves: see `finish_batch`.
+    fn stage_adds(&self, state: &mut WriteGuard<'_>, reqs: Vec<Arc<Request>>) -> AddStep {
+        let mut batch = Batch::new(state.store.dim().is_none());
+        for req in reqs {
+            let Op::Add {
+                records,
+                batch: is_batch,
+            } = &req.op
+            else {
+                unreachable!("run_adds takes only adds");
+            };
+            let count = records.len();
+            let is_batch = *is_batch;
+            match self.stage_request(state, &mut batch, records) {
+                Ok(()) => batch.members.push((req, count, is_batch)),
+                Err(StageError::Request(e)) => req.finish(Err(e)),
+                Err(StageError::Batch(e)) => {
+                    let cause = self.rollback_batch(state, batch, e);
+                    req.finish(Err(cause));
+                    batch = Batch::new(state.store.dim().is_none());
+                }
+            }
+        }
+        self.finish_batch(state, batch)
+    }
+
+    /// Decides how a staged batch finishes. A batch that needs no log sync is committed here. Otherwise the index is
+    /// synced under the lock, and the log is handed back for the sync that follows the release of the lock. A batch
+    /// whose index or log cannot be synced is rolled back here.
+    fn finish_batch(&self, state: &mut WriteGuard<'_>, batch: Batch) -> AddStep {
+        if batch.members.is_empty() {
+            return AddStep::Finished;
+        }
+        let needs_sync = self.durable
+            || batch.members.iter().any(|(_, _, is_batch)| *is_batch)
+            || state.unsynced + batch.added.len() >= SYNC_INTERVAL;
+        if !needs_sync {
+            state.unsynced += batch.added.len();
+            self.commit_batch(state, batch);
+            return AddStep::Finished;
+        }
+
+        state.pending = batch.added.len();
+        if let Err(e) = state.timed(|s| s.store.sync(&self.index_path)) {
+            self.rollback_batch(state, batch, e);
+            return AddStep::Finished;
+        }
+        match state.timed(|s| s.docs.sync_handle()) {
+            Ok(log) => AddStep::Sync { batch, log },
+            Err(e) => {
+                self.rollback_batch(state, batch, e);
+                AddStep::Finished
+            }
+        }
+    }
+
+    /// Commits a batch after its log sync. A failed sync rolls it back instead.
+    fn commit_synced(
+        &self,
+        state: &mut WriteGuard<'_>,
+        (batch, synced): (Batch, Result<(), ZenarError>),
+    ) {
+        if let Err(e) = synced {
+            self.rollback_batch(state, batch, e);
+            return;
+        }
+        state.pending = 0;
+        state.unsynced = 0;
+        self.counters.record_sync_group(batch.members.len());
+        self.commit_batch(state, batch);
+    }
+
+    /// Validates one add request and stages it into the batch. A request error leaves the batch as
+    /// it was. A batch error means the batch's writes may be partly done, and the caller rolls it back.
+    fn stage_request(
+        &self,
+        state: &mut WriteGuard<'_>,
+        batch: &mut Batch,
+        records: &[Record],
+    ) -> Result<(), StageError> {
+        healthy(state).map_err(StageError::Request)?;
+        let (values, new_fields) = prepare_batch(state, records).map_err(StageError::Request)?;
+        self.extend_schema(state, &new_fields)
+            .map_err(StageError::Request)?;
+        let refs: Vec<DocRef<'_>> = records
+            .iter()
+            .zip(values.iter())
+            .map(|(r, values)| DocRef {
+                id: r.id,
+                text: r.text.as_str(),
+                metadata: values.as_slice(),
+            })
+            .collect();
+        #[cfg(test)]
+        if self
+            .fail_stage
+            .swap(false, std::sync::atomic::Ordering::SeqCst)
+        {
+            let e = ZenarError::PersistenceError("injected staging failure".into());
+            return Err(StageError::Batch(poison(state, e)));
+        }
+        let staged = state
+            .timed(|s| s.docs.stage_puts(&refs))
+            .map_err(|e| StageError::Batch(poison(state, e)))?;
+        batch.staged.push(staged);
+        for record in records {
+            batch.added.push(record.id);
+            state
+                .store
+                .add(&record.vector, record.id)
+                .map_err(StageError::Batch)?;
+        }
+        Ok(())
+    }
+
+    /// Undoes a batch that could not be committed: removes its vectors, syncs the index to match, and
+    /// truncates the log to the start of the batch. Finishes every member with the cause and returns it.
+    /// If the index cannot be synced to match, or the truncation fails, the collection is poisoned: the
+    /// disk would then disagree with memory, and only a reopen, which reconciles, may continue.
+    fn rollback_batch(&self, state: &mut State, batch: Batch, cause: ZenarError) -> ZenarError {
+        state.pending = 0;
+        for id in &batch.added {
+            state.store.remove(*id);
+        }
+        if !batch.added.is_empty()
+            && let Err(e) = state.store.sync(&self.index_path)
+        {
+            poison(state, e);
+        }
+        let cause = match batch.staged.into_iter().next() {
+            Some(first) => undo_or_poison(state, first, cause),
+            None => cause,
+        };
+        for (req, _, _) in &batch.members {
+            req.finish(Err(cause.clone()));
+        }
+        cause
+    }
+
+    /// Makes a batch visible and finishes its members. The first vector of a collection fixes its
+    /// dimension, which is recorded in the catalog. If that write fails, the batch is already visible,
+    /// so every member gets the error and may still be applied (docs/STORAGE.md).
+    fn commit_batch(&self, state: &mut State, batch: Batch) {
+        for staged in batch.staged {
+            state.docs.commit(staged);
+            state.committed_len = state.docs.log_len();
+        }
+        let recorded = if batch.was_empty && state.store.dim().is_some() {
+            self.record_dimension(state)
+        } else {
+            Ok(())
+        };
+        for (req, count, _) in &batch.members {
+            req.finish(match &recorded {
+                Ok(()) => Ok(*count),
+                Err(e) => Err(e.clone()),
+            });
+        }
+    }
+
+    /// Persists new schema fields in the catalog, then extends the in-memory schema.
+    /// The order matters. A record that uses a new field must not reach the log before the
+    /// catalog knows the field, or reopening would fail.
+    fn extend_schema(
+        &self,
+        state: &mut State,
+        new_fields: &[(String, FieldKind)],
+    ) -> Result<(), ZenarError> {
+        if new_fields.is_empty() {
+            return Ok(());
+        }
+        let added: Vec<(String, String)> = new_fields
+            .iter()
+            .map(|(n, k)| (n.clone(), k.as_str().to_string()))
+            .collect();
+        self.catalog
+            .update(&self.name, |entry| entry.fields.extend(added))?;
+        state.docs.extend_fields(new_fields);
+        Ok(())
+    }
+
+    fn record_dimension(&self, state: &State) -> Result<(), ZenarError> {
+        if let Some(dim) = state.store.dim() {
+            self.catalog
+                .update(&self.name, |entry| entry.dimension = Some(dim))?;
+        }
+        Ok(())
+    }
+
+    /// Syncs the vector index and the document log. Both must succeed.
+    fn sync_both(&self, state: &mut WriteGuard<'_>) -> Result<(), ZenarError> {
+        state.timed(|s| s.store.sync(&self.index_path))?;
+        state.docs.sync()?;
+        state.unsynced = 0;
+        Ok(())
+    }
+
+    /// Lowers the recorded lengths before a delete changes anything on disk. The index can lose
+    /// `deleting` vectors when it is synced, and the log shrinks only when compaction runs, so
+    /// before the delete is recorded again a crash can leave each file between its recorded length
+    /// and that length less `deleting`. Lowering by exactly that keeps the shortened-file check
+    /// on, so a file that is missing or cut short is still refused. Zeroing the log length is
+    /// needed only when compaction runs.
+    fn lower_recorded_lengths(&self, deleting: usize, compacting: bool) -> Result<(), ZenarError> {
+        self.catalog.update(&self.name, |entry| {
+            entry.durable_vectors = entry.durable_vectors.saturating_sub(deleting);
+            if compacting {
+                entry.durable_log_len = 0;
+            }
+        })
+    }
+
+    /// Records how far the log and the vector index are synced. Call it right after a successful
+    /// sync, and after compaction, since both change what is durable.
+    fn record_durable(&self, state: &State) -> Result<(), ZenarError> {
+        let log_len = state.docs.log_len();
+        let vectors = state.store.len();
+        self.catalog.update(&self.name, |entry| {
+            entry.durable_log_len = log_len;
+            entry.durable_vectors = vectors;
+            // Recording the lengths also ends any compaction that was recorded as pending.
+            entry.compaction_pending = None;
+        })
+    }
+
+    /// Puts the catalog entry back to its state before the compaction. If that write fails, the catalog may
+    /// still hold the pending record, which a reopen settles, so the collection is poisoned.
+    fn undo_before_rename(
+        &self,
+        state: &mut WriteGuard<'_>,
+        prior: &Entry,
+        cause: ZenarError,
+    ) -> Result<(), ZenarError> {
+        let (len, pending) = (prior.durable_log_len, prior.compaction_pending);
+        match self.catalog.update(&self.name, |e| {
+            e.durable_log_len = len;
+            e.compaction_pending = pending;
+        }) {
+            Ok(()) => Err(cause),
+            Err(e) => Err(poison(state, e)),
+        }
+    }
+
+    /// Checks a delete's ids under the lock, then removes them from the index, syncs the index and stages the
+    /// tombstones. The index change is synced under the write lock before the tombstones are logged, so a deleted
+    /// vector leaves the disk first. Any failure from the index sync or the staging poisons the collection.
+    fn stage_deletes(
+        &self,
+        state: &mut WriteGuard<'_>,
+        ids: &[u64],
+    ) -> Result<DeleteStep, ZenarError> {
+        healthy(state)?;
+        if ids.len() > 1 {
+            let mut seen = HashSet::with_capacity(ids.len());
+            for &id in ids {
+                if !seen.insert(id) {
+                    return Err(ZenarError::InvalidArgument(format!(
+                        "id {id} appears twice in the batch"
+                    )));
+                }
+            }
+        }
+        for &id in ids {
+            if !state.docs.contains(id) {
+                return Err(ZenarError::VectorNotFound(id));
+            }
+        }
+        // The log shrinks only at a swap, which records its own lengths (see `swap_locked`).
+        let lowering = Instant::now();
+        let lowered = self.lower_recorded_lengths(ids.len(), false);
+        state.add_fs(lowering);
+        lowered?;
+        for &id in ids {
+            state.store.remove(id);
+        }
+        if let Err(e) = state.timed(|s| s.store.sync(&self.index_path)) {
+            return Err(poison(state, e));
+        }
+        let staged = match state.timed(|s| s.docs.stage_deletes(ids)) {
+            Ok(staged) => staged,
+            Err(e) => return Err(poison(state, e)),
+        };
+        let log = match state.timed(|s| s.docs.sync_handle()) {
+            Ok(log) => log,
+            Err(e) => return Err(poison(state, e)),
+        };
+        Ok(DeleteStep { staged, log })
+    }
+
+    /// Commits a delete after its log sync, and records the durable lengths. Returns whether the log now passes the
+    /// compaction threshold, so that the caller starts a compaction once the lock is released.
+    fn commit_deletes(
+        &self,
+        state: &mut WriteGuard<'_>,
+        (staged, synced): (Staged, Result<(), ZenarError>),
+    ) -> (bool, Result<(), ZenarError>) {
+        if let Err(e) = synced {
+            return (false, Err(poison(state, e)));
+        }
+        state.docs.commit(staged);
+        state.committed_len = state.docs.log_len();
+        state.unsynced = 0;
+        let compact_due = state.docs.should_compact();
+        let recording = Instant::now();
+        let recorded = self.record_durable(state);
+        state.add_fs(recording);
+        match recorded {
+            Ok(()) => (compact_due, Ok(())),
+            Err(e) => (compact_due, Err(poison(state, e))),
+        }
+    }
+
+    fn flush_state(&self, state: &mut WriteGuard<'_>, _: ()) -> Result<(), ZenarError> {
+        healthy(state)?;
+        if state.unsynced > 0 || self.durable {
+            self.sync_both(state)?;
+        }
+        // Adds only grow the files, so their recorded lengths can lag until the next flush. Recording
+        // here keeps the shortened-file check exact at every flush and close. Deletes record on their own,
+        // since they are the operations that shrink a file.
+        self.record_durable(state)?;
+        Ok(())
+    }
+
+    fn calibrate_state(
+        &self,
+        state: &mut WriteGuard<'_>,
+        sample: &[f32],
+    ) -> Result<(), ZenarError> {
+        healthy(state)?;
+        state.store.calibrate(sample)?;
+        state.timed(|s| s.store.sync(&self.index_path))?;
+        state.unsynced = 0;
+        Ok(())
+    }
+
+    /// Reconciles the document log and the vector index after a restart (spec section 26).
+    fn reconcile_state(
+        &self,
+        state: &mut WriteGuard<'_>,
+        _: (),
+    ) -> Result<RecoveryReport, ZenarError> {
+        healthy(state)?;
+        let mut report = RecoveryReport::default();
+
+        let live: HashSet<u64> = state.docs.live_ids().into_iter().collect();
+        let mut orphan_docs: Vec<u64> = live
+            .iter()
+            .copied()
+            .filter(|id| !state.store.contains(*id))
+            .collect();
+        orphan_docs.sort_unstable();
+        let mut dirty = false;
+        for id in orphan_docs {
+            let staged = state.docs.stage_delete(id)?;
+            state.docs.commit(staged);
+            state.committed_len = state.docs.log_len();
+            report.orphaned_rows_removed += 1;
+            dirty = true;
+        }
+
+        let stray: Vec<u64> = state.store.ids().filter(|id| !live.contains(id)).collect();
+        for id in stray {
+            state.store.remove(id);
+            report.orphaned_vectors_removed += 1;
+            dirty = true;
+        }
+
+        if dirty {
+            self.sync_both(state)?;
+        }
+        Ok(report)
+    }
+
+    /// Writes the current index file (used when a new collection is created with a dimension).
+    fn persist_state(&self, state: &mut WriteGuard<'_>, _: ()) -> Result<(), ZenarError> {
+        state.timed(|s| s.store.sync(&self.index_path))?;
+        state.unsynced = 0;
+        Ok(())
+    }
+
+    /// The swap (docs/R3.md, section 4). Failures before the rename undo themselves, and leave the collection
+    /// usable. A failure after the rename poisons it, and a reopen settles the catalog and the log. On success
+    /// the old structure is returned, for the caller to drop once the lock is released.
+    fn swap_locked(
+        &self,
+        state: &mut WriteGuard<'_>,
+        built: Built,
+    ) -> Result<Option<DocStore>, ZenarError> {
+        let Built {
+            mut docs,
+            tmp,
+            tail_from,
+        } = built;
+        let path = state.docs.log_path().to_path_buf();
+        let prior = self
+            .catalog
+            .get(&self.name)?
+            .ok_or_else(|| ZenarError::CollectionNotFound(self.name.clone()))?;
+        // Before the rename: copy the final tail, sync the temporary log, and record the pending lengths.
+        let fs_start = Instant::now();
+        let before_rename = (|| -> Result<(), ZenarError> {
+            healthy(state)?;
+            let bytes = DocStore::read_log_range(&path, tail_from, state.committed_len)?;
+            docs.append_raw(&bytes)?;
+            self.compaction_point("swap tail")?;
+            docs.sync()?;
+            self.compaction_point("swap tail synced")?;
+            let new_len = docs.log_len();
+            let old_len = state.docs.log_len();
+            self.catalog.update(&self.name, |e| {
+                e.durable_log_len = new_len;
+                e.compaction_pending = Some(old_len);
+            })?;
+            self.compaction_point("pending recorded")?;
+            Ok(())
+        })();
+        state.add_fs(fs_start);
+        if let Err(e) = before_rename {
+            drop(docs);
+            let _ = fs::remove_file(&tmp);
+            return self.undo_before_rename(state, &prior, e).map(|()| None);
+        }
+        // The rename. The old log's handle is released first, as Windows requires.
+        let rename_start = Instant::now();
+        state.docs.release_handle();
+        if let Err(e) = fs::rename(&tmp, &path) {
+            let _ = fs::remove_file(&tmp);
+            if let Err(reattach) = state.docs.reattach() {
+                return Err(poison(state, reattach));
+            }
+            return self
+                .undo_before_rename(state, &prior, crate::docstore::io_err(e))
+                .map(|()| None);
+        }
+        // From here the file on disk is the new log, and the memory must follow it.
+        if let Err(e) = self.compaction_point("renamed") {
+            return Err(poison(state, e));
+        }
+        let synced_parent = crate::docstore::sync_parent(&path);
+        state.add_fs(rename_start);
+        if let Err(e) = synced_parent {
+            return Err(poison(state, e));
+        }
+        if let Err(e) = self.compaction_point("directory synced") {
+            return Err(poison(state, e));
+        }
+        // The new structure already has an open handle on the renamed file, so no reopen is needed.
+        docs.retarget(&path);
+        let old = std::mem::replace(&mut state.docs, docs);
+        if let Err(e) = self.compaction_point("swapped") {
+            return Err(poison(state, e));
+        }
+        let recording = Instant::now();
+        let recorded = self.record_durable(state);
+        state.add_fs(recording);
+        if let Err(e) = recorded {
+            return Err(poison(state, e));
+        }
+        if let Err(e) = self.compaction_point("pending cleared") {
+            return Err(poison(state, e));
+        }
+        state.committed_len = state.docs.log_len();
+        state.unsynced = 0;
+        Ok(Some(old))
+    }
+
+    /// Test hook at each transition of a compaction. A hook can observe the directory (to copy it, as a
+    /// crash would leave it), and a configured point fails with an injected error.
+    #[cfg(test)]
+    fn compaction_point(&self, point: &'static str) -> Result<(), ZenarError> {
+        let hook = self.compaction_hook.lock().ok().and_then(|h| h.clone());
+        if let Some(hook) = hook {
+            hook(point);
+        }
+        let mut fail = self
+            .fail_compaction_at
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        if *fail == Some(point) {
+            *fail = None;
+            return Err(ZenarError::PersistenceError(format!(
+                "injected failure at {point}"
+            )));
+        }
+        Ok(())
+    }
+
+    #[cfg(not(test))]
+    fn compaction_point(&self, _point: &'static str) -> Result<(), ZenarError> {
+        Ok(())
+    }
+
+    /// Statistics and document count for a scope. `None` is the whole collection. A scope is
+    /// computed once and reused until the next write, since discovery repeats the same scope.
+    fn stats_for_scope(
+        &self,
+        state: &State,
+        scope: Option<&serde_json::Value>,
+    ) -> Result<(Arc<Vec<FieldStats>>, usize), ZenarError> {
+        let Some(value) = scope else {
+            return Ok((self.cached_stats(state)?, state.docs.live_count()));
+        };
+        let key = value.to_string();
+        {
+            let scoped = self
+                .scoped
+                .lock()
+                .map_err(|_| ZenarError::VectorStoreError("scope cache poisoned".into()))?;
+            if let Some(entry) = scoped.iter().find(|e| e.key == key) {
+                return Ok((Arc::clone(&entry.stats), entry.documents));
+            }
+        }
+        let rows = self.scope_rows(state, Some(value))?.unwrap_or_default();
+        let stats = Arc::new(state.docs.field_stats_in(&rows));
+        let documents = rows.len();
+        let mut scoped = self
+            .scoped
+            .lock()
+            .map_err(|_| ZenarError::VectorStoreError("scope cache poisoned".into()))?;
+        if scoped.len() >= SCOPE_CACHE_ENTRIES {
+            scoped.remove(0);
+        }
+        scoped.push(ScopedEntry {
+            key,
+            stats: Arc::clone(&stats),
+            documents,
+        });
+        Ok((stats, documents))
+    }
+
+    /// The live rows that `scope` allows. `None` for no scope, meaning the whole collection.
+    /// An empty scope object allows every live document.
+    fn scope_rows(
+        &self,
+        state: &State,
+        scope: Option<&serde_json::Value>,
+    ) -> Result<Option<Vec<u32>>, ZenarError> {
+        let Some(value) = scope else {
+            return Ok(None);
+        };
+        // The scope is parsed by the same code as `where`, so the message must name the argument.
+        if !value.is_object() {
+            return Err(ZenarError::InvalidFilter(
+                "scope must be a JSON object, for example {\"tenant\": \"A\"}".into(),
+            ));
+        }
+        let stats = self.cached_stats(state)?;
+        let filter = crate::agent::parse(value, state.docs.fields(), &stats)?
+            .filter
+            .unwrap_or(Filter::And(Vec::new()));
+        validate(&filter, state.docs.fields())?;
+        Ok(Some(state.docs.matching_rows(&filter)?))
+    }
+
+    /// Field statistics, cached until the next write.
+    fn cached_stats(&self, state: &State) -> Result<Arc<Vec<FieldStats>>, ZenarError> {
+        let mut cache = self
+            .stats
+            .lock()
+            .map_err(|_| ZenarError::VectorStoreError("stats cache poisoned".into()))?;
+        if let Some(stats) = cache.as_ref() {
+            return Ok(Arc::clone(stats));
+        }
+        let stats = Arc::new(state.docs.field_stats());
+        *cache = Some(Arc::clone(&stats));
+        Ok(stats)
+    }
+
+    /// Candidates for an unfiltered search, best first, as `(score, id)` pairs of the index: the first pass, or the
+    /// full over-fetch when the first pass lacks committed results.
+    ///
+    /// Vectors whose documents are not committed yet can rank in the top results (`pending` of them at most).
+    /// The first pass over-fetches only `min(pending, SEARCH_OVERFETCH_CAP)` for them. If it returns fewer than
+    /// `top_k` committed candidates while more than the cap is pending, a retry asks for the full
+    /// `top_k + pending`, which always holds at least `min(top_k, committed)` committed candidates. Both passes
+    /// run under the caller's read guard, so they see the same index and the same `pending`. The caller drops
+    /// the uncommitted candidates. Arithmetic saturates, so a very large `top_k` cannot wrap.
+    fn unfiltered_candidates(
+        &self,
+        state: &State,
+        query: &[f32],
+        top_k: usize,
+    ) -> Result<(Vec<f32>, Vec<u64>), ZenarError> {
+        let pending = state.pending;
+        let full = top_k.saturating_add(pending).min(state.store.len());
+        let first = top_k
+            .saturating_add(pending.min(SEARCH_OVERFETCH_CAP))
+            .min(state.store.len());
+        let (scores, ids) = state.store.search(query, first, None)?;
+        if pending <= SEARCH_OVERFETCH_CAP || first >= full {
+            return Ok((scores, ids));
+        }
+        let committed = ids
+            .iter()
+            .filter(|id| state.docs.contains(**id))
+            .take(top_k)
+            .count();
+        if committed >= top_k {
+            return Ok((scores, ids));
+        }
+        #[cfg(test)]
+        self.search_retries.fetch_add(1, Ordering::Relaxed);
+        state.store.search(query, full, None)
+    }
+
+    fn dimension_locked(&self, state: &State, _: ()) -> Option<usize> {
+        state.store.dim()
+    }
+
+    fn bit_width_locked(&self, state: &State, _: ()) -> usize {
+        state.store.bit_width()
+    }
+
+    fn get_locked(&self, state: &State, id: u64) -> Result<Option<DocumentRow>, ZenarError> {
+        healthy(state)?;
+        Ok(state.docs.fetch(&[id])?.into_iter().next())
+    }
+
+    fn get_many_locked(&self, state: &State, ids: &[u64]) -> Result<Vec<DocumentRow>, ZenarError> {
+        healthy(state)?;
+        state.docs.fetch(ids)
+    }
+
+    fn count_locked(&self, state: &State, _: ()) -> Result<usize, ZenarError> {
+        healthy(state)?;
+        Ok(state.docs.live_count())
+    }
+
+    fn compaction_snapshot(&self, state: &State, _: ()) -> Result<CompactionSnapshot, ZenarError> {
+        healthy(state)?;
+        Ok((
+            state.docs.log_path().to_path_buf(),
+            state.docs.fields().to_vec(),
+            state.committed_len,
+        ))
+    }
+
+    /// Like `search`, and also returns how many documents matched the filter before `top_k`
+    /// cut the list. A caller can tell "no match" apart from "more matches than requested".
+    fn search_locked(
+        &self,
+        state: &State,
+        (query, top_k, filter): (&[f32], usize, Option<&Filter>),
+    ) -> Result<(Vec<Hit>, usize), ZenarError> {
+        healthy(state)?;
+        if state.store.dim().is_none() {
+            return Ok((Vec::new(), 0));
+        }
+        validate_vector(query, state.store.dim())?;
+
+        let (scores, ids, matched) = match filter {
+            None => {
+                let matched = state.docs.live_count();
+                if state.store.is_empty() {
+                    return Ok((Vec::new(), 0));
+                }
+                let (scores, ids) = self.unfiltered_candidates(state, query, top_k)?;
+                (scores, ids, matched)
+            }
+            Some(filter) => {
+                validate(filter, state.docs.fields())?;
+                let candidates = state.docs.matching_ids(filter)?;
+                let live: Vec<u64> = candidates
+                    .into_iter()
+                    .filter(|id| state.store.contains(*id))
+                    .collect();
+                let matched = live.len();
+                if live.is_empty() {
+                    return Ok((Vec::new(), 0));
+                }
+                let k = top_k.min(live.len());
+                let (scores, ids) = state.store.search(query, k, Some(&live))?;
+                (scores, ids, matched)
+            }
+        };
+        if ids.is_empty() {
+            return Ok((Vec::new(), matched));
+        }
+        let mut docs: HashMap<u64, DocumentRow> = state
+            .docs
+            .fetch(&ids)?
+            .into_iter()
+            .map(|d| (d.id, d))
+            .collect();
+        let hits = ids
+            .into_iter()
+            .zip(scores)
+            .filter_map(|(id, score)| {
+                docs.remove(&id).map(|doc| Hit {
+                    id,
+                    score,
+                    text: doc.text,
+                    metadata: doc.metadata,
+                })
+            })
+            .take(top_k)
+            .collect();
+        Ok((hits, matched))
+    }
+
+    /// Discovery: every field with its type, the documents that carry it, and its values with
+    /// counts. `scope` limits both the documents counted and the values listed. `None` means
+    /// the whole collection, and should only be used by trusted code.
+    fn describe_locked(
+        &self,
+        state: &State,
+        scope: Option<&serde_json::Value>,
+    ) -> Result<serde_json::Value, ZenarError> {
+        healthy(state)?;
+        let (fields, documents) = self.stats_for_scope(state, scope)?;
+        let fields: Vec<serde_json::Value> = fields
+            .iter()
+            .map(|stat| crate::agent::field_json(stat, documents))
+            .collect();
+        Ok(serde_json::json!({
+            "name": self.name,
+            "dimension": state.store.dim(),
+            "bit_width": state.store.bit_width(),
+            "documents": documents,
+            "fields": fields,
+        }))
+    }
+
+    /// Finds values of one field that contain `text` (case-insensitive), most frequent first,
+    /// within `scope`. For fields with many distinct values, where listing them is not useful.
+    fn find_values_locked(
+        &self,
+        state: &State,
+        (field, text, limit, scope): (&str, &str, usize, Option<&serde_json::Value>),
+    ) -> Result<Vec<serde_json::Value>, ZenarError> {
+        healthy(state)?;
+        let (stats, _) = self.stats_for_scope(state, scope)?;
+        let stat = stats.iter().find(|s| s.name == field).ok_or_else(|| {
+            let names: Vec<&str> = stats.iter().map(|s| s.name.as_str()).collect();
+            ZenarError::InvalidFilter(format!(
+                "unknown field {field:?}; filterable fields: {}",
+                names.join(", ")
+            ))
+        })?;
+        let needle = text.to_lowercase();
+        Ok(stat
+            .values
+            .iter()
+            .filter(|(value, _)| crate::agent::value_text(value).to_lowercase().contains(&needle))
+            .take(limit)
+            .map(|(value, count)| {
+                serde_json::json!({"value": crate::agent::value_json(value), "count": count})
+            })
+            .collect())
+    }
+
+    /// Fields and their values as plain text, for a prompt, within `scope`.
+    fn fields_prompt_locked(
+        &self,
+        state: &State,
+        scope: Option<&serde_json::Value>,
+    ) -> Result<String, ZenarError> {
+        healthy(state)?;
+        let (stats, _) = self.stats_for_scope(state, scope)?;
+        Ok(crate::agent::fields_prompt(&stats))
+    }
+
+    /// Tool definition for this collection, within `scope` (see `agent::tool_spec`).
+    fn tool_spec_locked(
+        &self,
+        state: &State,
+        (tool_name, scope): (&str, Option<&serde_json::Value>),
+    ) -> Result<serde_json::Value, ZenarError> {
+        healthy(state)?;
+        let (stats, documents) = self.stats_for_scope(state, scope)?;
+        Ok(crate::agent::tool_spec(
+            tool_name, &self.name, documents, &stats,
+        ))
+    }
+
+    /// The retrieval's parsing under the read lock: the model's `where` and the caller's `scope`, with the warnings
+    /// about the model's values. The model's values and the warnings about them must come from inside the scope, or a
+    /// warning could name another tenant's values. Statistics are only needed for the model's `where`, so they are
+    /// computed only then.
+    fn parse_retrieval(
+        &self,
+        state: &State,
+        (where_, scope): (Option<&serde_json::Value>, Option<&serde_json::Value>),
+    ) -> Result<ParsedRetrieval, ZenarError> {
+        healthy(state)?;
+        let fields = state.docs.fields();
+        let (where_filter, warnings) = match where_ {
+            None => (None, Vec::new()),
+            Some(value) => {
+                let (stats, _) = self.stats_for_scope(state, scope)?;
+                let parsed = crate::agent::parse(value, fields, &stats)?;
+                (parsed.filter, parsed.warnings)
+            }
+        };
+        // The scope's own warnings are not reported, so its statistics are not needed.
+        let scope_filter = match scope {
+            None => None,
+            Some(value) => crate::agent::parse(value, fields, &[])?.filter,
+        };
+        Ok((where_filter, scope_filter, warnings))
+    }
 }
 
 impl Collection {
@@ -630,17 +1471,27 @@ impl Collection {
     ) -> Self {
         let docs_len = docs.log_len();
         Self {
-            name: name.to_string(),
-            stats: Mutex::new(None),
-            scoped: Mutex::new(Vec::new()),
-            index_path,
-            catalog,
-            durable,
+            core: Core {
+                name: name.to_string(),
+                stats: Mutex::new(None),
+                scoped: Mutex::new(Vec::new()),
+                index_path,
+                catalog,
+                durable,
+                counters: WriteCounters::default(),
+                #[cfg(test)]
+                compaction_hook: Mutex::new(None),
+                #[cfg(test)]
+                fail_compaction_at: Mutex::new(None),
+                #[cfg(test)]
+                fail_stage: AtomicBool::new(false),
+                #[cfg(test)]
+                search_retries: AtomicU64::new(0),
+            },
             queue: Mutex::new(Queue::default()),
             compaction: Mutex::new(CompactionSlot::default()),
             self_ref: std::sync::OnceLock::new(),
             ready: Condvar::new(),
-            counters: WriteCounters::default(),
             state: RwLock::new(State {
                 closed: false,
                 store,
@@ -653,31 +1504,20 @@ impl Collection {
             #[cfg(test)]
             window_hook: Mutex::new(None),
             #[cfg(test)]
-            compaction_hook: Mutex::new(None),
-            #[cfg(test)]
-            fail_compaction_at: Mutex::new(None),
-            #[cfg(test)]
-            fail_log_sync: std::sync::atomic::AtomicBool::new(false),
-            #[cfg(test)]
-            fail_stage: std::sync::atomic::AtomicBool::new(false),
-            #[cfg(test)]
-            search_retries: AtomicU64::new(0),
+            fail_log_sync: AtomicBool::new(false),
             admission: Admission::new(),
         }
     }
-
     pub fn name(&self) -> &str {
-        &self.name
+        &self.core.name
     }
 
     pub fn dimension(&self) -> Option<usize> {
-        self.read_state().map(|s| s.store.dim()).unwrap_or(None)
+        self.with_read((), Core::dimension_locked).unwrap_or(None)
     }
-
     pub fn bit_width(&self) -> usize {
-        self.read_state().map(|s| s.store.bit_width()).unwrap_or(0)
+        self.with_read((), Core::bit_width_locked).unwrap_or(0)
     }
-
     /// Adds one document. Concurrent writes to the collection are grouped: see `submit`.
     ///
     /// The document becomes visible only after the index and the log are synced, or, for an add that
@@ -828,169 +1668,23 @@ impl Collection {
         if reqs.is_empty() {
             return;
         }
-        let mut state = match self.write_state_op("add_stage") {
-            Ok(state) => state,
-            Err(e) => return finish_all(&reqs, &e),
+        let step = match self.with_write("add_stage", reqs, Core::stage_adds) {
+            Ok(step) => step,
+            Err((reqs, e)) => return finish_all(&reqs, &e),
         };
-        let mut batch = Batch::new(state.store.dim().is_none());
-        for req in reqs {
-            let Op::Add {
-                records,
-                batch: is_batch,
-            } = &req.op
-            else {
-                unreachable!("run_adds takes only adds");
-            };
-            let count = records.len();
-            let is_batch = *is_batch;
-            match self.stage_request(&mut state, &mut batch, records) {
-                Ok(()) => batch.members.push((req, count, is_batch)),
-                Err(StageError::Request(e)) => req.finish(Err(e)),
-                Err(StageError::Batch(e)) => {
-                    let cause = self.rollback_batch(&mut state, batch, e);
-                    req.finish(Err(cause));
-                    batch = Batch::new(state.store.dim().is_none());
-                }
-            }
-        }
-        self.finish_batch(state, batch);
-    }
-
-    /// Validates one add request and stages it into the batch. A request error leaves the batch as
-    /// it was. A batch error means the batch's writes may be partly done, and the caller rolls it back.
-    fn stage_request(
-        &self,
-        state: &mut WriteGuard<'_>,
-        batch: &mut Batch,
-        records: &[Record],
-    ) -> Result<(), StageError> {
-        healthy(state).map_err(StageError::Request)?;
-        let (values, new_fields) = prepare_batch(state, records).map_err(StageError::Request)?;
-        self.extend_schema(state, &new_fields)
-            .map_err(StageError::Request)?;
-        let refs: Vec<DocRef<'_>> = records
-            .iter()
-            .zip(values.iter())
-            .map(|(r, values)| DocRef {
-                id: r.id,
-                text: r.text.as_str(),
-                metadata: values.as_slice(),
-            })
-            .collect();
-        #[cfg(test)]
-        if self
-            .fail_stage
-            .swap(false, std::sync::atomic::Ordering::SeqCst)
-        {
-            let e = ZenarError::PersistenceError("injected staging failure".into());
-            return Err(StageError::Batch(poison(state, e)));
-        }
-        let staged = state
-            .timed(|s| s.docs.stage_puts(&refs))
-            .map_err(|e| StageError::Batch(poison(state, e)))?;
-        batch.staged.push(staged);
-        for record in records {
-            batch.added.push(record.id);
-            state
-                .store
-                .add(&record.vector, record.id)
-                .map_err(StageError::Batch)?;
-        }
-        Ok(())
-    }
-
-    /// Undoes a batch that could not be committed: removes its vectors, syncs the index to match, and
-    /// truncates the log to the start of the batch. Finishes every member with the cause and returns it.
-    /// If the index cannot be synced to match, or the truncation fails, the collection is poisoned: the
-    /// disk would then disagree with memory, and only a reopen, which reconciles, may continue.
-    fn rollback_batch(&self, state: &mut State, batch: Batch, cause: ZenarError) -> ZenarError {
-        state.pending = 0;
-        for id in &batch.added {
-            state.store.remove(*id);
-        }
-        if !batch.added.is_empty()
-            && let Err(e) = state.store.sync(&self.index_path)
-        {
-            poison(state, e);
-        }
-        let cause = match batch.staged.into_iter().next() {
-            Some(first) => undo_or_poison(state, first, cause),
-            None => cause,
+        let AddStep::Sync { batch, log } = step else {
+            return;
         };
-        for (req, _, _) in &batch.members {
-            req.finish(Err(cause.clone()));
-        }
-        cause
-    }
-
-    /// Syncs a batch and commits it. The index is synced under the write lock, since TurboVec syncs
-    /// from its in-memory state. The log is synced with the lock released, so readers run during its
-    /// fsync. The lock is taken again before the documents are committed. An add that does not reach
-    /// a sync boundary is committed without syncing (docs/STORAGE.md).
-    fn finish_batch<'a>(&'a self, mut state: WriteGuard<'a>, batch: Batch) {
-        if batch.members.is_empty() {
-            return;
-        }
-        let needs_sync = self.durable
-            || batch.members.iter().any(|(_, _, is_batch)| *is_batch)
-            || state.unsynced + batch.added.len() >= SYNC_INTERVAL;
-        if !needs_sync {
-            state.unsynced += batch.added.len();
-            self.commit_batch(&mut state, batch);
-            return;
-        }
-
-        state.pending = batch.added.len();
-        if let Err(e) = state.timed(|s| s.store.sync(&self.index_path)) {
-            self.rollback_batch(&mut state, batch, e);
-            return;
-        }
-        let log = match state.timed(|s| s.docs.sync_handle()) {
-            Ok(log) => log,
-            Err(e) => {
-                self.rollback_batch(&mut state, batch, e);
-                return;
-            }
-        };
-        drop(state);
+        // The lock is released while the log syncs, so readers run during its fsync.
         #[cfg(test)]
         self.run_window_hook();
         let synced = self.sync_log(&log);
-        let mut state = match self.write_state_op("add_commit") {
-            Ok(state) => state,
-            Err(e) => return finish_members(&batch, &e),
-        };
-        if let Err(e) = synced {
-            self.rollback_batch(&mut state, batch, e);
-            return;
-        }
-        state.pending = 0;
-        state.unsynced = 0;
-        self.counters.record_sync_group(batch.members.len());
-        self.commit_batch(&mut state, batch);
-    }
-
-    /// Makes a batch visible and finishes its members. The first vector of a collection fixes its
-    /// dimension, which is recorded in the catalog. If that write fails, the batch is already visible,
-    /// so every member gets the error and may still be applied (docs/STORAGE.md).
-    fn commit_batch(&self, state: &mut State, batch: Batch) {
-        for staged in batch.staged {
-            state.docs.commit(staged);
-            state.committed_len = state.docs.log_len();
-        }
-        let recorded = if batch.was_empty && state.store.dim().is_some() {
-            self.record_dimension(state)
-        } else {
-            Ok(())
-        };
-        for (req, count, _) in &batch.members {
-            req.finish(match &recorded {
-                Ok(()) => Ok(*count),
-                Err(e) => Err(e.clone()),
-            });
+        if let Err(((batch, _), e)) =
+            self.with_write("add_commit", (batch, synced), Core::commit_synced)
+        {
+            finish_members(&batch, &e);
         }
     }
-
     /// Runs a delete, flush or calibration. Each takes the write lock for its own work.
     fn run_other(&self, op: &Op) -> Result<usize, ZenarError> {
         match op {
@@ -1005,96 +1699,31 @@ impl Collection {
     /// Checks the ids of a delete and deletes them. A missing id, or an id repeated in the batch,
     /// changes nothing.
     fn run_delete(&self, ids: &[u64]) -> Result<usize, ZenarError> {
-        let state = self.write_state_op("delete_stage")?;
-        healthy(&state)?;
-        if ids.len() > 1 {
-            let mut seen = HashSet::with_capacity(ids.len());
-            for &id in ids {
-                if !seen.insert(id) {
-                    return Err(ZenarError::InvalidArgument(format!(
-                        "id {id} appears twice in the batch"
-                    )));
-                }
-            }
-        }
-        for &id in ids {
-            if !state.docs.contains(id) {
-                return Err(ZenarError::VectorNotFound(id));
-            }
-        }
-        self.delete_ids(state, ids)?;
-        Ok(ids.len())
-    }
-
-    /// Deletes documents whose ids exist and are unique. The index change is synced under the
-    /// write lock before the tombstones are logged, so a deleted vector leaves the disk first. The
-    /// log is synced with the lock released. Any failure from the index sync on poisons the
-    /// collection, as `delete` documents (docs/STORAGE.md).
-    fn delete_ids<'a>(&'a self, mut state: WriteGuard<'a>, ids: &[u64]) -> Result<(), ZenarError> {
-        // The log shrinks only at a swap, which records its own lengths (see `swap_locked`).
-        let lowering = Instant::now();
-        let lowered = self.lower_recorded_lengths(ids.len(), false);
-        state.add_fs(lowering);
-        lowered?;
-        for &id in ids {
-            state.store.remove(id);
-        }
-        if let Err(e) = state.timed(|s| s.store.sync(&self.index_path)) {
-            return Err(poison(&mut state, e));
-        }
-        let staged = match state.timed(|s| s.docs.stage_deletes(ids)) {
-            Ok(staged) => staged,
-            Err(e) => return Err(poison(&mut state, e)),
-        };
-        let log = match state.timed(|s| s.docs.sync_handle()) {
-            Ok(log) => log,
-            Err(e) => return Err(poison(&mut state, e)),
-        };
-        drop(state);
+        let step = self
+            .with_write("delete_stage", ids, Core::stage_deletes)
+            .map_err(|(_, e)| e)??;
+        // The lock is released while the log syncs, as for adds.
         #[cfg(test)]
         self.run_window_hook();
-        let synced = self.sync_log(&log);
-        let mut state = self.write_state_op("delete_commit")?;
-        if let Err(e) = synced {
-            return Err(poison(&mut state, e));
-        }
-        state.docs.commit(staged);
-        state.committed_len = state.docs.log_len();
-        state.unsynced = 0;
-        if state.docs.should_compact() {
+        let synced = self.sync_log(&step.log);
+        let (compact_due, committed) = self
+            .with_write("delete_commit", (step.staged, synced), Core::commit_deletes)
+            .map_err(|(_, e)| e)?;
+        // The threshold is checked under the lock, and the compaction starts once the lock is released.
+        if compact_due {
             self.start_compaction();
         }
-        let recording = Instant::now();
-        let recorded = self.record_durable(&state);
-        state.add_fs(recording);
-        if let Err(e) = recorded {
-            return Err(poison(&mut state, e));
-        }
-        Ok(())
+        committed?;
+        Ok(ids.len())
     }
-
     fn flush_locked(&self) -> Result<(), ZenarError> {
-        let mut state = self.write_state_op("flush")?;
-        healthy(&state)?;
-        if state.unsynced > 0 || self.durable {
-            self.sync_both(&mut state)?;
-        }
-        // Adds only grow the files, so their recorded lengths can lag until the next flush. Recording
-        // here keeps the shortened-file check exact at every flush and close. Deletes record on their own,
-        // since they are the operations that shrink a file.
-        self.record_durable(&state)?;
-        Ok(())
+        self.with_write("flush", (), Core::flush_state)
+            .map_err(|(_, e)| e)?
     }
-
     fn calibrate_locked(&self, sample: &[f32]) -> Result<(), ZenarError> {
-        let mut state = self.write_state_op("calibrate")?;
-        healthy(&state)?;
-        state.store.calibrate(sample)?;
-        state.timed(|s| s.store.sync(&self.index_path))?;
-        state.unsynced = 0;
-        Ok(())
+        self.with_write("calibrate", sample, Core::calibrate_state)
+            .map_err(|(_, e)| e)?
     }
-
     /// Syncs the log through a handle taken under the lock. Test builds can inject a failure here.
     fn sync_log(&self, log: &std::fs::File) -> Result<(), ZenarError> {
         #[cfg(test)]
@@ -1122,15 +1751,15 @@ impl Collection {
     /// operation that took it, its wait, its hold and the filesystem time timed inside it. Turning it on
     /// clears the trace. A diagnostic: it costs a lock and a push per hold.
     pub fn set_lock_trace(&self, on: bool) {
-        if let Ok(mut trace) = self.counters.trace.lock() {
+        if let Ok(mut trace) = self.core.counters.trace.lock() {
             trace.clear();
         }
-        self.counters.tracing.store(on, Ordering::Relaxed);
+        self.core.counters.tracing.store(on, Ordering::Relaxed);
     }
 
     /// Takes the events recorded since the trace was turned on, and empties the trace.
     pub fn take_lock_trace(&self) -> Vec<LockEvent> {
-        match self.counters.trace.lock() {
+        match self.core.counters.trace.lock() {
             Ok(mut trace) => std::mem::take(&mut *trace),
             Err(_) => Vec::new(),
         }
@@ -1139,7 +1768,7 @@ impl Collection {
     /// Counters for the write path and the readers' waits for the state lock, cumulative since the
     /// collection was opened. A diagnostic: see BENCHMARKS.md, "Several writers".
     pub fn write_stats(&self) -> WriteStats {
-        let c = &self.counters;
+        let c = &self.core.counters;
         let load = |a: &AtomicU64| a.load(Ordering::Relaxed);
         let mut group_writes = [0u64; GROUP_BUCKETS];
         for (out, bucket) in group_writes.iter_mut().zip(c.group_writes.iter()) {
@@ -1159,24 +1788,15 @@ impl Collection {
     }
 
     pub fn get(&self, id: u64) -> Result<Option<DocumentRow>, ZenarError> {
-        let state = self.read_state()?;
-        healthy(&state)?;
-        Ok(state.docs.fetch(&[id])?.into_iter().next())
+        self.with_read(id, Core::get_locked)?
     }
-
     /// Returns found documents in the order of `ids`. Missing ids are skipped.
     pub fn get_many(&self, ids: &[u64]) -> Result<Vec<DocumentRow>, ZenarError> {
-        let state = self.read_state()?;
-        healthy(&state)?;
-        state.docs.fetch(ids)
+        self.with_read(ids, Core::get_many_locked)?
     }
-
     pub fn count(&self) -> Result<usize, ZenarError> {
-        let state = self.read_state()?;
-        healthy(&state)?;
-        Ok(state.docs.live_count())
+        self.with_read((), Core::count_locked)?
     }
-
     /// Top-`top_k` search, optionally filtered (spec sections 18-22).
     ///
     /// * No filter: TurboVec only. Documents are read for the top-K alone.
@@ -1205,123 +1825,15 @@ impl Collection {
                 "top_k must be greater than 0".into(),
             ));
         }
-        let state = self.read_state()?;
-        healthy(&state)?;
-        if state.store.dim().is_none() {
-            return Ok((Vec::new(), 0));
-        }
-        validate_vector(query, state.store.dim())?;
-
-        let (scores, ids, matched) = match filter {
-            None => {
-                let matched = state.docs.live_count();
-                if state.store.is_empty() {
-                    return Ok((Vec::new(), 0));
-                }
-                let (scores, ids) = self.unfiltered_candidates(&state, query, top_k)?;
-                (scores, ids, matched)
-            }
-            Some(filter) => {
-                validate(filter, state.docs.fields())?;
-                let candidates = state.docs.matching_ids(filter)?;
-                let live: Vec<u64> = candidates
-                    .into_iter()
-                    .filter(|id| state.store.contains(*id))
-                    .collect();
-                let matched = live.len();
-                if live.is_empty() {
-                    return Ok((Vec::new(), 0));
-                }
-                let k = top_k.min(live.len());
-                let (scores, ids) = state.store.search(query, k, Some(&live))?;
-                (scores, ids, matched)
-            }
-        };
-        if ids.is_empty() {
-            return Ok((Vec::new(), matched));
-        }
-        let mut docs: HashMap<u64, DocumentRow> = state
-            .docs
-            .fetch(&ids)?
-            .into_iter()
-            .map(|d| (d.id, d))
-            .collect();
-        let hits = ids
-            .into_iter()
-            .zip(scores)
-            .filter_map(|(id, score)| {
-                docs.remove(&id).map(|doc| Hit {
-                    id,
-                    score,
-                    text: doc.text,
-                    metadata: doc.metadata,
-                })
-            })
-            .take(top_k)
-            .collect();
-        Ok((hits, matched))
+        self.with_read((query, top_k, filter), Core::search_locked)?
     }
 
-    /// Candidates for an unfiltered search, best first, as `(score, id)` pairs of the index: the first pass, or the
-    /// full over-fetch when the first pass lacks committed results.
-    ///
-    /// Vectors whose documents are not committed yet can rank in the top results (`pending` of them at most).
-    /// The first pass over-fetches only `min(pending, SEARCH_OVERFETCH_CAP)` for them. If it returns fewer than
-    /// `top_k` committed candidates while more than the cap is pending, a retry asks for the full
-    /// `top_k + pending`, which always holds at least `min(top_k, committed)` committed candidates. Both passes
-    /// run under the caller's read guard, so they see the same index and the same `pending`. The caller drops
-    /// the uncommitted candidates. Arithmetic saturates, so a very large `top_k` cannot wrap.
-    fn unfiltered_candidates(
-        &self,
-        state: &State,
-        query: &[f32],
-        top_k: usize,
-    ) -> Result<(Vec<f32>, Vec<u64>), ZenarError> {
-        let pending = state.pending;
-        let full = top_k.saturating_add(pending).min(state.store.len());
-        let first = top_k
-            .saturating_add(pending.min(SEARCH_OVERFETCH_CAP))
-            .min(state.store.len());
-        let (scores, ids) = state.store.search(query, first, None)?;
-        if pending <= SEARCH_OVERFETCH_CAP || first >= full {
-            return Ok((scores, ids));
-        }
-        let committed = ids
-            .iter()
-            .filter(|id| state.docs.contains(**id))
-            .take(top_k)
-            .count();
-        if committed >= top_k {
-            return Ok((scores, ids));
-        }
-        #[cfg(test)]
-        self.search_retries.fetch_add(1, Ordering::Relaxed);
-        state.store.search(query, full, None)
-    }
-
-    /// Discovery: every field with its type, the documents that carry it, and its values with
-    /// counts. `scope` limits both the documents counted and the values listed. `None` means
-    /// the whole collection, and should only be used by trusted code.
     pub fn describe(
         &self,
         scope: Option<&serde_json::Value>,
     ) -> Result<serde_json::Value, ZenarError> {
-        let state = self.read_state()?;
-        healthy(&state)?;
-        let (fields, documents) = self.stats_for_scope(&state, scope)?;
-        let fields: Vec<serde_json::Value> = fields
-            .iter()
-            .map(|stat| crate::agent::field_json(stat, documents))
-            .collect();
-        Ok(serde_json::json!({
-            "name": self.name,
-            "dimension": state.store.dim(),
-            "bit_width": state.store.bit_width(),
-            "documents": documents,
-            "fields": fields,
-        }))
+        self.with_read(scope, Core::describe_locked)?
     }
-
     /// Finds values of one field that contain `text` (case-insensitive), most frequent first,
     /// within `scope`. For fields with many distinct values, where listing them is not useful.
     pub fn find_values(
@@ -1331,28 +1843,8 @@ impl Collection {
         limit: usize,
         scope: Option<&serde_json::Value>,
     ) -> Result<Vec<serde_json::Value>, ZenarError> {
-        let state = self.read_state()?;
-        healthy(&state)?;
-        let (stats, _) = self.stats_for_scope(&state, scope)?;
-        let stat = stats.iter().find(|s| s.name == field).ok_or_else(|| {
-            let names: Vec<&str> = stats.iter().map(|s| s.name.as_str()).collect();
-            ZenarError::InvalidFilter(format!(
-                "unknown field {field:?}; filterable fields: {}",
-                names.join(", ")
-            ))
-        })?;
-        let needle = text.to_lowercase();
-        Ok(stat
-            .values
-            .iter()
-            .filter(|(value, _)| crate::agent::value_text(value).to_lowercase().contains(&needle))
-            .take(limit)
-            .map(|(value, count)| {
-                serde_json::json!({"value": crate::agent::value_json(value), "count": count})
-            })
-            .collect())
+        self.with_read((field, text, limit, scope), Core::find_values_locked)?
     }
-
     /// Retrieval for an agent.
     ///
     /// `where_` is the model's filter. `scope` is the caller's fixed filter, such as the tenant.
@@ -1366,29 +1858,9 @@ impl Collection {
         where_: Option<&serde_json::Value>,
         scope: Option<&serde_json::Value>,
     ) -> Result<Retrieval, ZenarError> {
-        let (where_filter, scope_filter, warnings) = {
-            // One read lock for parsing. It is released before the search takes its own.
-            let state = self.read_state()?;
-            healthy(&state)?;
-            let fields = state.docs.fields();
-            // The model's values and the warnings about them must come from inside the scope, or a
-            // warning could name another tenant's values. Statistics are only needed for the model's
-            // `where`, so they are computed only then.
-            let (where_filter, warnings) = match where_ {
-                None => (None, Vec::new()),
-                Some(value) => {
-                    let (stats, _) = self.stats_for_scope(&state, scope)?;
-                    let parsed = crate::agent::parse(value, fields, &stats)?;
-                    (parsed.filter, parsed.warnings)
-                }
-            };
-            // The scope's own warnings are not reported, so its statistics are not needed.
-            let scope_filter = match scope {
-                None => None,
-                Some(value) => crate::agent::parse(value, fields, &[])?.filter,
-            };
-            (where_filter, scope_filter, warnings)
-        };
+        // One read lock for parsing. It is released before the search takes its own.
+        let (where_filter, scope_filter, warnings) =
+            self.with_read((where_, scope), Core::parse_retrieval)??;
         let applied = match &where_filter {
             Some(f) => crate::agent::describe_filter(f),
             None => "no filter (all documents in scope)".to_string(),
@@ -1407,15 +1879,10 @@ impl Collection {
             warnings,
         })
     }
-
     /// Fields and their values as plain text, for a prompt, within `scope`.
     pub fn fields_prompt(&self, scope: Option<&serde_json::Value>) -> Result<String, ZenarError> {
-        let state = self.read_state()?;
-        healthy(&state)?;
-        let (stats, _) = self.stats_for_scope(&state, scope)?;
-        Ok(crate::agent::fields_prompt(&stats))
+        self.with_read(scope, Core::fields_prompt_locked)?
     }
-
     /// Tool definition for this collection, within `scope` (see `agent::tool_spec`).
     pub fn tool_spec(
         &self,
@@ -1434,184 +1901,18 @@ impl Collection {
                 "tool name {tool_name:?} must be 1 to 64 letters, digits, '_' or '-'"
             )));
         }
-        let state = self.read_state()?;
-        healthy(&state)?;
-        let (stats, documents) = self.stats_for_scope(&state, scope)?;
-        Ok(crate::agent::tool_spec(
-            tool_name, &self.name, documents, &stats,
-        ))
+        self.with_read((tool_name, scope), Core::tool_spec_locked)?
     }
 
-    /// Statistics and document count for a scope. `None` is the whole collection. A scope is
-    /// computed once and reused until the next write, since discovery repeats the same scope.
-    fn stats_for_scope(
-        &self,
-        state: &State,
-        scope: Option<&serde_json::Value>,
-    ) -> Result<(Arc<Vec<FieldStats>>, usize), ZenarError> {
-        let Some(value) = scope else {
-            return Ok((self.cached_stats(state)?, state.docs.live_count()));
-        };
-        let key = value.to_string();
-        {
-            let scoped = self
-                .scoped
-                .lock()
-                .map_err(|_| ZenarError::VectorStoreError("scope cache poisoned".into()))?;
-            if let Some(entry) = scoped.iter().find(|e| e.key == key) {
-                return Ok((Arc::clone(&entry.stats), entry.documents));
-            }
-        }
-        let rows = self.scope_rows(state, Some(value))?.unwrap_or_default();
-        let stats = Arc::new(state.docs.field_stats_in(&rows));
-        let documents = rows.len();
-        let mut scoped = self
-            .scoped
-            .lock()
-            .map_err(|_| ZenarError::VectorStoreError("scope cache poisoned".into()))?;
-        if scoped.len() >= SCOPE_CACHE_ENTRIES {
-            scoped.remove(0);
-        }
-        scoped.push(ScopedEntry {
-            key,
-            stats: Arc::clone(&stats),
-            documents,
-        });
-        Ok((stats, documents))
-    }
-
-    /// The live rows that `scope` allows. `None` for no scope, meaning the whole collection.
-    /// An empty scope object allows every live document.
-    fn scope_rows(
-        &self,
-        state: &State,
-        scope: Option<&serde_json::Value>,
-    ) -> Result<Option<Vec<u32>>, ZenarError> {
-        let Some(value) = scope else {
-            return Ok(None);
-        };
-        // The scope is parsed by the same code as `where`, so the message must name the argument.
-        if !value.is_object() {
-            return Err(ZenarError::InvalidFilter(
-                "scope must be a JSON object, for example {\"tenant\": \"A\"}".into(),
-            ));
-        }
-        let stats = self.cached_stats(state)?;
-        let filter = crate::agent::parse(value, state.docs.fields(), &stats)?
-            .filter
-            .unwrap_or(Filter::And(Vec::new()));
-        validate(&filter, state.docs.fields())?;
-        Ok(Some(state.docs.matching_rows(&filter)?))
-    }
-
-    /// Reconciles the document log and the vector index after a restart (spec section 26).
     pub fn reconcile(&self) -> Result<RecoveryReport, ZenarError> {
-        let mut state = self.write_state_op("reconcile")?;
-        healthy(&state)?;
-        let mut report = RecoveryReport::default();
-
-        let live: HashSet<u64> = state.docs.live_ids().into_iter().collect();
-        let mut orphan_docs: Vec<u64> = live
-            .iter()
-            .copied()
-            .filter(|id| !state.store.contains(*id))
-            .collect();
-        orphan_docs.sort_unstable();
-        let mut dirty = false;
-        for id in orphan_docs {
-            let staged = state.docs.stage_delete(id)?;
-            state.docs.commit(staged);
-            state.committed_len = state.docs.log_len();
-            report.orphaned_rows_removed += 1;
-            dirty = true;
-        }
-
-        let stray: Vec<u64> = state.store.ids().filter(|id| !live.contains(id)).collect();
-        for id in stray {
-            state.store.remove(id);
-            report.orphaned_vectors_removed += 1;
-            dirty = true;
-        }
-
-        if dirty {
-            self.sync_both(&mut state)?;
-        }
-        Ok(report)
+        self.with_write("reconcile", (), Core::reconcile_state)
+            .map_err(|(_, e)| e)?
     }
-
     /// Writes the current index file (used when a new collection is created with a dimension).
     pub(crate) fn persist(&self) -> Result<(), ZenarError> {
-        let mut state = self.write_state_op("persist")?;
-        state.timed(|s| s.store.sync(&self.index_path))?;
-        state.unsynced = 0;
-        Ok(())
+        self.with_write("persist", (), Core::persist_state)
+            .map_err(|(_, e)| e)?
     }
-
-    /// Persists new schema fields in the catalog, then extends the in-memory schema.
-    /// The order matters. A record that uses a new field must not reach the log before the
-    /// catalog knows the field, or reopening would fail.
-    fn extend_schema(
-        &self,
-        state: &mut State,
-        new_fields: &[(String, FieldKind)],
-    ) -> Result<(), ZenarError> {
-        if new_fields.is_empty() {
-            return Ok(());
-        }
-        let added: Vec<(String, String)> = new_fields
-            .iter()
-            .map(|(n, k)| (n.clone(), k.as_str().to_string()))
-            .collect();
-        self.catalog
-            .update(&self.name, |entry| entry.fields.extend(added))?;
-        state.docs.extend_fields(new_fields);
-        Ok(())
-    }
-
-    fn record_dimension(&self, state: &State) -> Result<(), ZenarError> {
-        if let Some(dim) = state.store.dim() {
-            self.catalog
-                .update(&self.name, |entry| entry.dimension = Some(dim))?;
-        }
-        Ok(())
-    }
-
-    /// Syncs the vector index and the document log. Both must succeed.
-    fn sync_both(&self, state: &mut WriteGuard<'_>) -> Result<(), ZenarError> {
-        state.timed(|s| s.store.sync(&self.index_path))?;
-        state.docs.sync()?;
-        state.unsynced = 0;
-        Ok(())
-    }
-
-    /// Lowers the recorded lengths before a delete changes anything on disk. The index can lose
-    /// `deleting` vectors when it is synced, and the log shrinks only when compaction runs, so
-    /// before the delete is recorded again a crash can leave each file between its recorded length
-    /// and that length less `deleting`. Lowering by exactly that keeps the shortened-file check
-    /// on, so a file that is missing or cut short is still refused. Zeroing the log length is
-    /// needed only when compaction runs.
-    fn lower_recorded_lengths(&self, deleting: usize, compacting: bool) -> Result<(), ZenarError> {
-        self.catalog.update(&self.name, |entry| {
-            entry.durable_vectors = entry.durable_vectors.saturating_sub(deleting);
-            if compacting {
-                entry.durable_log_len = 0;
-            }
-        })
-    }
-
-    /// Records how far the log and the vector index are synced. Call it right after a successful
-    /// sync, and after compaction, since both change what is durable.
-    fn record_durable(&self, state: &State) -> Result<(), ZenarError> {
-        let log_len = state.docs.log_len();
-        let vectors = state.store.len();
-        self.catalog.update(&self.name, |entry| {
-            entry.durable_log_len = log_len;
-            entry.durable_vectors = vectors;
-            // Recording the lengths also ends any compaction that was recorded as pending.
-            entry.compaction_pending = None;
-        })
-    }
-
     /// Starts a background build of the compacted structure, unless one is running. The build holds no lock
     /// while it works. Its result is swapped in by a queued `Op::Compact`, so no write group is in its window
     /// during the swap (docs/R3.md, section 4).
@@ -1664,8 +1965,8 @@ impl Collection {
         // would fail the same way and start again, without end. The next delete starts the next attempt.
         let due = result.is_ok()
             && self
-                .read_state()
-                .is_ok_and(|state| state.docs.should_compact());
+                .with_read((), |_, state, ()| state.docs.should_compact())
+                .is_ok_and(|due| due);
         if due {
             self.start_compaction();
         }
@@ -1681,15 +1982,7 @@ impl Collection {
     ///
     /// Writes continue meanwhile. They append to the old log, and the swap copies whatever is left.
     fn build_compaction(&self) -> Result<Built, ZenarError> {
-        let (path, fields, snapshot) = {
-            let state = self.read_state()?;
-            healthy(&state)?;
-            (
-                state.docs.log_path().to_path_buf(),
-                state.docs.fields().to_vec(),
-                state.committed_len,
-            )
-        };
+        let (path, fields, snapshot) = self.with_read((), Core::compaction_snapshot)??;
         let tmp = path.with_extension("log.compact");
         let _ = fs::remove_file(&tmp);
         match self.build_into(&path, &tmp, fields, snapshot) {
@@ -1714,23 +2007,23 @@ impl Collection {
         fields: Vec<(String, FieldKind)>,
         snapshot: u64,
     ) -> Result<(DocStore, u64), ZenarError> {
-        self.compaction_point("build snapshot")?;
+        self.core.compaction_point("build snapshot")?;
         DocStore::write_snapshot(path, snapshot, tmp)?;
-        self.compaction_point("build temp synced")?;
+        self.core.compaction_point("build temp synced")?;
         let mut docs = DocStore::open(tmp, fields)?;
-        self.compaction_point("build replayed")?;
+        self.core.compaction_point("build replayed")?;
         let mut tail_from = snapshot;
         for _ in 0..CATCH_UP_ROUNDS {
-            let watermark = self.read_state()?.committed_len;
+            let watermark = self.with_read((), |_, state, ()| state.committed_len)?;
             if watermark.saturating_sub(tail_from) < CATCH_UP_BYTES {
                 break;
             }
             let bytes = DocStore::read_log_range(path, tail_from, watermark)?;
             docs.append_raw(&bytes)?;
             tail_from = watermark;
-            self.compaction_point("catch-up round")?;
+            self.core.compaction_point("catch-up round")?;
         }
-        self.compaction_point("build done")?;
+        self.core.compaction_point("build done")?;
         Ok((docs, tail_from))
     }
 
@@ -1745,121 +2038,16 @@ impl Collection {
         let Some(built) = built else {
             return Ok(());
         };
-        let state = self.write_state_op("swap")?;
+        let old = self
+            .with_write("swap", built, Core::swap_locked)
+            .map_err(|(_, e)| e)??;
         // The old structure comes back out of the swap and is dropped here, after the lock is released, so
         // freeing its rows and postings does not add to the writers' wait.
-        if let Some(old) = self.swap_locked(state, built)? {
+        if let Some(old) = old {
             drop(old);
         }
         Ok(())
     }
-
-    /// The swap (docs/R3.md, section 4). Failures before the rename undo themselves, and leave the collection
-    /// usable. A failure after the rename poisons it, and a reopen settles the catalog and the log. On success
-    /// the old structure is returned, for the caller to drop once the lock is released.
-    fn swap_locked(
-        &self,
-        mut state: WriteGuard<'_>,
-        built: Built,
-    ) -> Result<Option<DocStore>, ZenarError> {
-        let Built {
-            mut docs,
-            tmp,
-            tail_from,
-        } = built;
-        let path = state.docs.log_path().to_path_buf();
-        let prior = self
-            .catalog
-            .get(&self.name)?
-            .ok_or_else(|| ZenarError::CollectionNotFound(self.name.clone()))?;
-        // Before the rename: copy the final tail, sync the temporary log, and record the pending lengths.
-        let fs_start = Instant::now();
-        let before_rename = (|| -> Result<(), ZenarError> {
-            healthy(&state)?;
-            let bytes = DocStore::read_log_range(&path, tail_from, state.committed_len)?;
-            docs.append_raw(&bytes)?;
-            self.compaction_point("swap tail")?;
-            docs.sync()?;
-            self.compaction_point("swap tail synced")?;
-            let new_len = docs.log_len();
-            let old_len = state.docs.log_len();
-            self.catalog.update(&self.name, |e| {
-                e.durable_log_len = new_len;
-                e.compaction_pending = Some(old_len);
-            })?;
-            self.compaction_point("pending recorded")?;
-            Ok(())
-        })();
-        state.add_fs(fs_start);
-        if let Err(e) = before_rename {
-            drop(docs);
-            let _ = fs::remove_file(&tmp);
-            return self
-                .undo_before_rename(&mut state, &prior, e)
-                .map(|()| None);
-        }
-        // The rename. The old log's handle is released first, as Windows requires.
-        let rename_start = Instant::now();
-        state.docs.release_handle();
-        if let Err(e) = fs::rename(&tmp, &path) {
-            let _ = fs::remove_file(&tmp);
-            if let Err(reattach) = state.docs.reattach() {
-                return Err(poison(&mut state, reattach));
-            }
-            return self
-                .undo_before_rename(&mut state, &prior, crate::docstore::io_err(e))
-                .map(|()| None);
-        }
-        // From here the file on disk is the new log, and the memory must follow it.
-        if let Err(e) = self.compaction_point("renamed") {
-            return Err(poison(&mut state, e));
-        }
-        let synced_parent = crate::docstore::sync_parent(&path);
-        state.add_fs(rename_start);
-        if let Err(e) = synced_parent {
-            return Err(poison(&mut state, e));
-        }
-        if let Err(e) = self.compaction_point("directory synced") {
-            return Err(poison(&mut state, e));
-        }
-        // The new structure already has an open handle on the renamed file, so no reopen is needed.
-        docs.retarget(&path);
-        let old = std::mem::replace(&mut state.docs, docs);
-        if let Err(e) = self.compaction_point("swapped") {
-            return Err(poison(&mut state, e));
-        }
-        let recording = Instant::now();
-        let recorded = self.record_durable(&state);
-        state.add_fs(recording);
-        if let Err(e) = recorded {
-            return Err(poison(&mut state, e));
-        }
-        if let Err(e) = self.compaction_point("pending cleared") {
-            return Err(poison(&mut state, e));
-        }
-        state.committed_len = state.docs.log_len();
-        state.unsynced = 0;
-        Ok(Some(old))
-    }
-
-    /// Puts the catalog entry back to its state before the compaction. If that write fails, the catalog may
-    /// still hold the pending record, which a reopen settles, so the collection is poisoned.
-    fn undo_before_rename(
-        &self,
-        state: &mut WriteGuard<'_>,
-        prior: &Entry,
-        cause: ZenarError,
-    ) -> Result<(), ZenarError> {
-        let (len, pending) = (prior.durable_log_len, prior.compaction_pending);
-        match self.catalog.update(&self.name, |e| {
-            e.durable_log_len = len;
-            e.compaction_pending = pending;
-        }) {
-            Ok(()) => Err(cause),
-            Err(e) => Err(poison(state, e)),
-        }
-    }
-
     /// Starts a compaction and waits for it, on this thread. Test use only.
     #[cfg(test)]
     pub(crate) fn compact_now(&self) -> Result<(), ZenarError> {
@@ -1896,7 +2084,7 @@ impl Collection {
     /// Test only: how many unfiltered searches retried with the full over-fetch.
     #[cfg(test)]
     pub(crate) fn search_retry_count(&self) -> u64 {
-        self.search_retries.load(Ordering::Relaxed)
+        self.core.search_retries.load(Ordering::Relaxed)
     }
 
     /// Waits for a background compaction to finish. Test use only.
@@ -1918,32 +2106,6 @@ impl Collection {
         let _ = self.self_ref.set(Arc::downgrade(self));
     }
 
-    /// Test hook at each transition of a compaction. A hook can observe the directory (to copy it, as a
-    /// crash would leave it), and a configured point fails with an injected error.
-    #[cfg(test)]
-    fn compaction_point(&self, point: &'static str) -> Result<(), ZenarError> {
-        let hook = self.compaction_hook.lock().ok().and_then(|h| h.clone());
-        if let Some(hook) = hook {
-            hook(point);
-        }
-        let mut fail = self
-            .fail_compaction_at
-            .lock()
-            .unwrap_or_else(|p| p.into_inner());
-        if *fail == Some(point) {
-            *fail = None;
-            return Err(ZenarError::PersistenceError(format!(
-                "injected failure at {point}"
-            )));
-        }
-        Ok(())
-    }
-
-    #[cfg(not(test))]
-    fn compaction_point(&self, _point: &'static str) -> Result<(), ZenarError> {
-        Ok(())
-    }
-
     fn read_state(&self) -> Result<StateRead<'_>, ZenarError> {
         debug_assert_eq!(
             READS_HELD.with(|n| n.get()),
@@ -1958,14 +2120,14 @@ impl Collection {
             .map_err(|_| ZenarError::VectorStoreError("collection lock poisoned".into()))?;
         READS_HELD.with(|n| n.set(n.get() + 1));
         let guard = StateRead { guard };
-        self.counters.record_read_wait(waiting.elapsed());
+        self.core.counters.record_read_wait(waiting.elapsed());
         self.not_closed(&guard)?;
         Ok(guard)
     }
 
     fn not_closed(&self, state: &State) -> Result<(), ZenarError> {
         if state.closed {
-            return Err(ZenarError::CollectionClosed(self.name.clone()));
+            return Err(ZenarError::CollectionClosed(self.core.name.clone()));
         }
         Ok(())
     }
@@ -1999,34 +2161,42 @@ impl Collection {
         self.not_closed(&guard)?;
         // Every mutation takes the write lock first, so clearing here means no reader can store
         // statistics computed before the mutation after it has been cleared.
-        if let Ok(mut cache) = self.stats.lock() {
+        if let Ok(mut cache) = self.core.stats.lock() {
             *cache = None;
         }
-        if let Ok(mut scoped) = self.scoped.lock() {
+        if let Ok(mut scoped) = self.core.scoped.lock() {
             scoped.clear();
         }
         Ok(WriteGuard {
             guard,
             since,
-            counters: &self.counters,
+            counters: &self.core.counters,
             op,
             waited_ns,
             fs_ns: 0,
         })
     }
 
-    /// Field statistics, cached until the next write.
-    fn cached_stats(&self, state: &State) -> Result<Arc<Vec<FieldStats>>, ZenarError> {
-        let mut cache = self
-            .stats
-            .lock()
-            .map_err(|_| ZenarError::VectorStoreError("stats cache poisoned".into()))?;
-        if let Some(stats) = cache.as_ref() {
-            return Ok(Arc::clone(stats));
-        }
-        let stats = Arc::new(state.docs.field_stats());
-        *cache = Some(Arc::clone(&stats));
-        Ok(stats)
+    /// Runs `f` on the state under a read guard. `f` is a function pointer, not a closure, so it gets only `Core`
+    /// and the state. It cannot take the state lock again, and it cannot reach `Collection`.
+    fn with_read<A, R>(&self, arg: A, f: fn(&Core, &State, A) -> R) -> Result<R, ZenarError> {
+        let state = self.read_state()?;
+        Ok(f(&self.core, &state, arg))
+    }
+
+    /// Runs `f` on the state under the write guard for `op`. A function pointer, as for `with_read`. When the
+    /// lock cannot be taken, `arg` comes back with the error, so that the caller can finish what it holds.
+    fn with_write<A, R>(
+        &self,
+        op: &'static str,
+        arg: A,
+        f: fn(&Core, &mut WriteGuard<'_>, A) -> R,
+    ) -> Result<R, (A, ZenarError)> {
+        let mut state = match self.write_state_op(op) {
+            Ok(state) => state,
+            Err(e) => return Err((arg, e)),
+        };
+        Ok(f(&self.core, &mut state, arg))
     }
 }
 
@@ -2038,7 +2208,7 @@ impl Drop for Collection {
             && state.poisoned.is_none()
             && state.unsynced > 0
         {
-            let _ = state.store.sync(&self.index_path);
+            let _ = state.store.sync(&self.core.index_path);
             let _ = state.docs.sync();
             state.unsynced = 0;
         }
@@ -2267,7 +2437,7 @@ mod recovery_tests {
             db.flush().unwrap();
             let mut state = c.write_state().unwrap();
             state.store.add(&v(2.0), 2).unwrap();
-            state.store.sync(&c.index_path).unwrap();
+            state.store.sync(&c.core.index_path).unwrap();
         }
         let db = VectorDB::open(&dir).unwrap();
         assert_eq!(db.recovery_report().orphaned_vectors_removed, 1);
@@ -2582,7 +2752,7 @@ mod recovery_tests {
             c.add(2, &v(2.0), "two", vec![]).unwrap();
             db.flush().unwrap();
             // The window a delete opens, then a crash: poisoning keeps the drop from recording again.
-            c.lower_recorded_lengths(1, false).unwrap();
+            c.core.lower_recorded_lengths(1, false).unwrap();
             c.write_state().unwrap().poisoned = Some("simulated crash".into());
         }
         fs::remove_file(dir.join("vectors").join("cd.zvec")).unwrap();
@@ -3375,7 +3545,7 @@ mod recovery_tests {
                     .collect::<Vec<_>>(),
             )
             .unwrap();
-            c.fail_stage.store(true, Ordering::SeqCst);
+            c.core.fail_stage.store(true, Ordering::SeqCst);
             let batch: Vec<Record> = (10..14)
                 .map(|i| Record {
                     id: i,
@@ -3642,7 +3812,7 @@ mod recovery_tests {
         let copies = temp_dir("crash-transitions-copies");
         let (db, c) = compacting_fixture(&dir);
         let (src, dst) = (dir.clone(), copies.clone());
-        *c.compaction_hook.lock().unwrap() = Some(Arc::new(move |point: &'static str| {
+        *c.core.compaction_hook.lock().unwrap() = Some(Arc::new(move |point: &'static str| {
             copy_tree(&src, &dst.join(point.replace(' ', "_")));
         }));
         assert_eq!(
@@ -3650,7 +3820,7 @@ mod recovery_tests {
             6000
         );
         c.wait_for_compaction();
-        *c.compaction_hook.lock().unwrap() = None;
+        *c.core.compaction_hook.lock().unwrap() = None;
         drop(c);
         drop(db);
         // The original reopens too.
@@ -3682,7 +3852,7 @@ mod recovery_tests {
         for point in COMPACTION_POINTS {
             let dir = temp_dir(&format!("fail-{}", point.replace(' ', "-")));
             let (db, c) = compacting_fixture(&dir);
-            *c.fail_compaction_at.lock().unwrap() = Some(point);
+            *c.core.fail_compaction_at.lock().unwrap() = Some(point);
             assert!(
                 c.delete_many(&(0..6000).collect::<Vec<u64>>()).is_ok(),
                 "{point}"
@@ -3723,14 +3893,14 @@ mod recovery_tests {
         let copies = temp_dir("pending-unexpected-copy");
         let (db, c) = compacting_fixture(&dir);
         let (src, dst) = (dir.clone(), copies.clone());
-        *c.compaction_hook.lock().unwrap() = Some(Arc::new(move |point: &'static str| {
+        *c.core.compaction_hook.lock().unwrap() = Some(Arc::new(move |point: &'static str| {
             if point == "pending recorded" {
                 copy_tree(&src, &dst);
             }
         }));
         c.delete_many(&(0..6000).collect::<Vec<u64>>()).unwrap();
         c.wait_for_compaction();
-        *c.compaction_hook.lock().unwrap() = None;
+        *c.core.compaction_hook.lock().unwrap() = None;
         drop(c);
         drop(db);
         // The copy holds pending = old length, with the old log. Truncate the log to a third length.
@@ -3765,12 +3935,12 @@ mod recovery_tests {
         let (db, c) = compacting_fixture(&dir);
         let seen = Arc::new(Mutex::new(Vec::<&'static str>::new()));
         let log = Arc::clone(&seen);
-        *c.compaction_hook.lock().unwrap() = Some(Arc::new(move |point: &'static str| {
+        *c.core.compaction_hook.lock().unwrap() = Some(Arc::new(move |point: &'static str| {
             log.lock().unwrap().push(point);
         }));
         c.delete_many(&(0..6000).collect::<Vec<u64>>()).unwrap();
         c.wait_for_compaction();
-        *c.compaction_hook.lock().unwrap() = None;
+        *c.core.compaction_hook.lock().unwrap() = None;
         assert_eq!(*seen.lock().unwrap(), COMPACTION_POINTS.to_vec());
         drop(c);
         drop(db);
@@ -3787,7 +3957,7 @@ mod recovery_tests {
         let log = Arc::clone(&seen);
         let writer = Arc::clone(&c);
         let fired = std::sync::atomic::AtomicBool::new(false);
-        *c.compaction_hook.lock().unwrap() = Some(Arc::new(move |point: &'static str| {
+        *c.core.compaction_hook.lock().unwrap() = Some(Arc::new(move |point: &'static str| {
             log.lock().unwrap().push(point);
             if point == "build replayed" && !fired.swap(true, std::sync::atomic::Ordering::SeqCst) {
                 let records: Vec<Record> = (20_000..22_000)
@@ -3806,7 +3976,7 @@ mod recovery_tests {
         }));
         c.delete_many(&(0..6000).collect::<Vec<u64>>()).unwrap();
         c.wait_for_compaction();
-        *c.compaction_hook.lock().unwrap() = None;
+        *c.core.compaction_hook.lock().unwrap() = None;
         assert!(
             seen.lock().unwrap().contains(&"catch-up round"),
             "{:?}",
@@ -3860,7 +4030,7 @@ mod recovery_tests {
         let during = Arc::new(Mutex::new(Vec::<Vec<u64>>::new()));
         let sink = Arc::clone(&during);
         let reader = Arc::clone(&c);
-        *c.compaction_hook.lock().unwrap() = Some(Arc::new(move |point: &'static str| {
+        *c.core.compaction_hook.lock().unwrap() = Some(Arc::new(move |point: &'static str| {
             // Only the build runs without the collection lock. A swap point holds it, so a search there would wait.
             if point == "build done" {
                 for k in [1usize, 10, 50, 5000] {
@@ -3876,7 +4046,7 @@ mod recovery_tests {
         }));
         c.delete_many(&(0..6000).collect::<Vec<u64>>()).unwrap();
         c.wait_for_compaction();
-        *c.compaction_hook.lock().unwrap() = None;
+        *c.core.compaction_hook.lock().unwrap() = None;
         // The reference was taken before the delete, so it includes deleted ids. Compare against the
         // results after the delete, taken with the same query and k.
         let after: Vec<Vec<u64>> = [1usize, 10, 50, 5000]
@@ -3983,7 +4153,7 @@ mod recovery_tests {
     fn failed_build_leaves_no_temporary_log() {
         let dir = temp_dir("failed-build-tmp");
         let (db, c) = compacting_fixture(&dir);
-        *c.fail_compaction_at.lock().unwrap() = Some("build replayed");
+        *c.core.fail_compaction_at.lock().unwrap() = Some("build replayed");
         c.delete_many(&(0..6000).collect::<Vec<u64>>()).unwrap();
         c.wait_for_compaction();
         assert!(!dir.join("docs").join("cp.log.compact").exists());
@@ -4026,7 +4196,7 @@ mod recovery_tests {
         // 5,000 more: after the swap that is 3,000 live and 5,000 dead, which is due again.
         let fired = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let reader = Arc::clone(&c);
-        *c.compaction_hook.lock().unwrap() = Some(Arc::new(move |point: &'static str| {
+        *c.core.compaction_hook.lock().unwrap() = Some(Arc::new(move |point: &'static str| {
             if point == "build done" && !fired.swap(true, Ordering::SeqCst) {
                 reader
                     .delete_many(&(12_000..17_000).collect::<Vec<u64>>())
@@ -4069,7 +4239,7 @@ mod recovery_tests {
         entered_rx.recv().unwrap();
         let swapped = Arc::new(AtomicBool::new(false));
         let flag = Arc::clone(&swapped);
-        *c.compaction_hook.lock().unwrap() = Some(Arc::new(move |point: &'static str| {
+        *c.core.compaction_hook.lock().unwrap() = Some(Arc::new(move |point: &'static str| {
             if point == "swapped" {
                 flag.store(true, Ordering::SeqCst);
             }
@@ -4100,7 +4270,7 @@ mod recovery_tests {
         let (db, c) = compacting_fixture(&dir);
         let reader = Arc::clone(&c);
         let fired = AtomicBool::new(false);
-        *c.compaction_hook.lock().unwrap() = Some(Arc::new(move |point: &'static str| {
+        *c.core.compaction_hook.lock().unwrap() = Some(Arc::new(move |point: &'static str| {
             if point == "build done" && !fired.swap(true, Ordering::SeqCst) {
                 reader.delete_many(&[7000, 7001, 7002]).unwrap();
             }
@@ -4128,7 +4298,7 @@ mod recovery_tests {
         let (db, c) = compacting_fixture(&dir);
         let reader = Arc::clone(&c);
         let fired = AtomicBool::new(false);
-        *c.compaction_hook.lock().unwrap() = Some(Arc::new(move |point: &'static str| {
+        *c.core.compaction_hook.lock().unwrap() = Some(Arc::new(move |point: &'static str| {
             if point == "build done" && !fired.swap(true, Ordering::SeqCst) {
                 reader.delete_many(&[7000]).unwrap();
                 reader
@@ -4247,7 +4417,7 @@ mod recovery_tests {
         let copies = temp_dir("pending-old-copies");
         let (db, c) = compacting_fixture(&dir);
         let (src, dst) = (dir.clone(), copies.clone());
-        *c.compaction_hook.lock().unwrap() = Some(Arc::new(move |point: &'static str| {
+        *c.core.compaction_hook.lock().unwrap() = Some(Arc::new(move |point: &'static str| {
             if point == "pending recorded" {
                 copy_tree(&src, &dst);
             }
@@ -4282,7 +4452,7 @@ mod recovery_tests {
         let copies = temp_dir("pending-new-copies");
         let (db, c) = compacting_fixture(&dir);
         let (src, dst) = (dir.clone(), copies.clone());
-        *c.compaction_hook.lock().unwrap() = Some(Arc::new(move |point: &'static str| {
+        *c.core.compaction_hook.lock().unwrap() = Some(Arc::new(move |point: &'static str| {
             if point == "renamed" {
                 copy_tree(&src, &dst);
             }
@@ -4320,7 +4490,7 @@ mod recovery_tests {
         let copies = temp_dir("stale-temp-copies");
         let (db, c) = compacting_fixture(&dir);
         let (src, dst) = (dir.clone(), copies.clone());
-        *c.compaction_hook.lock().unwrap() = Some(Arc::new(move |point: &'static str| {
+        *c.core.compaction_hook.lock().unwrap() = Some(Arc::new(move |point: &'static str| {
             if point == "build replayed" {
                 copy_tree(&src, &dst);
             }
@@ -4348,7 +4518,7 @@ mod recovery_tests {
         let rounds = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let (count, writer) = (Arc::clone(&rounds), Arc::clone(&c));
         let fired = AtomicBool::new(false);
-        *c.compaction_hook.lock().unwrap() = Some(Arc::new(move |point: &'static str| {
+        *c.core.compaction_hook.lock().unwrap() = Some(Arc::new(move |point: &'static str| {
             if point == "catch-up round" {
                 count.fetch_add(1, Ordering::SeqCst);
             }
@@ -4367,7 +4537,7 @@ mod recovery_tests {
         }));
         c.delete_many(&(0..6000).collect::<Vec<u64>>()).unwrap();
         wait_until_idle(&c);
-        *c.compaction_hook.lock().unwrap() = None;
+        *c.core.compaction_hook.lock().unwrap() = None;
         assert!(rounds.load(Ordering::SeqCst) >= 1, "no catch-up round ran");
         let query = along(0.4, 0);
         let before: Vec<u64> = c
@@ -4433,7 +4603,7 @@ mod recovery_tests {
         assert_eq!(reference.len(), 50);
         let during = Arc::new(Mutex::new(Vec::new()));
         let (sink, reader) = (Arc::clone(&during), Arc::clone(&c));
-        *c.compaction_hook.lock().unwrap() = Some(Arc::new(move |point: &'static str| {
+        *c.core.compaction_hook.lock().unwrap() = Some(Arc::new(move |point: &'static str| {
             // Only the build runs without the collection lock, so a search is taken at "build done".
             if point == "build done" {
                 let query = along(0.3, 0);
@@ -4455,7 +4625,7 @@ mod recovery_tests {
         }));
         c.delete_many(&(0..6000).collect::<Vec<u64>>()).unwrap();
         wait_until_idle(&c);
-        *c.compaction_hook.lock().unwrap() = None;
+        *c.core.compaction_hook.lock().unwrap() = None;
         let during = during.lock().unwrap().clone();
         assert_eq!(during.len(), 1);
         let after = ids(&c);
@@ -4579,12 +4749,12 @@ mod recovery_tests {
         let (db, c) = compacting_fixture(&dir);
         let builds = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let counter = Arc::clone(&builds);
-        *c.compaction_hook.lock().unwrap() = Some(Arc::new(move |point: &'static str| {
+        *c.core.compaction_hook.lock().unwrap() = Some(Arc::new(move |point: &'static str| {
             if point == "build done" {
                 counter.fetch_add(1, Ordering::SeqCst);
             }
         }));
-        *c.fail_compaction_at.lock().unwrap() = Some("swap tail");
+        *c.core.fail_compaction_at.lock().unwrap() = Some("swap tail");
         c.delete_many(&(0..6000).collect::<Vec<u64>>()).unwrap();
         wait_until_idle(&c);
         thread::sleep(Duration::from_millis(200));
@@ -5390,5 +5560,156 @@ mod admission_tests {
         drop(c);
         drop(db);
         fs::remove_dir_all(&dir).ok();
+    }
+}
+
+/// Checks the lock architecture on the source of this file. A textual check cannot replace the compiler, which already
+/// stops `Core` from naming `Collection`, and the function-pointer signatures of `with_read` and `with_write`. This
+/// check guards the rules the types do not state: no lock token in `Core`, and lock acquisition only in the helpers.
+#[cfg(test)]
+mod lock_architecture_tests {
+    /// The production code of this file: everything before the test module.
+    fn production_source() -> &'static str {
+        let src = include_str!("collection.rs");
+        let end = src
+            .find("#[cfg(test)]\nmod tests {")
+            .expect("the test module starts after the production code");
+        &src[..end]
+    }
+
+    /// Whether `line` names the type `word`, as a whole word.
+    fn names(line: &str, word: &str) -> bool {
+        line.match_indices(word).any(|(i, _)| {
+            let before = line[..i].chars().next_back();
+            let after = line[i + word.len()..].chars().next();
+            !before.is_some_and(|c| c.is_alphanumeric() || c == '_')
+                && !after.is_some_and(|c| c.is_alphanumeric() || c == '_')
+        })
+    }
+
+    /// The lines of `text` that are code, not comments.
+    fn code_lines(text: &str) -> impl Iterator<Item = &str> {
+        text.lines().filter(|l| {
+            let t = l.trim_start();
+            !t.starts_with("//")
+        })
+    }
+
+    /// The text of the block that starts with `header` and ends at the next line that is exactly `}`.
+    fn block<'a>(src: &'a str, header: &str) -> Option<&'a str> {
+        let start = src.find(header)?;
+        let rest = &src[start..];
+        let end = rest.find("\n}\n")?;
+        Some(&rest[..end])
+    }
+
+    /// Tokens that a `Core` method must not contain: each one reaches the state lock or `Collection`.
+    const FORBIDDEN_IN_CORE: &[&str] = &[
+        "read_state",
+        "write_state",
+        "with_read",
+        "with_write",
+        "self.state",
+        "Collection",
+        "self_ref",
+        "submit(",
+        "start_compaction",
+        "Weak",
+    ];
+
+    /// The methods that may take the state lock directly, or call a method that does. Every other method reaches the
+    /// lock through `with_read` or `with_write`, which hand the guard to a function pointer on `Core`.
+    const MAY_LOCK: &[&str] = &[
+        "read_state",
+        "write_state",
+        "write_state_op",
+        "with_read",
+        "with_write",
+        "close",
+    ];
+
+    /// Returns the first problem in the `Core` code of `src`, or `None`.
+    fn core_problem(src: &str) -> Option<String> {
+        let core_struct = block(src, "struct Core {")?;
+        for line in code_lines(core_struct) {
+            if names(line, "Collection") || names(line, "RwLock") || names(line, "Weak") {
+                return Some(format!("struct Core holds a route to the lock: {line}"));
+            }
+        }
+        let core_impl = block(src, "impl Core {")?;
+        for line in code_lines(core_impl) {
+            for token in FORBIDDEN_IN_CORE {
+                if names(line, token)
+                    || (token.ends_with('(') && line.contains(token))
+                    || (token.contains('.') && line.contains(token))
+                {
+                    return Some(format!("impl Core uses {token:?}: {line}"));
+                }
+            }
+        }
+        None
+    }
+
+    /// Returns the name of each method in `src` that takes the state lock, directly or by a call, and is not in
+    /// `MAY_LOCK`. Methods are the four-space-indented `fn` lines of the impl blocks.
+    fn unexpected_lockers(src: &str) -> Vec<String> {
+        let mut current = String::new();
+        let mut bad = Vec::new();
+        for line in code_lines(src) {
+            if let Some(rest) = line.strip_prefix("    ") {
+                let rest = rest
+                    .strip_prefix("pub(crate) ")
+                    .or_else(|| rest.strip_prefix("pub "))
+                    .unwrap_or(rest);
+                if let Some(after) = rest.strip_prefix("fn ") {
+                    current = after
+                        .split(|c: char| !(c.is_alphanumeric() || c == '_'))
+                        .next()
+                        .unwrap_or("")
+                        .to_string();
+                }
+            }
+            // `self.state.get_mut()` takes no lock: it needs `&mut self`.
+            let takes_lock = [
+                "read_state(",
+                "write_state(",
+                "write_state_op(",
+                "self.state.read(",
+                "self.state.write(",
+            ]
+            .iter()
+            .any(|t| line.contains(t));
+            if takes_lock && !MAY_LOCK.contains(&current.as_str()) && !bad.contains(&current) {
+                bad.push(current.clone());
+            }
+        }
+        bad
+    }
+
+    #[test]
+    fn core_holds_no_route_to_the_lock() {
+        let src = production_source();
+        assert_eq!(core_problem(src), None);
+    }
+
+    #[test]
+    fn only_the_lock_helpers_take_the_lock() {
+        let src = production_source();
+        assert_eq!(unexpected_lockers(src), Vec::<String>::new());
+    }
+
+    /// The checks above must catch a violation. Each case plants one in a copy of the source.
+    #[test]
+    fn the_checks_catch_planted_violations() {
+        let src = production_source();
+        let core = "impl Core {\n";
+        let planted = src.replacen(core, "impl Core {\n    fn leak(&self) { self.count_locked_probe(); let _ = self.read_state(); }\n", 1);
+        assert!(core_problem(&planted).is_some());
+        let stray = src.replacen(
+            "    pub fn count(",
+            "    fn stray_probe(&self) { let _s = self.read_state(); }\n    fn count(",
+            1,
+        );
+        assert!(unexpected_lockers(&stray).contains(&"stray_probe".to_string()));
     }
 }

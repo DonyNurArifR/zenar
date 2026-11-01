@@ -78,10 +78,18 @@ the lock for about 2 ms per section, twice per group.
   a guard is waited for, so the two cannot form a cycle. Search, document fetch, and the other read work run under the
   state read guard, not under the admission mutex.
 
-  **Recursive reads are not allowed.** A thread that holds a `StateRead` must not call `read_state` again. If a writer is
-  announced, the second call waits at the gate for the first guard to be released, while the writer waits for that guard:
-  a deadlock. Debug builds assert the rule (`READS_HELD`). No code path takes a second read guard today; `retrieve`
-  releases its guard before it searches, and `describe` passes its guard down rather than taking another.
+  **Guarded code cannot reach the lock.** The code that runs while a state guard is held is written as methods on
+  `Core`, the part of a `Collection` that holds the data and no reference to the collection or its lock. Each such
+  method receives the guard or the state explicitly. The lock is taken only by `with_read` and `with_write`, which pass
+  `Core` and the guard to a function pointer. A function pointer cannot capture `self`, so a call that would take the
+  lock again cannot be written inside guarded code; the compiler rejects it. `lock_architecture_tests` in
+  `collection.rs` also checks the structure in the source.
+
+  **Recursive reads are not allowed.** A thread that holds a `StateRead` must not take another guard of the same lock. A
+  second read waits at the gate for a writer that waits for the first guard: a deadlock. A second write waits for the
+  thread's own guard. Debug builds assert the read rule (`READS_HELD`). Release builds do not check it at run time; the
+  structure above is what keeps guarded code from taking a second guard. No code path takes a second guard today;
+  `retrieve` releases its guard before it searches, and `describe` passes its guard down rather than taking another.
 
   **What is guaranteed.** Once a writer is announced, readers that have not yet passed the gate wait, so an announced
   writer gets the state lock after the readers that were already past the gate release it. A reader that finishes a
@@ -199,7 +207,7 @@ about 100 lines and two more lock sections, for a gain that is inside the run-to
 the risk of an ordering mistake. The next lock-hold target is the index sync, which is an engine constraint.
 
 Ordering and visibility, for the record. Nothing becomes visible before the log sync: documents are committed only after the
-sync in `finish_batch`, whatever happens during preparation.
+log sync in `commit_synced`, whatever happens during preparation.
 
 ## Audit
 
@@ -217,7 +225,7 @@ that covers it. The tests are in `crates/zenar-core/src/collection.rs` unless no
 | Group commit keeps the durability guarantees | A write returns only after its group's log sync (or its rollback). The `add` with no sync, which is not a sync boundary, is unchanged. | `acknowledgement_comes_after_the_log_sync`, the kill -9 tests in `tests/test_robustness.py` |
 | A rejected group member fails on its own | Validation happens per write, against the collection and the group's earlier writes. | `grouped_writes_fail_individually_and_the_rest_commit` |
 | Crash recovery of a partly completed group | After a crash between the index sync and the log sync, the whole group is present. After a power loss inside the log write, a prefix of the batch is present and the stray vectors are removed. | `crash_after_group_index_sync_keeps_the_whole_group`, `torn_group_log_keeps_a_prefix_and_removes_stray_vectors` |
-| No write is acknowledged before its required sync | The result is set only after the sync in `finish_batch`. | `acknowledgement_comes_after_the_log_sync` |
+| No write is acknowledged before its required sync | The result is set only after the log sync in `commit_synced`. | `acknowledgement_comes_after_the_log_sync` |
 
 What the audit did not cover, and the remaining risks:
 
