@@ -4,14 +4,15 @@
 //! The writer's batch time is the time `add_many` takes, which is the time it holds the collection
 //! lock for a write. It includes validation, the log write, the index write and both fsyncs.
 //!
-//! Usage: cargo run --release -p zenar-core --example concurrent_bench -- [rows] [dim] [readers] [seconds] [batch]
+//! Writer threads share the writer cases: with `writers` threads, each case runs that many writers, all on one
+//! collection. Usage: cargo run --release -p zenar-core --example concurrent_bench -- [rows] [dim] [readers] [seconds] [batch] [writers]
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use zenar_core::{Collection, MetaValue, Record, VectorDB};
+use zenar_core::{Collection, MetaValue, Record, VectorDB, WriteStats};
 
 const CATEGORIES: [&str; 5] = ["faq", "product", "tools", "electronics", "appliances"];
 
@@ -71,15 +72,22 @@ struct Outcome {
     batch: Vec<Duration>,
 }
 
+/// Settings shared by every case of one run.
+struct Run {
+    dim: usize,
+    seconds: f64,
+    batch_size: usize,
+    writers: usize,
+}
+
 fn run_case(
     col: &Arc<Collection>,
     queries: &Arc<Vec<Vec<f32>>>,
     next_id: &Arc<AtomicU64>,
     case: &Case,
-    dim: usize,
-    seconds: f64,
-    batch_size: usize,
+    run: &Run,
 ) -> Outcome {
+    let (dim, batch_size, writers) = (run.dim, run.batch_size, run.writers);
     let stop = Arc::new(AtomicBool::new(false));
     let start = Instant::now();
     let mut readers = Vec::with_capacity(case.readers);
@@ -98,36 +106,40 @@ fn run_case(
             samples
         }));
     }
-    let writer = case.writer.map(|pause| {
-        let (col, stop, next_id) = (Arc::clone(col), Arc::clone(&stop), Arc::clone(next_id));
-        thread::spawn(move || {
-            let mut rng = Lcg(0xC0FFEE ^ next_id.load(Ordering::Relaxed));
-            let mut samples = Vec::new();
-            while !stop.load(Ordering::Relaxed) {
-                let first = next_id.fetch_add(batch_size as u64, Ordering::Relaxed);
-                let records: Vec<Record> = (first..first + batch_size as u64)
-                    .map(|id| record(id, rng.vector(dim)))
-                    .collect();
-                let t = Instant::now();
-                col.add_many(&records).expect("add_many");
-                samples.push(t.elapsed());
-                if !pause.is_zero() {
-                    thread::sleep(pause);
+    let mut writer_threads = Vec::new();
+    if let Some(pause) = case.writer {
+        for w in 0..writers {
+            let (col, stop, next_id) = (Arc::clone(col), Arc::clone(&stop), Arc::clone(next_id));
+            writer_threads.push(thread::spawn(move || {
+                let mut rng = Lcg(0xC0FFEE ^ (w as u64 + 1));
+                let mut samples = Vec::new();
+                while !stop.load(Ordering::Relaxed) {
+                    let first = next_id.fetch_add(batch_size as u64, Ordering::Relaxed);
+                    let records: Vec<Record> = (first..first + batch_size as u64)
+                        .map(|id| record(id, rng.vector(dim)))
+                        .collect();
+                    let t = Instant::now();
+                    col.add_many(&records).expect("add_many");
+                    samples.push(t.elapsed());
+                    if !pause.is_zero() {
+                        thread::sleep(pause);
+                    }
                 }
-            }
-            samples
-        })
-    });
+                samples
+            }));
+        }
+    }
 
-    thread::sleep(Duration::from_secs_f64(seconds));
+    thread::sleep(Duration::from_secs_f64(run.seconds));
     stop.store(true, Ordering::Relaxed);
     let mut search = Vec::new();
     for handle in readers {
         search.extend(handle.join().expect("reader"));
     }
-    let batch = writer
-        .map(|h| h.join().expect("writer"))
-        .unwrap_or_default();
+    let mut batch = Vec::new();
+    for handle in writer_threads {
+        batch.extend(handle.join().expect("writer"));
+    }
     Outcome {
         wall: start.elapsed().as_secs_f64(),
         search,
@@ -135,23 +147,91 @@ fn run_case(
     }
 }
 
+/// The counters of one case: the difference between two snapshots.
+fn delta(before: &WriteStats, after: &WriteStats) -> WriteStats {
+    let mut group_writes = [0u64; zenar_core::GROUP_BUCKETS];
+    for (i, out) in group_writes.iter_mut().enumerate() {
+        *out = after.group_writes[i] - before.group_writes[i];
+    }
+    WriteStats {
+        sync_groups: after.sync_groups - before.sync_groups,
+        group_writes,
+        synced_writes: after.synced_writes - before.synced_writes,
+        write_holds: after.write_holds - before.write_holds,
+        write_hold_total_ns: after.write_hold_total_ns - before.write_hold_total_ns,
+        // Maxima are cumulative: a case's own maximum is only known when it set a new one.
+        write_hold_max_ns: after.write_hold_max_ns,
+        read_waits: after.read_waits - before.read_waits,
+        read_wait_total_ns: after.read_wait_total_ns - before.read_wait_total_ns,
+        read_wait_max_ns: after.read_wait_max_ns,
+    }
+}
+
+/// One line of the write-path counters for a case: groups, writes per group, and the lock times.
+fn report_stats(d: &WriteStats) {
+    let mean_us = |total: u64, n: u64| {
+        if n == 0 {
+            0.0
+        } else {
+            total as f64 / n as f64 / 1e3
+        }
+    };
+    let avg_group = if d.sync_groups == 0 {
+        0.0
+    } else {
+        d.synced_writes as f64 / d.sync_groups as f64
+    };
+    let hist: Vec<String> = d
+        .group_writes
+        .iter()
+        .enumerate()
+        .filter(|(_, n)| **n > 0)
+        .map(|(i, n)| {
+            format!(
+                "{}{}:{}",
+                i + 1,
+                if i + 1 == zenar_core::GROUP_BUCKETS {
+                    "+"
+                } else {
+                    ""
+                },
+                n
+            )
+        })
+        .collect();
+    println!(
+        "    groups {:>6}  writes/group {:>5.2}  sizes {{{}}}  state lock held by writes: mean {:>7.1} us, max {:>8.1} us  readers waited: mean {:>7.1} us, max {:>8.1} us",
+        d.sync_groups,
+        avg_group,
+        hist.join(" "),
+        mean_us(d.write_hold_total_ns, d.write_holds),
+        d.write_hold_max_ns as f64 / 1e3,
+        mean_us(d.read_wait_total_ns, d.read_waits),
+        d.read_wait_max_ns as f64 / 1e3,
+    );
+}
+
 fn report(case: &Case, mut out: Outcome, batch_size: usize) {
     let searches = out.search.len() as f64;
     let batches = out.batch.len() as f64;
     let search_p50 = percentile(&mut out.search, 0.50);
+    let search_p95 = percentile(&mut out.search, 0.95);
     let search_p99 = percentile(&mut out.search, 0.99);
     let batch_p50 = percentile(&mut out.batch, 0.50);
+    let batch_p95 = percentile(&mut out.batch, 0.95);
     let batch_p99 = percentile(&mut out.batch, 0.99);
     println!(
-        "{:<34} readers {:>2}  search {:>8.0}/s  p50 {:>7.3} ms  p99 {:>8.3} ms | writer {:>6.1} batch/s ({:>7.0} rows/s)  batch p50 {:>6.2} ms  p99 {:>6.2} ms",
+        "{:<34} readers {:>2}  search {:>8.0}/s  p50 {:>7.3}  p95 {:>7.3}  p99 {:>7.3} ms | writer {:>6.1} batch/s ({:>7.0} rows/s)  batch p50 {:>6.2}  p95 {:>6.2}  p99 {:>6.2} ms",
         case.label,
         case.readers,
         searches / out.wall,
         search_p50,
+        search_p95,
         search_p99,
         batches / out.wall,
         batches * batch_size as f64 / out.wall,
         batch_p50,
+        batch_p95,
         batch_p99,
     );
 }
@@ -164,6 +244,13 @@ fn main() {
     let readers: usize = arg(3, "8").parse().expect("readers");
     let seconds: f64 = arg(4, "5").parse().expect("seconds");
     let batch_size: usize = arg(5, "50").parse().expect("batch");
+    let writers: usize = arg(6, "1").parse().expect("writers");
+    let run = Run {
+        dim,
+        seconds,
+        batch_size,
+        writers,
+    };
 
     let dir = std::env::temp_dir().join(format!("zenar-concurrent-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
@@ -220,8 +307,10 @@ fn main() {
         },
     ];
     for case in &cases {
-        let out = run_case(&col, &queries, &next_id, case, dim, seconds, batch_size);
+        let before = col.write_stats();
+        let out = run_case(&col, &queries, &next_id, case, &run);
         report(case, out, batch_size);
+        report_stats(&delta(&before, &col.write_stats()));
     }
 
     drop(col);

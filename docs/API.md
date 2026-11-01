@@ -33,7 +33,7 @@ with VectorDB("./data") as db:                       # flushes and releases the 
 | `get(id)` / `get_many(ids)` | Return dicts `{id, text, metadata}`, or `None` / skipped ids. Vectors are not returned. |
 | `delete(id)` | Removes the vector from the index and syncs before returning. Raises `VectorNotFoundError` if absent. |
 | `delete_many(ids)` | Deletes many ids atomically with one index sync and one log sync: all of them are deleted, or none is. Use this for bulk deletes. |
-| `search(vector, top_k=10, filter=None, **equality)` | Returns `[{id, score, text, metadata}]`, best first. |
+| `search(vector, top_k=10, filter=None, **equality)` | Returns `[{id, score, text, metadata}]`, best first. Returns `top_k` results when that many committed documents match. Documents added by a write that has not returned yet are not returned. The score is the inner product of the query and the stored vector, the only metric Zenar supports. |
 | `name`, `count()`, `stats()`, `dimension`, `bit_width` | `name` is the collection's name. |
 | `calibrate(sample)` | Fits the quantizer from a flat sample of `n * dimension` floats. See below. |
 
@@ -95,6 +95,10 @@ still have been applied. Check with `get()` before retrying (STORAGE.md, "What a
 
 `RecoveryError` on open means a file was removed, truncated or damaged outside Zenar. The open is refused and the
 files are left as they were.
+
+Concurrent writes to one collection can share a sync. A write returns only after its own sync, so an `add` or `add_many`
+that returns without error is durable under the same rules as before. An error from a write means it was not applied,
+except as STORAGE.md describes for errors after a sync.
 
 `CollectionClosedError` means the handle outlived its database, or its collection was dropped. Keep a reference to the
 `VectorDB` for as long as you use its collections. A collection handle cannot write after its database is closed, since

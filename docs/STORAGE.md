@@ -46,15 +46,22 @@ open. Drop the handle first, then drop the collection.
 
 ## Ingest order
 
+Writes to a collection are queued. One leader at a time runs a group of them, so a group's syncs and rollback never
+overlap another group's. Readers do not take the queue. The steps below describe one write. A group shares the index sync
+and the log sync among its writes, and a failure rolls back the whole group (docs/CONCURRENCY.md, "Group commit").
+
 ### `add`
 
 1. Validate the record. A field name the schema lacks extends the schema, with the type of its first value. The catalog
    is written first, so a record that uses a new field never reaches the log before the catalog knows the field.
 2. Write the PUT frame to the log (not yet visible to readers).
 3. Add the vector to the in-memory index.
-4. At a sync boundary (every 1000 adds, or every add with `durable=True`), sync the index file, then the log. If that
-   fails, the vector is removed and the log is truncated back. If the truncation fails too, the collection is poisoned.
-5. Make the document visible.
+4. At a sync boundary (every 1000 adds, or every add with `durable=True`), sync the index file under the lock. Then
+   release the lock, sync the log, take the lock again, and make the document visible. If either sync fails, the vector
+   is removed, the index is synced again, and the log is truncated back. If the re-sync or the truncation fails, the
+   collection is poisoned.
+   Between the index sync and the commit, the vector is in the index and its document is not committed. Searches
+   exclude such documents, and ask for extra results to make up for them (see the search rule in ARCHITECTURE.md).
 
 ### `add_many`
 
@@ -67,14 +74,15 @@ A batch is all-or-nothing:
 4. Sync the index file, then the log.
 5. Make the documents visible.
 
-If step 2, 3 or 4 fails, the vectors added so far are removed, the index is synced again (best effort), and the log is
-truncated to its length before the batch. If the truncation fails, the collection is poisoned: the batch's bytes would
+Step 4 syncs the index under the lock, then the log with the lock released, then commits under the lock. If step 2, 3 or
+4 fails, the vectors added so far are removed, the index is synced again, and the log is truncated to its
+length before the batch. If the truncation fails, the collection is poisoned: the batch's bytes would
 otherwise stay in the log in front of later writes.
 
 ## Deletes
 
 `delete_many` does the same steps for a batch, with one index sync and one log sync. Every id must exist and be unique,
-or nothing changes.
+or nothing changes. The log sync runs with the collection lock released, as for adds.
 
 `delete` (one id):
 
@@ -145,13 +153,19 @@ document. "Poisoned" is defined in the section above.
 |---|---|---|---|
 | `add` or `add_many` is rejected by the index before the log is synced (for example, `store.add` fails) | Yes | Undone in memory and in the log. Usable. | Absent. |
 | `add` or `add_many`: writing the log bytes fails | Yes | Poisoned. The write is not trusted to have been truncated. | The leftover bytes are unsynced documents. Those without a vector are removed. |
-| `add` or `add_many`: index sync succeeds, log sync fails | Yes | Undone. Usable. | Can be present. The vector is on disk, so reconciliation keeps the document if its bytes survived. An error can still have been applied. |
+| `add` or `add_many`: index sync succeeds, log sync fails | Yes | Undone, and usable, if the index re-sync and the truncation succeed. Poisoned if either fails. | Can be present. The vector is on disk, so reconciliation keeps the document if its bytes survived. An error can still have been applied. |
 | `add` or `add_many`: truncating the log back fails | Yes | Poisoned. | Leftover bytes are unsynced documents. Those without a vector are removed. |
 | `delete` fails at the index sync | Yes | Poisoned. | Present, with its vector. The delete was not applied. |
 | `delete` fails after the index sync (tombstone or log sync) | Yes | Poisoned. | Absent. The vector is gone, so the document is removed. |
 | Compaction fails after the rename | Yes | Poisoned. | The log on disk is replayed. Its live documents are the same either way. |
 | `flush()` fails | Yes | Usable. Nothing already synced is undone. | Whatever reached the disk. |
+| A panic in the group's leader, after the index sync | Yes, for every write in the group (the panicking thread unwinds) | Poisoned. | The index was synced and the log bytes were written, so the group's writes may be present. Reconciliation keeps them if both files hold them. |
 | Power loss during `add_many` | No error (the process did not return) | Not applicable | A prefix of the batch can survive. The index is synced first, and the log bytes may be partly on disk. A process crash gives all or nothing. |
+
+With group commit, one failure affects a whole group. An `add` or `add_many` that is in a group whose log sync fails gets
+the error and is rolled back with the group, and nothing in the group is visible. A write that the group rejects on its
+own (a duplicate id, a bad vector) gets its own error and does not affect the others. A write returns only after its
+sync, or after its rollback.
 
 After an error, check with `get()` or `count()` before retrying. An error means the write may or may not have been
 applied. Retrying an add that was applied returns `DuplicateId`.
@@ -205,8 +219,8 @@ applied. Retrying an add that was applied returns `DuplicateId`.
   `corruption_in_the_middle_is_an_error_not_a_silent_drop` (Rust, log level).
 - `document_without_vector_is_removed_on_reopen`, `vector_without_document_is_removed_on_reopen` (Rust, collection level).
 - `poisoned_collection_refuses_every_operation` (Rust).
-- `failed_delete_poisons_and_reopen_keeps_the_document`, `failed_add_leaves_no_trace_and_the_collection_stays_usable`,
-  `failed_add_many_is_all_or_nothing_across_reopen` (Rust): real index-write failures, injected by making the index file
+- `failed_delete_poisons_and_reopen_keeps_the_document`, `failed_add_with_failing_index_poisons_and_reopen_leaves_no_trace`,
+  `failed_add_many_with_failing_index_poisons_and_reopen_is_all_or_nothing` (Rust): real index-write failures, injected by making the index file
   refuse writes (Unix only; the tests refuse to run as root).
 - `failed_undo_poisons_and_reopen_removes_the_orphan_frames` (Rust): a failing truncation poisons the collection, and the
   orphan frames do not produce a duplicate id on the next open.
@@ -214,6 +228,21 @@ applied. Retrying an add that was applied returns `DuplicateId`.
   `log_cut_short_after_sync_is_refused_without_changing_the_file`, `damaged_synced_record_is_refused_without_truncation`
   (Rust): refusals on open.
 - `crash_during_delete_does_not_hide_a_missing_index` (Rust): a crash inside a delete's window still refuses a missing index.
+- `search_in_window_returns_full_top_k_from_committed_documents`, `filtered_search_in_window_never_returns_uncommitted_documents`,
+  `search_in_delete_window_skips_the_removed_vector_and_stays_full` (Rust): searches while a write is between its index sync
+  and its commit. A barrier holds the write there.
+- `failed_log_sync_in_window_rolls_back_and_stays_usable`, `failed_log_sync_in_delete_window_poisons_and_reopen_completes_the_delete`,
+  `pending_documents_are_invisible_to_get_count_and_search`, `acknowledgement_comes_after_the_log_sync`,
+  `crash_after_group_index_sync_keeps_the_whole_group` (a copy of the directory taken inside the window is reopened),
+  `torn_group_log_keeps_a_prefix_and_removes_stray_vectors` (a copy cut inside the batch's frames),
+  `acknowledged_writes_are_seen_and_acknowledged_deletes_are_not` (Rust): concurrent writers, deleters and searchers.
+  (Rust): a log sync that fails with the lock released.
+- `concurrent_inserts_and_searches_return_committed_full_results` (Rust): writers and readers on one collection. Every
+  result is committed, has no repeat, and the result is full.
+- `group_that_fails_its_log_sync_rolls_back_every_member`, `grouped_writes_fail_individually_and_the_rest_commit` (Rust):
+  writes queued behind a leader run as one group. A failing log sync rolls back every member. A rejected member fails
+  alone.
+- `tests/test_concurrency.py` (Python): several threads write through the API, then the database is reopened.
 
 Power loss is not tested here. The `fsync` guarantees come from the platform, and they have not been checked on real
 hardware.

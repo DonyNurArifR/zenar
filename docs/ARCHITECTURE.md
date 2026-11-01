@@ -134,7 +134,16 @@ search(vector, top_k, filter)
 
 ## Concurrency
 
-- One `RwLock` per collection. Searches run concurrently. Writes (add, add_many, delete, flush, calibrate) are serialized.
+- One `RwLock` per collection. Searches run concurrently with each other and with the log fsync of a write.
+- Writes (add, add_many, delete, delete_many, flush, calibrate) are queued per collection. A leader runs the queued adds as
+  one group, with one index sync and one log sync for the group. Deletes, flushes and calibrations run alone. Readers do
+  not take the queue. A leader lingers up to 2 ms for recent writers, so that their writes share its syncs. A panic part
+  way through a group poisons the collection (STORAGE.md).
+- A write syncs its vector index while holding the lock, since TurboVec syncs from its in-memory state. It then syncs its
+  document log with the lock released, and takes the lock again to commit. Only the index sync and the in-memory work hold
+  the lock during an add. Flush and compaction still hold it for their whole run (docs/CONCURRENCY.md).
+- A search whose results include vectors of uncommitted writes asks for extra results and drops those hits, so it still
+  returns `top_k` committed results when that many exist.
 - The document log is read with positioned reads (`pread`), so readers do not share a file cursor.
 - The GIL is released around every core call (`py.detach`).
 - No panic crosses into Python. Each core call is wrapped in `catch_unwind` and reported as `VectorStoreError`.

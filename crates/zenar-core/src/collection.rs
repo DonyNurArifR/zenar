@@ -1,9 +1,12 @@
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex, MutexGuard, RwLock, RwLockReadGuard, RwLockWriteGuard};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Condvar, Mutex, RwLock, RwLockReadGuard, RwLockWriteGuard};
+use std::thread::{self, ThreadId};
+use std::time::{Duration, Instant};
 
 use crate::catalog::Catalog;
-use crate::docstore::{DocRef, DocStore, DocumentRow, FieldStats};
+use crate::docstore::{DocRef, DocStore, DocumentRow, FieldStats, Staged};
 use crate::error::ZenarError;
 use crate::filter::{Filter, validate};
 use crate::names::is_valid_field_name;
@@ -91,6 +94,273 @@ struct State {
     closed: bool,
 }
 
+/// Largest group size counted separately in `WriteStats`. Bigger groups share the last bucket.
+pub const GROUP_BUCKETS: usize = 16;
+
+/// Counters for the write path, read through `Collection::write_stats`. Every counter is cumulative
+/// since the collection was opened.
+#[derive(Default)]
+struct WriteCounters {
+    /// Syncs of a batch, one per group that synced: the number of `(index sync, log sync)` pairs.
+    sync_groups: AtomicU64,
+    /// Histogram of the number of writes per synced group, bucket `i` for `i + 1` writes.
+    group_writes: [AtomicU64; GROUP_BUCKETS],
+    /// Writes staged for a sync, summed over all groups.
+    synced_writes: AtomicU64,
+    /// Exclusive holds of the state lock by writes, and their total and largest duration in ns.
+    holds: AtomicU64,
+    hold_ns: AtomicU64,
+    max_hold_ns: AtomicU64,
+    /// Shared acquisitions of the state lock by readers, and the time each spent waiting for it.
+    read_waits: AtomicU64,
+    read_wait_ns: AtomicU64,
+    max_read_wait_ns: AtomicU64,
+}
+
+impl WriteCounters {
+    fn record_hold(&self, held: Duration) {
+        let ns = u64::try_from(held.as_nanos()).unwrap_or(u64::MAX);
+        self.holds.fetch_add(1, Ordering::Relaxed);
+        self.hold_ns.fetch_add(ns, Ordering::Relaxed);
+        self.max_hold_ns.fetch_max(ns, Ordering::Relaxed);
+    }
+
+    fn record_read_wait(&self, waited: Duration) {
+        let ns = u64::try_from(waited.as_nanos()).unwrap_or(u64::MAX);
+        self.read_waits.fetch_add(1, Ordering::Relaxed);
+        self.read_wait_ns.fetch_add(ns, Ordering::Relaxed);
+        self.max_read_wait_ns.fetch_max(ns, Ordering::Relaxed);
+    }
+
+    fn record_sync_group(&self, writes: usize) {
+        self.sync_groups.fetch_add(1, Ordering::Relaxed);
+        self.synced_writes
+            .fetch_add(writes as u64, Ordering::Relaxed);
+        let bucket = writes.clamp(1, GROUP_BUCKETS) - 1;
+        self.group_writes[bucket].fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// A snapshot of the write path's counters. See `Collection::write_stats`.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct WriteStats {
+    /// Groups that synced: each is one index sync and one log sync.
+    pub sync_groups: u64,
+    /// `group_writes[i]` counts the synced groups with `i + 1` writes. The last bucket also counts
+    /// every larger group.
+    pub group_writes: [u64; GROUP_BUCKETS],
+    /// Writes that went through a sync group, summed over groups.
+    pub synced_writes: u64,
+    /// Exclusive holds of the state lock by writes.
+    pub write_holds: u64,
+    pub write_hold_total_ns: u64,
+    pub write_hold_max_ns: u64,
+    /// Shared acquisitions of the state lock by readers, and the time spent waiting for them.
+    pub read_waits: u64,
+    pub read_wait_total_ns: u64,
+    pub read_wait_max_ns: u64,
+}
+
+/// Exclusive access to the state. Dropping it records how long the lock was held.
+struct WriteGuard<'a> {
+    guard: RwLockWriteGuard<'a, State>,
+    since: Instant,
+    counters: &'a WriteCounters,
+}
+
+impl std::ops::Deref for WriteGuard<'_> {
+    type Target = State;
+    fn deref(&self) -> &State {
+        &self.guard
+    }
+}
+
+impl std::ops::DerefMut for WriteGuard<'_> {
+    fn deref_mut(&mut self) -> &mut State {
+        &mut self.guard
+    }
+}
+
+impl Drop for WriteGuard<'_> {
+    fn drop(&mut self) {
+        self.counters.record_hold(self.since.elapsed());
+    }
+}
+
+/// One write queued for the writer. Its result is set by the leader, and taken by the writer that queued it.
+struct Request {
+    op: Op,
+    outcome: Mutex<Option<Result<usize, ZenarError>>>,
+    /// Set once the leader has a result for the write. A taken result leaves `outcome` empty, so this
+    /// flag tells a finished write from an abandoned one.
+    done: AtomicBool,
+}
+
+impl Request {
+    fn new(op: Op) -> Self {
+        Self {
+            op,
+            outcome: Mutex::new(None),
+            done: AtomicBool::new(false),
+        }
+    }
+
+    fn finish(&self, result: Result<usize, ZenarError>) {
+        let mut outcome = self.outcome.lock().unwrap_or_else(|p| p.into_inner());
+        *outcome = Some(result);
+        self.done.store(true, Ordering::SeqCst);
+    }
+}
+
+/// A write operation. Adds are grouped; the others run alone.
+enum Op {
+    /// `batch` is false for `add`, which may be committed without a sync, and true for `add_many`,
+    /// which always syncs.
+    Add {
+        records: Vec<Record>,
+        batch: bool,
+    },
+    Delete(Vec<u64>),
+    Flush,
+    Calibrate(Vec<f32>),
+}
+
+/// The queue of writes waiting for a leader.
+#[derive(Default)]
+struct Queue {
+    pending: Vec<Arc<Request>>,
+    leading: bool,
+    /// The last time each writer thread queued a write. The leader counts the recent ones to decide
+    /// how long to wait for the others before it syncs.
+    seen: HashMap<ThreadId, Instant>,
+}
+
+/// How long a leader waits for the other recent writers before it starts a group. A lone writer
+/// never waits. A group only grows when a writer arrives within this time.
+const GROUP_LINGER: Duration = Duration::from_millis(2);
+
+/// A writer thread counts as recent for this long after its last write.
+const RECENT_WRITER: Duration = Duration::from_millis(20);
+
+/// Holds the leader role for one group. Dropping it finishes any write the group left without a
+/// result, and releases the role, so a panic in the group cannot leave writers waiting for ever.
+struct Lead<'a> {
+    collection: &'a Collection,
+    group: Vec<Arc<Request>>,
+}
+
+impl Drop for Lead<'_> {
+    fn drop(&mut self) {
+        if self
+            .group
+            .iter()
+            .any(|req| !req.done.load(Ordering::SeqCst))
+        {
+            // The group stopped part way, so its staged writes may be in the index and the log but not in
+            // memory. Only a reopen, which reconciles the two files, can make the state consistent again.
+            let mut state = self
+                .collection
+                .state
+                .write()
+                .unwrap_or_else(|p| p.into_inner());
+            state.poisoned.get_or_insert_with(|| {
+                "a write group was aborted part way; reopen the database to recover".into()
+            });
+            drop(state);
+            for req in &self.group {
+                req.finish(Err(ZenarError::VectorStoreError(
+                    "the write group was aborted".into(),
+                )));
+            }
+        }
+        let mut queue = self
+            .collection
+            .queue
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        queue.leading = false;
+        self.collection.ready.notify_all();
+    }
+}
+
+/// The writes of one group's adds, staged in order and waiting for their sync.
+struct Batch {
+    /// The requests whose writes are staged, with their record counts and whether they are `add_many`.
+    members: Vec<(Arc<Request>, usize, bool)>,
+    /// The ids of the vectors added to the index, in order.
+    added: Vec<u64>,
+    /// The staged log writes, in order. The first one's start is the rollback point.
+    staged: Vec<Staged>,
+    /// Whether the index was empty when the batch started, so that the batch may fix the dimension.
+    was_empty: bool,
+}
+
+impl Batch {
+    fn new(was_empty: bool) -> Self {
+        Self {
+            members: Vec::new(),
+            added: Vec::new(),
+            staged: Vec::new(),
+            was_empty,
+        }
+    }
+}
+
+/// Why a request could not be staged. A request error changes nothing. A batch error may leave writes
+/// behind, so the batch is rolled back.
+enum StageError {
+    Request(ZenarError),
+    Batch(ZenarError),
+}
+
+fn queue_poisoned() -> ZenarError {
+    ZenarError::VectorStoreError("collection write queue poisoned".into())
+}
+
+fn finish_all(reqs: &[Arc<Request>], e: &ZenarError) {
+    for req in reqs {
+        req.finish(Err(e.clone()));
+    }
+}
+
+fn finish_members(batch: &Batch, e: &ZenarError) {
+    for (req, _, _) in &batch.members {
+        req.finish(Err(e.clone()));
+    }
+}
+
+/// The values to store for each record of a batch, and the metadata fields the batch introduces.
+type PreparedBatch = (Vec<Vec<(String, MetaValue)>>, Vec<(String, FieldKind)>);
+
+/// Checks a batch against the collection. Returns the values to store and the metadata fields the
+/// batch introduces. Nothing is written. The vectors of earlier requests in the same group are
+/// already in the index, so they are checked for duplicates as stored documents are.
+fn prepare_batch(state: &State, records: &[Record]) -> Result<PreparedBatch, ZenarError> {
+    if state.store.dim().is_none() {
+        validate_dimension(records[0].vector.len())?;
+    }
+    let expected_dim = state.store.dim().or(Some(records[0].vector.len()));
+    let mut seen = HashSet::with_capacity(records.len());
+    let mut schema: Vec<(String, FieldKind)> = state.docs.fields().to_vec();
+    let mut new_fields: Vec<(String, FieldKind)> = Vec::new();
+    let mut prepared: Vec<Vec<(String, MetaValue)>> = Vec::with_capacity(records.len());
+    for record in records {
+        check_id(record.id)?;
+        if !seen.insert(record.id)
+            || state.store.contains(record.id)
+            || state.docs.contains(record.id)
+        {
+            return Err(ZenarError::DuplicateId(record.id));
+        }
+        validate_vector(&record.vector, expected_dim)?;
+        let (introduced, values) = resolve_metadata(&schema, record.metadata.clone())?;
+        schema.extend(introduced.iter().cloned());
+        new_fields.extend(introduced);
+        prepared.push(values);
+    }
+    Ok((prepared, new_fields))
+}
+
 /// A named set of vectors plus their documents and metadata.
 ///
 /// Writes are serialized behind one lock. Reads run concurrently with each other.
@@ -104,9 +374,13 @@ pub struct Collection {
     catalog: Arc<Catalog>,
     /// Sync the document log on every commit, not only at sync boundaries.
     durable: bool,
-    /// Serializes writes. Taken before `state`, never after it.
-    writers: Mutex<()>,
+    /// Writes waiting for a leader. See `submit`.
+    queue: Mutex<Queue>,
+    /// Signalled when a leader finishes, so that a waiting writer can become the leader.
+    ready: Condvar,
     state: RwLock<State>,
+    /// Counters for `write_stats`.
+    counters: WriteCounters,
     /// Test hook that runs while a write has released `state` and is syncing its log.
     #[cfg(test)]
     window_hook: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
@@ -131,7 +405,9 @@ impl Collection {
             index_path,
             catalog,
             durable,
-            writers: Mutex::new(()),
+            queue: Mutex::new(Queue::default()),
+            ready: Condvar::new(),
+            counters: WriteCounters::default(),
             state: RwLock::new(State {
                 closed: false,
                 store,
@@ -159,12 +435,10 @@ impl Collection {
         self.read_state().map(|s| s.store.bit_width()).unwrap_or(0)
     }
 
-    /// Adds one document.
+    /// Adds one document. Concurrent writes to the collection are grouped: see `submit`.
     ///
-    /// Order: stage the document write, add the vector in memory, and at a sync boundary sync the
-    /// index under the write lock and the log with the lock released. The document becomes visible
-    /// only after both syncs. A crash before the boundary can lose the newest adds, and reconciliation
-    /// removes the rest (docs/STORAGE.md).
+    /// The document becomes visible only after the index and the log are synced, or, for an add that
+    /// does not reach a sync boundary, after it is added in memory (docs/STORAGE.md).
     pub fn add(
         &self,
         id: u64,
@@ -173,96 +447,187 @@ impl Collection {
         metadata: Vec<(String, MetaValue)>,
     ) -> Result<(), ZenarError> {
         check_id(id)?;
-        let _gate = self.write_gate()?;
-        let mut state = self.write_state()?;
-        healthy(&state)?;
-        validate_vector(vector, state.store.dim())?;
-        let first_vector = state.store.dim().is_none();
-        let (new_fields, values) = resolve_metadata(state.docs.fields(), metadata)?;
-        if state.store.contains(id) || state.docs.contains(id) {
-            return Err(ZenarError::DuplicateId(id));
-        }
-        self.extend_schema(&mut state, &new_fields)?;
-
-        let staged = state
-            .docs
-            .stage_puts(&[DocRef {
-                id,
-                text,
-                metadata: &values,
-            }])
-            .map_err(|e| poison(&mut state, e))?;
-        if let Err(e) = state.store.add(vector, id) {
-            return Err(undo_or_poison(&mut state, staged, e));
-        }
-        if self.durable || state.unsynced + 1 >= SYNC_INTERVAL {
-            state.pending = 1;
-            let (mut state, staged) = self.sync_batch(state, &[id], staged)?;
-            state.docs.commit(staged);
-            if first_vector {
-                self.record_dimension(&state)?;
-            }
-        } else {
-            state.unsynced += 1;
-            state.docs.commit(staged);
-            if first_vector {
-                self.record_dimension(&state)?;
-            }
-        }
-        Ok(())
+        let record = Record {
+            id,
+            vector: vector.to_vec(),
+            text: text.to_string(),
+            metadata,
+        };
+        self.submit(Op::Add {
+            records: vec![record],
+            batch: false,
+        })
+        .map(|_| ())
     }
 
     /// Adds many documents atomically. Either every record is added or none is, for errors Zenar
     /// reports and for a process crash. After a power loss a prefix of the batch can survive
     /// (STORAGE.md, "What a failure leaves behind").
     ///
-    /// 1. Validate every record before any write: ids, vectors, metadata, duplicates
-    ///    within the batch and against stored documents.
-    /// 2. Extend the metadata schema if the batch introduces fields.
-    /// 3. Write all documents to the log and all vectors to the index.
-    /// 4. Sync the index under the write lock, then the log with the lock released.
-    /// 5. Make the documents visible.
-    ///
-    /// Any failure in 3 or 4 undoes the batch. The schema change in step 2 stays, which is
-    /// harmless because no document uses the new fields.
+    /// The batch is validated before anything is written: ids, vectors, metadata, duplicates within
+    /// the batch and against stored documents. It is then written, synced and committed with the
+    /// other writes in its group. Any failure in the group rolls back every batch in it.
     pub fn add_many(&self, records: &[Record]) -> Result<usize, ZenarError> {
         if records.is_empty() {
             return Ok(0);
         }
-        let _gate = self.write_gate()?;
-        let mut state = self.write_state()?;
-        healthy(&state)?;
-        let first_vector = state.store.dim().is_none();
+        self.submit(Op::Add {
+            records: records.to_vec(),
+            batch: true,
+        })
+    }
 
-        // 1. Validate.
-        if first_vector {
-            validate_dimension(records[0].vector.len())?;
+    /// Deletes one document. The vector leaves the index and the index is synced before the delete
+    /// is logged, so a deleted vector is gone from disk once `delete` returns (spec section 67).
+    pub fn delete(&self, id: u64) -> Result<(), ZenarError> {
+        self.submit(Op::Delete(vec![id])).map(|_| ())
+    }
+
+    /// Deletes many documents with one index sync and one log sync. Either all of them are
+    /// deleted or none is: every id must exist and be unique, or nothing changes.
+    pub fn delete_many(&self, ids: &[u64]) -> Result<usize, ZenarError> {
+        if ids.is_empty() {
+            return Ok(0);
         }
-        let expected_dim = state.store.dim().or(Some(records[0].vector.len()));
-        let mut seen = HashSet::with_capacity(records.len());
-        let mut schema: Vec<(String, FieldKind)> = state.docs.fields().to_vec();
-        let mut new_fields: Vec<(String, FieldKind)> = Vec::new();
-        let mut prepared: Vec<Vec<(String, MetaValue)>> = Vec::with_capacity(records.len());
-        for record in records {
-            check_id(record.id)?;
-            if !seen.insert(record.id)
-                || state.store.contains(record.id)
-                || state.docs.contains(record.id)
-            {
-                return Err(ZenarError::DuplicateId(record.id));
+        self.submit(Op::Delete(ids.to_vec()))
+    }
+
+    /// Makes every add so far durable: the index and the document log are synced. Holds the write
+    /// lock throughout, so readers wait for these two fsyncs.
+    pub fn flush(&self) -> Result<(), ZenarError> {
+        self.submit(Op::Flush).map(|_| ())
+    }
+
+    /// Fits the TQ+ calibration from a sample (spec section 88).
+    pub fn calibrate(&self, sample: &[f32]) -> Result<(), ZenarError> {
+        self.submit(Op::Calibrate(sample.to_vec())).map(|_| ())
+    }
+
+    /// Queues a write and returns its result. Writes are grouped: whichever writer finds no leader
+    /// takes every queued write and runs them as one group (`lead`). Other writers wait until their
+    /// own result is ready. A group runs one at a time, so its sync and rollback never overlap
+    /// another group's. A write returns only after the sync that makes it durable, or after its
+    /// rollback.
+    fn submit(&self, op: Op) -> Result<usize, ZenarError> {
+        let req = Arc::new(Request::new(op));
+        let mut queue = self.queue.lock().map_err(|_| queue_poisoned())?;
+        queue.seen.insert(thread::current().id(), Instant::now());
+        queue.pending.push(Arc::clone(&req));
+        // A leader may be lingering for writers. This one is what it waits for.
+        self.ready.notify_all();
+        loop {
+            if let Some(result) = req.outcome.lock().map_err(|_| queue_poisoned())?.take() {
+                return result;
             }
-            validate_vector(&record.vector, expected_dim)?;
-            let (introduced, values) = resolve_metadata(&schema, record.metadata.clone())?;
-            schema.extend(introduced.iter().cloned());
-            new_fields.extend(introduced);
-            prepared.push(values);
+            if queue.leading {
+                queue = self.ready.wait(queue).map_err(|_| queue_poisoned())?;
+                continue;
+            }
+            queue.leading = true;
+            let group = self.gather(queue)?;
+            self.lead(group);
+            queue = self.queue.lock().map_err(|_| queue_poisoned())?;
         }
-        self.extend_schema(&mut state, &new_fields)?;
+    }
 
-        // 3. Documents, then vectors.
+    /// Takes the queued writes for the next group. While the group holds fewer writes than there are
+    /// recent writer threads, waits up to `GROUP_LINGER` for the rest. Returns with the queue
+    /// unlocked, and the leader role held by the caller.
+    fn gather(
+        &self,
+        mut queue: std::sync::MutexGuard<'_, Queue>,
+    ) -> Result<Vec<Arc<Request>>, ZenarError> {
+        let deadline = Instant::now() + GROUP_LINGER;
+        let mut group = Vec::new();
+        loop {
+            group.append(&mut queue.pending);
+            let now = Instant::now();
+            queue
+                .seen
+                .retain(|_, last| now.duration_since(*last) < RECENT_WRITER);
+            if group.len() >= queue.seen.len() || now >= deadline {
+                drop(queue);
+                return Ok(group);
+            }
+            let (guard, _) = self
+                .ready
+                .wait_timeout(queue, deadline - now)
+                .map_err(|_| queue_poisoned())?;
+            queue = guard;
+        }
+    }
+
+    /// Runs one group in the order its writes were queued. Adds run together, one index sync and one
+    /// log sync for all of them. Deletes, flushes and calibrations run alone, so that they see every
+    /// add queued before them. The guard finishes any write left without a result and releases the
+    /// leader role, even if this panics.
+    fn lead(&self, group: Vec<Arc<Request>>) {
+        let guard = Lead {
+            collection: self,
+            group: group.clone(),
+        };
+        let mut adds = Vec::new();
+        for req in group {
+            if matches!(req.op, Op::Add { .. }) {
+                adds.push(req);
+            } else {
+                self.run_adds(std::mem::take(&mut adds));
+                let result = self.run_other(&req.op);
+                req.finish(result);
+            }
+        }
+        self.run_adds(adds);
+        drop(guard);
+    }
+
+    /// Runs a group of adds: validates and stages each write, then syncs and commits them together.
+    fn run_adds(&self, reqs: Vec<Arc<Request>>) {
+        if reqs.is_empty() {
+            return;
+        }
+        let mut state = match self.write_state() {
+            Ok(state) => state,
+            Err(e) => return finish_all(&reqs, &e),
+        };
+        let mut batch = Batch::new(state.store.dim().is_none());
+        for req in reqs {
+            let Op::Add {
+                records,
+                batch: is_batch,
+            } = &req.op
+            else {
+                unreachable!("run_adds takes only adds");
+            };
+            let count = records.len();
+            let is_batch = *is_batch;
+            match self.stage_request(&mut state, &mut batch, records) {
+                Ok(()) => batch.members.push((req, count, is_batch)),
+                Err(StageError::Request(e)) => req.finish(Err(e)),
+                Err(StageError::Batch(e)) => {
+                    let cause = self.rollback_batch(&mut state, batch, e);
+                    req.finish(Err(cause));
+                    batch = Batch::new(state.store.dim().is_none());
+                }
+            }
+        }
+        self.finish_batch(state, batch);
+    }
+
+    /// Validates one add request and stages it into the batch. A request error leaves the batch as
+    /// it was. A batch error means the batch's writes may be partly done, and the caller rolls it back.
+    fn stage_request(
+        &self,
+        state: &mut State,
+        batch: &mut Batch,
+        records: &[Record],
+    ) -> Result<(), StageError> {
+        healthy(state).map_err(StageError::Request)?;
+        let (values, new_fields) = prepare_batch(state, records).map_err(StageError::Request)?;
+        self.extend_schema(state, &new_fields)
+            .map_err(StageError::Request)?;
         let refs: Vec<DocRef<'_>> = records
             .iter()
-            .zip(prepared.iter())
+            .zip(values.iter())
             .map(|(r, values)| DocRef {
                 id: r.id,
                 text: r.text.as_str(),
@@ -272,85 +637,135 @@ impl Collection {
         let staged = state
             .docs
             .stage_puts(&refs)
-            .map_err(|e| poison(&mut state, e))?;
-        let mut added: Vec<u64> = Vec::with_capacity(records.len());
+            .map_err(|e| StageError::Batch(poison(state, e)))?;
+        batch.staged.push(staged);
         for record in records {
-            if let Err(e) = state.store.add(&record.vector, record.id) {
-                return Err(self.rollback(&mut state, &added, staged, e));
-            }
-            added.push(record.id);
+            batch.added.push(record.id);
+            state
+                .store
+                .add(&record.vector, record.id)
+                .map_err(StageError::Batch)?;
         }
-
-        // 4. Index under the lock, log after it.
-        state.pending = added.len();
-        let (mut state, staged) = self.sync_batch(state, &added, staged)?;
-
-        // 5. Visible.
-        state.docs.commit(staged);
-        if first_vector {
-            self.record_dimension(&state)?;
-        }
-        Ok(records.len())
+        Ok(())
     }
 
-    /// Makes an added batch durable. The index is synced while the write lock is held, because
-    /// TurboVec syncs from its in-memory state. The log is then synced with the lock released, so
-    /// readers run during the log's fsync. The lock is taken again before the caller commits the
-    /// documents. A failure rolls the batch back (see `rollback`) and returns the cause.
-    fn sync_batch<'a>(
-        &'a self,
-        mut state: RwLockWriteGuard<'a, State>,
-        added: &[u64],
-        staged: crate::docstore::Staged,
-    ) -> Result<(RwLockWriteGuard<'a, State>, crate::docstore::Staged), ZenarError> {
+    /// Undoes a batch that could not be committed: removes its vectors, syncs the index to match, and
+    /// truncates the log to the start of the batch. Finishes every member with the cause and returns it.
+    /// If the index cannot be synced to match, or the truncation fails, the collection is poisoned: the
+    /// disk would then disagree with memory, and only a reopen, which reconciles, may continue.
+    fn rollback_batch(&self, state: &mut State, batch: Batch, cause: ZenarError) -> ZenarError {
+        state.pending = 0;
+        for id in &batch.added {
+            state.store.remove(*id);
+        }
+        if !batch.added.is_empty()
+            && let Err(e) = state.store.sync(&self.index_path)
+        {
+            poison(state, e);
+        }
+        let cause = match batch.staged.into_iter().next() {
+            Some(first) => undo_or_poison(state, first, cause),
+            None => cause,
+        };
+        for (req, _, _) in &batch.members {
+            req.finish(Err(cause.clone()));
+        }
+        cause
+    }
+
+    /// Syncs a batch and commits it. The index is synced under the write lock, since TurboVec syncs
+    /// from its in-memory state. The log is synced with the lock released, so readers run during its
+    /// fsync. The lock is taken again before the documents are committed. An add that does not reach
+    /// a sync boundary is committed without syncing (docs/STORAGE.md).
+    fn finish_batch<'a>(&'a self, mut state: WriteGuard<'a>, batch: Batch) {
+        if batch.members.is_empty() {
+            return;
+        }
+        let needs_sync = self.durable
+            || batch.members.iter().any(|(_, _, is_batch)| *is_batch)
+            || state.unsynced + batch.added.len() >= SYNC_INTERVAL;
+        if !needs_sync {
+            state.unsynced += batch.added.len();
+            self.commit_batch(&mut state, batch);
+            return;
+        }
+
+        state.pending = batch.added.len();
         if let Err(e) = state.store.sync(&self.index_path) {
-            return Err(self.rollback(&mut state, added, staged, e));
+            self.rollback_batch(&mut state, batch, e);
+            return;
         }
         let log = match state.docs.sync_handle() {
             Ok(log) => log,
-            Err(e) => return Err(self.rollback(&mut state, added, staged, e)),
+            Err(e) => {
+                self.rollback_batch(&mut state, batch, e);
+                return;
+            }
         };
         drop(state);
         #[cfg(test)]
         self.run_window_hook();
         let synced = self.sync_log(&log);
-        let mut state = self.write_state()?;
+        let mut state = match self.write_state() {
+            Ok(state) => state,
+            Err(e) => return finish_members(&batch, &e),
+        };
         if let Err(e) = synced {
-            return Err(self.rollback(&mut state, added, staged, e));
+            self.rollback_batch(&mut state, batch, e);
+            return;
         }
         state.pending = 0;
         state.unsynced = 0;
-        Ok((state, staged))
+        self.counters.record_sync_group(batch.members.len());
+        self.commit_batch(&mut state, batch);
     }
 
-    /// Deletes one document. The vector leaves the index and the index is synced before the
-    /// delete is logged, so a deleted vector is gone from disk once `delete` returns (spec section 67).
-    pub fn delete(&self, id: u64) -> Result<(), ZenarError> {
-        let _gate = self.write_gate()?;
-        let state = self.write_state()?;
-        healthy(&state)?;
-        if !state.docs.contains(id) {
-            return Err(ZenarError::VectorNotFound(id));
+    /// Makes a batch visible and finishes its members. The first vector of a collection fixes its
+    /// dimension, which is recorded in the catalog. If that write fails, the batch is already visible,
+    /// so every member gets the error and may still be applied (docs/STORAGE.md).
+    fn commit_batch(&self, state: &mut State, batch: Batch) {
+        for staged in batch.staged {
+            state.docs.commit(staged);
         }
-        self.delete_ids(state, &[id])
+        let recorded = if batch.was_empty && state.store.dim().is_some() {
+            self.record_dimension(state)
+        } else {
+            Ok(())
+        };
+        for (req, count, _) in &batch.members {
+            req.finish(match &recorded {
+                Ok(()) => Ok(*count),
+                Err(e) => Err(e.clone()),
+            });
+        }
     }
 
-    /// Deletes many documents with one index sync and one log sync. Either all of them are
-    /// deleted or none is: every id must exist and be unique, or nothing changes.
-    pub fn delete_many(&self, ids: &[u64]) -> Result<usize, ZenarError> {
-        if ids.is_empty() {
-            return Ok(0);
+    /// Runs a delete, flush or calibration. Each takes the write lock for its own work.
+    fn run_other(&self, op: &Op) -> Result<usize, ZenarError> {
+        match op {
+            Op::Delete(ids) => self.run_delete(ids),
+            Op::Flush => self.flush_locked().map(|()| 0),
+            Op::Calibrate(sample) => self.calibrate_locked(sample).map(|()| 0),
+            Op::Add { .. } => unreachable!("adds run in run_adds"),
         }
-        let _gate = self.write_gate()?;
+    }
+
+    /// Checks the ids of a delete and deletes them. A missing id, or an id repeated in the batch,
+    /// changes nothing.
+    fn run_delete(&self, ids: &[u64]) -> Result<usize, ZenarError> {
         let state = self.write_state()?;
         healthy(&state)?;
-        let mut seen = HashSet::with_capacity(ids.len());
-        for &id in ids {
-            if !seen.insert(id) {
-                return Err(ZenarError::InvalidArgument(format!(
-                    "id {id} appears twice in the batch"
-                )));
+        if ids.len() > 1 {
+            let mut seen = HashSet::with_capacity(ids.len());
+            for &id in ids {
+                if !seen.insert(id) {
+                    return Err(ZenarError::InvalidArgument(format!(
+                        "id {id} appears twice in the batch"
+                    )));
+                }
             }
+        }
+        for &id in ids {
             if !state.docs.contains(id) {
                 return Err(ZenarError::VectorNotFound(id));
             }
@@ -363,11 +778,7 @@ impl Collection {
     /// write lock before the tombstones are logged, so a deleted vector leaves the disk first. The
     /// log is synced with the lock released. Any failure from the index sync on poisons the
     /// collection, as `delete` documents (docs/STORAGE.md).
-    fn delete_ids<'a>(
-        &'a self,
-        mut state: RwLockWriteGuard<'a, State>,
-        ids: &[u64],
-    ) -> Result<(), ZenarError> {
+    fn delete_ids<'a>(&'a self, mut state: WriteGuard<'a>, ids: &[u64]) -> Result<(), ZenarError> {
         let compacting = state.docs.compaction_due_after(ids.len());
         self.lower_recorded_lengths(ids.len(), compacting)?;
         for &id in ids {
@@ -407,10 +818,7 @@ impl Collection {
         Ok(())
     }
 
-    /// Makes every add so far durable: the index and the document log are synced. Holds the write
-    /// lock throughout, so readers wait for these two fsyncs.
-    pub fn flush(&self) -> Result<(), ZenarError> {
-        let _gate = self.write_gate()?;
+    fn flush_locked(&self) -> Result<(), ZenarError> {
         let mut state = self.write_state()?;
         healthy(&state)?;
         if state.unsynced > 0 || self.durable {
@@ -423,23 +831,13 @@ impl Collection {
         Ok(())
     }
 
-    /// Fits the TQ+ calibration from a sample (spec section 88).
-    pub fn calibrate(&self, sample: &[f32]) -> Result<(), ZenarError> {
-        let _gate = self.write_gate()?;
+    fn calibrate_locked(&self, sample: &[f32]) -> Result<(), ZenarError> {
         let mut state = self.write_state()?;
         healthy(&state)?;
         state.store.calibrate(sample)?;
         state.store.sync(&self.index_path)?;
         state.unsynced = 0;
         Ok(())
-    }
-
-    /// Serializes writers of this collection. Always taken before the state lock, never after it.
-    /// Readers do not take it.
-    fn write_gate(&self) -> Result<MutexGuard<'_, ()>, ZenarError> {
-        self.writers
-            .lock()
-            .map_err(|_| ZenarError::VectorStoreError("collection writer lock poisoned".into()))
     }
 
     /// Syncs the log through a handle taken under the lock. Test builds can inject a failure here.
@@ -462,6 +860,28 @@ impl Collection {
         let hook = self.window_hook.lock().ok().and_then(|h| h.clone());
         if let Some(hook) = hook {
             hook();
+        }
+    }
+
+    /// Counters for the write path and the readers' waits for the state lock, cumulative since the
+    /// collection was opened. A diagnostic: see BENCHMARKS.md, "Several writers".
+    pub fn write_stats(&self) -> WriteStats {
+        let c = &self.counters;
+        let load = |a: &AtomicU64| a.load(Ordering::Relaxed);
+        let mut group_writes = [0u64; GROUP_BUCKETS];
+        for (out, bucket) in group_writes.iter_mut().zip(c.group_writes.iter()) {
+            *out = load(bucket);
+        }
+        WriteStats {
+            sync_groups: load(&c.sync_groups),
+            group_writes,
+            synced_writes: load(&c.synced_writes),
+            write_holds: load(&c.holds),
+            write_hold_total_ns: load(&c.hold_ns),
+            write_hold_max_ns: load(&c.max_hold_ns),
+            read_waits: load(&c.read_waits),
+            read_wait_total_ns: load(&c.read_wait_ns),
+            read_wait_max_ns: load(&c.max_read_wait_ns),
         }
     }
 
@@ -883,33 +1303,13 @@ impl Collection {
         })
     }
 
-    /// Undoes a batch that failed before it became visible: removes its vectors from memory,
-    /// truncates its log bytes, and syncs the index to match. If that sync fails, recovery on
-    /// the next open removes the stray vectors. Returns `cause`, the error that started the rollback.
-    fn rollback(
-        &self,
-        state: &mut State,
-        added: &[u64],
-        staged: crate::docstore::Staged,
-        cause: ZenarError,
-    ) -> ZenarError {
-        state.pending = 0;
-        for id in added {
-            state.store.remove(*id);
-        }
-        if !added.is_empty()
-            && let Err(e) = state.store.sync(&self.index_path)
-        {
-            poison(state, e);
-        }
-        undo_or_poison(state, staged, cause)
-    }
-
     fn read_state(&self) -> Result<RwLockReadGuard<'_, State>, ZenarError> {
+        let waiting = Instant::now();
         let guard = self
             .state
             .read()
             .map_err(|_| ZenarError::VectorStoreError("collection lock poisoned".into()))?;
+        self.counters.record_read_wait(waiting.elapsed());
         self.not_closed(&guard)?;
         Ok(guard)
     }
@@ -930,11 +1330,12 @@ impl Collection {
         state.closed = true;
     }
 
-    fn write_state(&self) -> Result<RwLockWriteGuard<'_, State>, ZenarError> {
+    fn write_state(&self) -> Result<WriteGuard<'_>, ZenarError> {
         let guard = self
             .state
             .write()
             .map_err(|_| ZenarError::VectorStoreError("collection lock poisoned".into()))?;
+        let since = Instant::now();
         self.not_closed(&guard)?;
         // Every mutation takes the write lock first, so clearing here means no reader can store
         // statistics computed before the mutation after it has been cleared.
@@ -944,7 +1345,11 @@ impl Collection {
         if let Ok(mut scoped) = self.scoped.lock() {
             scoped.clear();
         }
-        Ok(guard)
+        Ok(WriteGuard {
+            guard,
+            since,
+            counters: &self.counters,
+        })
     }
 
     /// Field statistics, cached until the next write.
@@ -1820,6 +2225,144 @@ mod recovery_tests {
         fs::remove_dir_all(&dir).ok();
     }
 
+    /// Writes queued behind a leader run as one group. Here two `add_many` calls queue while the
+    /// first group is in its window, then run together, and a log-sync failure rolls back both.
+    /// The first group, already committed, is kept, and the collection stays usable.
+    #[cfg(unix)]
+    #[test]
+    fn group_that_fails_its_log_sync_rolls_back_every_member() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let dir = temp_dir("group-fail");
+        let db = VectorDB::open_with(&dir, crate::database::MetadataSync::Full).unwrap();
+        let c = db.create_collection("gf", Some(8), 4).unwrap();
+        c.add(0, &along(0.5, 0), "seed", vec![]).unwrap();
+
+        let batch = |first: u64| -> Vec<Record> {
+            (first..first + 3)
+                .map(|i| Record {
+                    id: i,
+                    vector: along(0.8, i),
+                    text: "g".into(),
+                    metadata: vec![],
+                })
+                .collect()
+        };
+        let barrier = Arc::new(std::sync::Barrier::new(2));
+        let inside = Arc::clone(&barrier);
+        let calls = AtomicUsize::new(0);
+        // Call 0 parks the first group in its window. Call 1 is the window of the grouped
+        // writes, and makes their log sync fail. Holding a handle to the collection in the hook
+        // leaks it at the end of the test, which is harmless here.
+        let handle = Arc::clone(&c);
+        set_window_hook(&c, move || match calls.fetch_add(1, Ordering::SeqCst) {
+            0 => {
+                inside.wait();
+                inside.wait();
+            }
+            1 => handle.fail_log_sync.store(true, Ordering::SeqCst),
+            _ => {}
+        });
+
+        let first = {
+            let c = Arc::clone(&c);
+            thread::spawn(move || c.add_many(&batch(100)))
+        };
+        barrier.wait();
+        let release = Release(&barrier);
+        let second = {
+            let c = Arc::clone(&c);
+            thread::spawn(move || c.add_many(&batch(200)))
+        };
+        let third = {
+            let c = Arc::clone(&c);
+            thread::spawn(move || c.add_many(&batch(300)))
+        };
+        while c.queue.lock().unwrap().pending.len() < 2 {
+            thread::yield_now();
+        }
+        drop(release);
+
+        assert_eq!(first.join().unwrap().unwrap(), 3);
+        assert!(second.join().unwrap().is_err());
+        assert!(third.join().unwrap().is_err());
+        assert_eq!(c.count().unwrap(), 4, "only the first group is committed");
+        assert!(c.get(200).unwrap().is_none());
+        assert!(c.get(300).unwrap().is_none());
+
+        c.add_many(&batch(400)).unwrap();
+        assert_eq!(c.count().unwrap(), 7);
+        drop(c);
+        drop(db);
+        let db = VectorDB::open(&dir).unwrap();
+        assert_eq!(db.get_collection("gf").unwrap().count().unwrap(), 7);
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// In one group, a rejected member gets its own error and the others commit. Here the second
+    /// batch repeats an id the first batch of the group added.
+    #[test]
+    fn grouped_writes_fail_individually_and_the_rest_commit() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let dir = temp_dir("group-reject");
+        let db = VectorDB::open(&dir).unwrap();
+        let c = db.create_collection("gr", Some(8), 4).unwrap();
+        c.add(0, &along(0.5, 0), "seed", vec![]).unwrap();
+
+        let batch = |ids: &[u64]| -> Vec<Record> {
+            ids.iter()
+                .map(|&i| Record {
+                    id: i,
+                    vector: along(0.8, i),
+                    text: "g".into(),
+                    metadata: vec![],
+                })
+                .collect()
+        };
+        let barrier = Arc::new(std::sync::Barrier::new(2));
+        let inside = Arc::clone(&barrier);
+        let calls = AtomicUsize::new(0);
+        set_window_hook(&c, move || {
+            if calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                inside.wait();
+                inside.wait();
+            }
+        });
+        let first = {
+            let c = Arc::clone(&c);
+            thread::spawn(move || c.add_many(&batch(&[100])))
+        };
+        barrier.wait();
+        let release = Release(&barrier);
+        let second = {
+            let c = Arc::clone(&c);
+            thread::spawn(move || c.add_many(&batch(&[200, 201])))
+        };
+        let third = {
+            let c = Arc::clone(&c);
+            thread::spawn(move || c.add_many(&batch(&[201, 202])))
+        };
+        while c.queue.lock().unwrap().pending.len() < 2 {
+            thread::yield_now();
+        }
+        drop(release);
+
+        assert_eq!(first.join().unwrap().unwrap(), 1);
+        let second = second.join().unwrap();
+        let third = third.join().unwrap();
+        // Both queued batches are in one group. Whichever is staged second repeats id 201.
+        assert!(
+            matches!(second, Ok(2)) ^ matches!(third, Ok(2)),
+            "exactly one of the two may commit: {second:?} {third:?}"
+        );
+        let failed = if second.is_err() { second } else { third };
+        assert!(
+            matches!(failed, Err(ZenarError::DuplicateId(201))),
+            "{failed:?}"
+        );
+        assert_eq!(c.count().unwrap(), 4);
+        fs::remove_dir_all(&dir).ok();
+    }
+
     /// Copies a directory tree, as a crash would leave it on disk.
     fn copy_tree(src: &Path, dst: &Path) {
         fs::create_dir_all(dst).unwrap();
@@ -2110,5 +2653,42 @@ mod recovery_tests {
         assert_eq!(report.orphaned_vectors_removed, 4, "{report:?}");
         fs::remove_dir_all(&dir).ok();
         fs::remove_dir_all(&snapshot).ok();
+    }
+
+    /// A panic in the leader part way through a group poisons the collection and releases the queue. The
+    /// write that panicked gets an error. A write queued behind it gets an error rather than waiting. A
+    /// reopen then reconciles the files: the panicked write is applied, since its index sync and its log
+    /// bytes were both written before the panic, and the documented rule for an error after a sync allows that.
+    #[test]
+    fn leader_panic_poisons_releases_the_queue_and_reopen_recovers() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let dir = temp_dir("leader-panic");
+        {
+            let db = VectorDB::open_with(&dir, crate::database::MetadataSync::Full).unwrap();
+            let c = db.create_collection("lp", Some(8), 4).unwrap();
+            c.add(0, &along(0.5, 0), "seed", vec![]).unwrap();
+            let calls = AtomicUsize::new(0);
+            set_window_hook(&c, move || {
+                if calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                    panic!("injected panic in the leader");
+                }
+            });
+            let victim = {
+                let c = Arc::clone(&c);
+                thread::spawn(move || c.add(1, &along(0.6, 1), "one", vec![]))
+            };
+            assert!(victim.join().is_err());
+            assert!(matches!(
+                c.add(2, &along(0.7, 2), "two", vec![]),
+                Err(ZenarError::PersistenceError(_))
+            ));
+            assert!(matches!(c.get(0), Err(ZenarError::PersistenceError(_))));
+        }
+        let db = VectorDB::open(&dir).unwrap();
+        let c = db.get_collection("lp").unwrap();
+        assert_eq!(c.count().unwrap(), 2);
+        assert!(c.get(1).unwrap().is_some());
+        c.add(2, &along(0.7, 2), "two", vec![]).unwrap();
+        fs::remove_dir_all(&dir).ok();
     }
 }

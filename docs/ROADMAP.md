@@ -13,6 +13,17 @@ not. Items marked done are verified in the code and the test suite; the tests ar
 - Measured the write lock: which operations hold it, for how long, and which of its steps is I/O (BENCHMARKS.md,
   "Concurrency and write cost"; docs/CONCURRENCY.md). Added the `concurrent_bench`, `write_breakdown`, `write_cost` and
   `delta_scan` examples.
+- Phase 1 of the concurrency proposal: log sync moved outside the collection lock, behind a per-collection writer gate.
+  Continuous-writer search throughput with 8 readers rose from about 700 to about 6,200 per second (median of three
+  runs). p99 fell from about 30 ms to about 6 ms. Search returns `top_k` committed results when that many exist (over-fetch for uncommitted
+  vectors). Regression tests cover window searches, injected log-sync failures, and concurrent inserts and searches
+  (docs/CONCURRENCY.md, BENCHMARKS.md).
+- Audit of the write path (CONCURRENCY.md, "Audit"): a failed index re-sync during rollback now poisons the collection. New
+  regression tests cover pending documents, acknowledgement after the log sync, a crash between a group's index sync and
+  log sync, a torn group log, and concurrent acknowledged writes and deletes.
+- Group commit for concurrent writers. Writes queue; a leader syncs a group with one index sync and one log sync. Writes alone, two
+  and four writers reach 1.8 and 3.2 times the Phase 1 rate. A bounded
+  linger lets writers share a group. A failed group rolls back every member (docs/CONCURRENCY.md, "Group commit").
 - Fixed: a failed truncation was ignored, so the failed write's bytes stayed in the log, and a later add of the same id
   made the database refuse to open ("duplicate live id"). A failed log write, or a failed truncation after one, now poisons the collection.
 - Fixed: a log that was shorter than its last sync was truncated before the shortened-file check, so a refused open
@@ -24,17 +35,15 @@ not. Items marked done are verified in the code and the test suite; the tests ar
 
 ## Open, in priority order
 
-1. **Reader throughput collapses under a continuous writer.** With 8 readers, search falls from about 33,000/s to about
-   680/s while one writer runs batches of 50. The write lock is held 8.6 ms per batch, and 89% of that is two fsyncs. Readers
-   are not starved indefinitely: p99 is about three batch times. The cost is throughput. The proposal (docs/CONCURRENCY.md)
-   moves the log fsync out of the lock, behind a per-collection writer gate. That changes the locking protocol, so it
-   waits for your decision. Its estimates are a model until a prototype is measured.
-1a. **Deletes hold the write lock for about 25 ms.** Two catalog writes account for about 17 ms of it (by subtraction;
-   not timed alone). Each catalog write syncs a temporary file and a directory. Keeping exact refusal costs that time.
-   Budgeting the recorded lengths (docs/CONCURRENCY.md, option J2) would bring it to about 8 ms, but it changes the bound
-   on the shortened-file check. That is a decision for you.
-1b. **Compaction holds the write lock for the whole rewrite.** 115 ms at 100,000 live rows and 261 ms at 500,000. A
-   long delete can stall every reader for that long. Moving the rewrite out of the lock is option K1 in the proposal.
+1. **Compaction holds the write lock for its whole rewrite.** 254 to 265 ms with 500,000 live rows, measured. It is now the
+   largest reader stall. Moving the rewrite out of the lock needs a plan for deletes that happen during the rewrite
+   (docs/CONCURRENCY.md, open item 1).
+0. **Staging under the index lock.** A group's leader stages every batch under the lock. Encoding each batch before the
+   lock is taken would shorten the lock hold. Not measured yet (docs/CONCURRENCY.md, open item 0).
+1b. **Index sync holds the write lock.** About 3.9 ms per batch. TurboVec syncs from its in-memory state with `&mut self`,
+   so this needs an engine change to move out (docs/CONCURRENCY.md, open item 3).
+1c. **Deletes write the catalog twice under the lock.** About 17 ms of a 24 ms delete. Exact refusal is kept by decision,
+   so this stays as it is (docs/CONCURRENCY.md, open item 2).
 2. **Open time grows with the log.** 0.44 s at 1M rows, and linear in the log. A persisted index or checkpoint would avoid
    the replay, and it would need its own recovery rules. Not started.
 3. **Power-loss behaviour is not tested on hardware.** The process-level crash tests and the byte-level torn-record tests

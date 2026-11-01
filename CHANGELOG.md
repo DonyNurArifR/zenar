@@ -6,6 +6,8 @@ project follows [semantic versioning](https://semver.org/) while it is pre-1.0.
 ## Unreleased
 
 ### Changed
+- Unfiltered search returns `top_k` committed results when that many exist, even while a write is between its index sync
+  and its commit. Documents of a write that has not returned yet are not returned.
 - A failed write to the document log poisons the collection, and so does a failed truncation after one. Before, the
   leftover bytes stayed in the log, and a later add of the same id could make the database refuse to open.
 - A delete no longer turns off the shortened-file check while it runs. A crash inside a delete cannot hide a missing
@@ -19,9 +21,26 @@ project follows [semantic versioning](https://semver.org/) while it is pre-1.0.
 - STORAGE.md states that the vector index and the document log are not one transaction. It covers the order of durable
   steps, the outcome of each failure, the poisoning rule, and reconciliation on open.
 - ROADMAP.md lists the open production-readiness items in priority order.
-- CONCURRENCY.md is a design proposal for reader throughput under a continuous writer. It measures the write lock and
-  proposes a locking change. Nothing in it is implemented yet.
+- CONCURRENCY.md describes the write lock, the measured costs, and the locking change in Phase 1.
 - BENCHMARKS.md corrects the delete cost (about 25 ms, not 8 ms) and adds the concurrency and write-cost measurements.
+
+### Performance
+- A write syncs its document log with the collection lock released. The index is still synced under the lock. With
+  8 readers and one continuous writer, search throughput rises from about 700 to about 6,200 per second, and p99 falls
+  from about 30 ms to about 6 ms. Single-writer write costs are unchanged within noise.
+- Writes from several threads to one collection share syncs (group commit). Writes queue; a leader syncs the queued
+  writes as one group, with one index sync and one log sync. Writes alone, four writers reach about 420 batches per second,
+  against about 130 before, and about 3.2 times the Phase 1 build. With 8 readers, search throughput at four writers
+  falls to about 2,600 per second, against about 5,900 for Phase 1: group commit trades reader throughput for writer
+  throughput. See BENCHMARKS.md, "Readers and writers".
+- A group's failure rolls back the whole group, and every write in it gets the error. A write the group rejects on its own
+  (a duplicate id, a bad vector) gets its own error, and the others commit.
+- Writes to one collection are queued (no per-collection writer gate). Readers do not take the queue.
+- A failed re-sync of the index during a rollback poisons the collection, as a failed truncation already did. Before, the
+  disk could hold vectors that the log did not have, and the collection stayed usable.
+- `Collection::write_stats` (Rust API) returns counters for group sizes, lock holds, and readers' waits for the state lock.
+  It is a diagnostic and is not in the Python API.
+
 
 ## 0.2.0
 

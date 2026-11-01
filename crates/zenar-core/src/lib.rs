@@ -14,7 +14,9 @@ pub mod names;
 pub mod storage;
 pub mod value;
 
-pub use collection::{Collection, Hit, Record, RecoveryReport, Retrieval};
+pub use collection::{
+    Collection, GROUP_BUCKETS, Hit, Record, RecoveryReport, Retrieval, WriteStats,
+};
 pub use database::{MetadataSync, VectorDB};
 pub use docstore::{DocumentRow, FieldStats};
 pub use error::ZenarError;

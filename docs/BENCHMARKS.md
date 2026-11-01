@@ -158,35 +158,83 @@ was 3.6 ms.
 
 ## Concurrency and write cost
 
-Reader and writer behaviour on one collection, and the cost of each write step. These show where the write lock is
-held and for how long (docs/CONCURRENCY.md has the analysis and the proposal). Reference machine, release build,
-dimension 384, top-10 unfiltered searches, 8 reader threads, 5 s per case. The table is the median of three runs; the
-readers-only search rate ranged from 28,700 to 33,800 across the three runs. The continuous-writer rate ranged from 657 to
-687 in those runs, and 696 to 873 in earlier runs of the same case.
+Reader and writer behaviour on one collection, and the cost of each write step. Three builds are compared:
 
-Reproduce:
+- **original**: commit d9ffc5e, one writer at a time through the collection lock. The lock covered both syncs.
+- **Phase 1**: commit 4dc3d67, the log sync outside the lock, writes serialized by a writer gate.
+- **group commit**: this change. Writes queue, and a leader syncs the queued writes as one group.
 
-```sh
-cargo run --release -p zenar-core --example concurrent_bench -- 100000 384 8 5 50
-cargo run --release -p zenar-core --example write_breakdown
-cargo run --release -p zenar-core --example write_cost -- 1000000
-cargo run --release -p zenar-core --example delta_scan
-```
+Reference machine, release build, dimension 384, 100,000 rows, batches of 50 rows, 8 reader threads, 5 s per case.
+Every number is the median of three runs for its column. Search latency is per query. Batch latency is per `add_many`
+of 50 rows, including its wait for the state lock. Reproduce with `concurrent_bench -- 100000 384 8 5 50 <writers>`.
 
-### Readers and a writer (`concurrent_bench`, 100,000 rows)
+### Readers and writers (continuous writer)
 
-| Case | Search/s | Search p50 | Search p99 | Writer batches/s | Batch p50 |
+| Writers | Build | Search/s | Search p50 | p95 | p99 | Writer batches/s | Batch p50 | p95 | p99 |
+|---|---|---|---|---|---|---|---|---|---|
+| 1 | original | 699 | 11.1 ms | 20.7 ms | 29.6 ms | 92.2 | 10.9 ms | 12.9 ms | 15.9 ms |
+| 1 | Phase 1 | 6,165 | 0.62 ms | 5.04 ms | 5.96 ms | 118.5 | 8.2 ms | 9.7 ms | 14.9 ms |
+| 1 | group commit | 6,330 | 0.63 ms | 5.03 ms | 5.86 ms | 116.1 | 8.2 ms | 10.7 ms | 15.4 ms |
+| 2 | original | 508 | 14.0 ms | 31.5 ms | 45.2 ms | 101.8 | 18.0 ms | 36.0 ms | 50.9 ms |
+| 2 | Phase 1 | 5,934 | 0.64 ms | 5.05 ms | 5.99 ms | 119.9 | 16.1 ms | 20.3 ms | 25.7 ms |
+| 2 | group commit | 4,323 | 1.00 ms | 5.82 ms | 6.60 ms | 225.9 | 8.6 ms | 10.4 ms | 14.5 ms |
+| 4 | original | 315 | 25.8 ms | 42.0 ms | 50.5 ms | 108.6 | 32.0 ms | 71.9 ms | 92.8 ms |
+| 4 | Phase 1 | 5,919 | 0.65 ms | 5.07 ms | 6.06 ms | 118.8 | 32.7 ms | 39.9 ms | 43.4 ms |
+| 4 | group commit | 2,626 | 2.03 ms | 7.13 ms | 8.41 ms | 400.0 | 9.5 ms | 13.7 ms | 16.4 ms |
+
+With no writer, search with 8 readers is unchanged across the builds within run-to-run noise: about 31,000 to 34,000
+per second. Reader throughput without a writer was not repeated for the group-commit build; the code on that path is
+unchanged.
+
+### Writer throughput without readers
+
+| Writers | Original | Phase 1 | Group commit |
+|---|---|---|---|
+| 1 | 116.2 batches/s | 132.6 batches/s | 135.0 batches/s |
+| 2 | 126.7 batches/s | 133.5 batches/s | 236.8 batches/s |
+| 4 | 128.7 batches/s | 133.7 batches/s | 421.4 batches/s |
+
+Batch p50 without readers: 8.8 ms, 7.1 ms and 7.0 ms at one writer; 15.1, 14.8 and 8.0 ms at two; 30.9, 29.1 and 9.0 ms at four.
+Group commit at four writers is 3.2 times Phase 1 and 3.3 times the original.
+
+### What the groups did (group commit build, counters from `Collection::write_stats`)
+
+Each group is one index sync and one log sync. The counters are cumulative for one run, and the run covers the readers
+case above.
+
+| Writers | Groups per 5 s run | Writes per group | Group sizes seen | Lock hold per hold, mean | Reader wait, mean |
 |---|---|---|---|---|---|
-| 1 reader, no writer | 8,817 | 0.081 ms | 1.4 ms | | |
-| 8 readers, no writer | 33,455 | 0.236 ms | 0.52 ms | | |
-| 8 readers, 1 batch/s | 31,963 | 0.238 ms | 0.56 ms | 1.0 | 8.7 ms |
-| 8 readers, 10 batch/s | 28,468 | 0.245 ms | 0.70 ms | 9.0 | 7.8 ms |
-| 8 readers, continuous writer | 679 | 11.1 ms | 27.6 ms | 90.4 | 10.9 ms |
-| Writer alone, continuous | | | | 116.4 | 8.6 ms |
+| 1 | about 585 | 1.00 | all 1 | 1.9 ms | 0.7 ms |
+| 2 | about 570 | 2.00 | 2 (all but one group) | 2.0 ms | 0.9 ms |
+| 4 | about 507 | 3.99 | 4 (about 99% of groups) | 2.1 ms | 1.5 ms |
 
-A batch is 50 rows through `add_many`. The batch time includes waiting for the write lock, so with readers present it
-is longer than alone. The continuous-writer row is the one under study: search throughput drops by about 98% while the
-writer runs, and the readers' p50 is one batch time.
+Each group takes the state lock twice: once to stage and sync the index, and once to commit. So a group holds the lock for
+two sections, and each is about 2 ms on average. Without readers the mean hold is 2.0 ms at one writer, 2.5 ms at two,
+and 2.6 to 3.0 ms at four. The largest single hold since the collection was opened was about 90 ms, from the seeding batches. The
+counters' maxima are cumulative, so they do not describe one case.
+
+### Write costs through the public API (`write_cost`, 100,000 rows)
+
+| Operation | Original | Phase 1 | Group commit (1 writer) |
+|---|---|---|---|
+| `add`, `durable=True` | 7.9 ms | 7.8 ms | 8.3 ms |
+| `add_many`, 50 rows | 7.8 ms | 7.7 ms | 8.3 ms |
+
+Five alternating runs of Phase 1 and the group-commit build give `add_many` means of 7.7 and 8.0 ms, with runs from 6.5 to
+8.8 ms on both. The single-writer path is about 4% slower in the mean. That is within the variation between runs.
+
+The delete path is unchanged: one delete is about 24 ms, and a compacting `delete_many` of 1,000 ids is 115 ms at
+200,000 rows and 261 ms at 1,000,000 (compaction holds the lock; see ROADMAP.md).
+
+### Trade-off: group commit against reader throughput
+
+Group commit trades reader throughput for writer throughput, and this is measured, not estimated. A group stages every
+batch in it while holding the state lock, so the lock is held longer per group as the group grows. At four writers each
+group holds the lock for about 2 ms per section, twice per group. Readers then wait longer on average (1.5 ms against
+0.7 ms at one writer), and search throughput falls from about 6,300 per second at one writer to about 2,600 at four. The
+writers' gain is larger: 400 batches per second at four writers, against 116 at one. Work done per second rises, and
+each search waits longer. Moving the encoding of each batch out of the lock is the next thing to measure. A bounded
+number of writers, or a cap on group size, would limit the reader cost if it matters for a workload.
 
 ### Write steps (`write_breakdown`, 50-row batch, sequential)
 
@@ -207,8 +255,8 @@ batch.
 | Operation | Time |
 |---|---|
 | `add`, default durability | 0.01 ms |
-| `add`, `durable=True` | 7.4 to 7.9 ms |
-| `add_many`, 50 rows | 7.5 to 8.5 ms |
+| `add`, `durable=True` | 7.3 to 8.0 ms |
+| `add_many`, 50 rows | 7.3 to 9.0 ms (7.3 to 8.5 ms before Phase 1) |
 | `delete`, one id (10,000 rows) | 24.8 ms |
 | `delete_many`, 1,000 ids, no compaction | 23 to 31 ms |
 | `delete_many`, 1,000 ids, the batch that compacts (200,000 rows, 100,000 live after) | 115 ms |
@@ -216,6 +264,17 @@ batch.
 
 Compaction holds the write lock for the whole rewrite and the reopen that follows it. Its cost grows with the live rows
 left.
+
+### Syncs per group (`group_cost`, no threads)
+
+Four batches of 50 rows, written in one pass with one index sync and one log sync per batch, against one pair of syncs
+for the whole group. This is the saving that group commit makes on the sync path.
+
+| Group size | One sync pair per batch | One sync pair per group | Speed-up |
+|---|---|---|---|
+| 1 | 9.7 ms per batch | 9.2 ms per batch | 1.05x |
+| 2 | 9.1 ms per batch | 5.1 ms per batch | 1.78x |
+| 4 | 8.9 ms per batch | 2.9 ms per batch | 3.07x |
 
 ### Delta scan cost (`delta_scan`, dimension 384, naive scalar loops)
 
