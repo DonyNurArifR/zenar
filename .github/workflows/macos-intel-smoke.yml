@@ -6,6 +6,11 @@ name: macOS Intel smoke (manual)
 
 on:
   workflow_dispatch:
+  # Runs from this branch only, and only when this file changes. Dispatching needs the file on the default
+  # branch, which it is not, so the first run comes from the push that adds this trigger.
+  push:
+    branches: [docs-index-atomicity]
+    paths: [".github/workflows/macos-intel-smoke.yml"]
 
 permissions:
   contents: read
