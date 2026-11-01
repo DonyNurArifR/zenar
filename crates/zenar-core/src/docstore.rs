@@ -198,6 +198,9 @@ pub struct DocStore {
     by_id: HashMap<u64, u32>,
     live: usize,
     dead: usize,
+    /// Test hook: makes the next `undo` fail without truncating, as a failing `set_len` would.
+    #[cfg(test)]
+    pub(crate) fail_undo: bool,
 }
 
 impl DocStore {
@@ -215,10 +218,33 @@ impl DocStore {
 
     /// Opens an existing log and replays it. A torn tail is truncated.
     pub fn open(path: &Path, fields: Vec<(String, FieldKind)>) -> Result<Self, ZenarError> {
+        Self::open_checked(path, fields, 0)
+    }
+
+    /// Opens an existing log, as `open` does, but refuses a log that does not still hold the
+    /// `durable_len` bytes it had at its last sync. The check runs before anything is truncated,
+    /// so a refused open leaves the file as it found it.
+    pub fn open_checked(
+        path: &Path,
+        fields: Vec<(String, FieldKind)>,
+        durable_len: u64,
+    ) -> Result<Self, ZenarError> {
         let file = open_log(path).map_err(io_err)?;
         let file_len = file.metadata().map_err(io_err)?.len();
+        if file_len < durable_len {
+            return Err(ZenarError::RecoveryError(format!(
+                "the document log is {file_len} bytes but was {durable_len} at its last sync; \
+                 a file was truncated outside Zenar"
+            )));
+        }
         let mut store = Self::empty(path.to_path_buf(), Some(file), 0, fields);
         let good_end = store.replay(file_len)?;
+        if good_end < durable_len {
+            return Err(ZenarError::RecoveryError(format!(
+                "the document log is valid to byte {good_end}, but {durable_len} bytes were synced; \
+                 a synced record is damaged"
+            )));
+        }
         if good_end < file_len {
             let file = store.handle()?;
             file.set_len(good_end).map_err(io_err)?;
@@ -248,6 +274,8 @@ impl DocStore {
             by_id: HashMap::new(),
             live: 0,
             dead: 0,
+            #[cfg(test)]
+            fail_undo: false,
         }
     }
 
@@ -422,8 +450,13 @@ impl DocStore {
         Ok(())
     }
 
-    /// Discards a staged write by truncating the log back to its length before the write.
+    /// Discards a staged write by truncating the log back to its length before the write. If this
+    /// fails, the staged bytes may still be in the log, and the caller must poison the collection.
     pub fn undo(&mut self, staged: Staged) -> Result<(), ZenarError> {
+        #[cfg(test)]
+        if self.fail_undo {
+            return Err(ZenarError::PersistenceError("injected undo failure".into()));
+        }
         self.handle()?.set_len(staged.old_len).map_err(io_err)?;
         self.len = staged.old_len;
         Ok(())
@@ -477,7 +510,15 @@ impl DocStore {
 
     /// True when dead rows are worth reclaiming: more dead than live, and enough to matter.
     pub fn should_compact(&self) -> bool {
-        self.dead > 4096 && self.dead > self.live
+        self.compaction_due_after(0)
+    }
+
+    /// Whether the log would be due for compaction after `deleting` more documents are removed.
+    /// Called before the delete, so that the recorded lengths can be lowered first.
+    pub fn compaction_due_after(&self, deleting: usize) -> bool {
+        let dead = self.dead + deleting;
+        let live = self.live - deleting;
+        dead > 4096 && dead > live
     }
 
     /// Rewrites the log with only live documents, then replaces the old log atomically.

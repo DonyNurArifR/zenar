@@ -3,6 +3,23 @@
 All notable changes to Zenar. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the
 project follows [semantic versioning](https://semver.org/) while it is pre-1.0.
 
+## Unreleased
+
+### Changed
+- A failed write to the document log poisons the collection, and so does a failed truncation after one. Before, the
+  leftover bytes stayed in the log, and a later add of the same id could make the database refuse to open.
+- A delete no longer turns off the shortened-file check while it runs. A crash inside a delete cannot hide a missing
+  vector index.
+- `RecoveryError` on open is raised before any file is truncated, and a missing document log is refused instead of
+  recreated empty while the catalog says it held synced bytes.
+
+### Documentation
+- ARCHITECTURE.md describes the metadata indexes: structures, lookup and update costs, memory, the alternatives that
+  were measured and those that were not.
+- STORAGE.md states that the vector index and the document log are not one transaction. It covers the order of durable
+  steps, the outcome of each failure, the poisoning rule, and reconciliation on open.
+- ROADMAP.md lists the open production-readiness items in priority order.
+
 ## 0.2.0
 
 First release since 0.1.1. It changes the on-disk format, so databases written by 0.1.x cannot be opened and must

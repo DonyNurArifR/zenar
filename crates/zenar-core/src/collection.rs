@@ -164,20 +164,21 @@ impl Collection {
         }
         self.extend_schema(&mut state, &new_fields)?;
 
-        let staged = state.docs.stage_puts(&[DocRef {
-            id,
-            text,
-            metadata: &values,
-        }])?;
+        let staged = state
+            .docs
+            .stage_puts(&[DocRef {
+                id,
+                text,
+                metadata: &values,
+            }])
+            .map_err(|e| poison(&mut state, e))?;
         if let Err(e) = state.store.add(vector, id) {
-            state.docs.undo(staged)?;
-            return Err(e);
+            return Err(undo_or_poison(&mut state, staged, e));
         }
         if self.durable || state.unsynced + 1 >= SYNC_INTERVAL {
             if let Err(e) = self.sync_both(&mut state) {
                 let _ = state.store.remove(id);
-                let _ = state.docs.undo(staged);
-                return Err(e);
+                return Err(undo_or_poison(&mut state, staged, e));
             }
         } else {
             state.unsynced += 1;
@@ -189,7 +190,9 @@ impl Collection {
         Ok(())
     }
 
-    /// Adds many documents atomically. Either every record is added or none is.
+    /// Adds many documents atomically. Either every record is added or none is, for errors Zenar
+    /// reports and for a process crash. After a power loss a prefix of the batch can survive
+    /// (STORAGE.md, "What a failure leaves behind").
     ///
     /// 1. Validate every record before any write: ids, vectors, metadata, duplicates
     ///    within the batch and against stored documents.
@@ -243,20 +246,21 @@ impl Collection {
                 metadata: values.as_slice(),
             })
             .collect();
-        let staged = state.docs.stage_puts(&refs)?;
+        let staged = state
+            .docs
+            .stage_puts(&refs)
+            .map_err(|e| poison(&mut state, e))?;
         let mut added: Vec<u64> = Vec::with_capacity(records.len());
         for record in records {
             if let Err(e) = state.store.add(&record.vector, record.id) {
-                self.rollback(&mut state, &added, staged);
-                return Err(e);
+                return Err(self.rollback(&mut state, &added, staged, e));
             }
             added.push(record.id);
         }
 
         // 4. One sync for the whole batch.
         if let Err(e) = self.sync_both(&mut state) {
-            self.rollback(&mut state, &added, staged);
-            return Err(e);
+            return Err(self.rollback(&mut state, &added, staged, e));
         }
 
         // 5. Visible.
@@ -277,7 +281,8 @@ impl Collection {
         }
         // From here on the in-memory state is ahead of the durable state until the delete is
         // logged and synced. Any failure poisons the collection, since it cannot be undone safely.
-        self.clear_recorded_lengths()?;
+        let compacting = state.docs.compaction_due_after(1);
+        self.lower_recorded_lengths(1, compacting)?;
         if !state.store.remove(id) {
             return Err(ZenarError::VectorNotFound(id));
         }
@@ -326,7 +331,8 @@ impl Collection {
             }
         }
         // From here, see `delete`: any failure poisons the collection.
-        self.clear_recorded_lengths()?;
+        let compacting = state.docs.compaction_due_after(ids.len());
+        self.lower_recorded_lengths(ids.len(), compacting)?;
         for &id in ids {
             state.store.remove(id);
         }
@@ -765,14 +771,18 @@ impl Collection {
         Ok(())
     }
 
-    /// Clears the recorded lengths before a delete. A delete can shrink the vector index (synced
-    /// before the delete is logged) and the log (when compaction runs). A crash in between would
-    /// leave recorded values larger than the files. Zero is always safe: it disables the
-    /// shortened-file check until the next record.
-    fn clear_recorded_lengths(&self) -> Result<(), ZenarError> {
+    /// Lowers the recorded lengths before a delete changes anything on disk. The index can lose
+    /// `deleting` vectors when it is synced, and the log shrinks only when compaction runs, so
+    /// before the delete is recorded again a crash can leave each file between its recorded length
+    /// and that length less `deleting`. Lowering by exactly that keeps the shortened-file check
+    /// on, so a file that is missing or cut short is still refused. Zeroing the log length is
+    /// needed only when compaction runs.
+    fn lower_recorded_lengths(&self, deleting: usize, compacting: bool) -> Result<(), ZenarError> {
         self.catalog.update(&self.name, |entry| {
-            entry.durable_log_len = 0;
-            entry.durable_vectors = 0;
+            entry.durable_vectors = entry.durable_vectors.saturating_sub(deleting);
+            if compacting {
+                entry.durable_log_len = 0;
+            }
         })
     }
 
@@ -789,15 +799,21 @@ impl Collection {
 
     /// Undoes a batch that failed before it became visible: removes its vectors from memory,
     /// truncates its log bytes, and syncs the index to match. If that sync fails, recovery on
-    /// the next open removes the stray vectors.
-    fn rollback(&self, state: &mut State, added: &[u64], staged: crate::docstore::Staged) {
+    /// the next open removes the stray vectors. Returns `cause`, the error that started the rollback.
+    fn rollback(
+        &self,
+        state: &mut State,
+        added: &[u64],
+        staged: crate::docstore::Staged,
+        cause: ZenarError,
+    ) -> ZenarError {
         for id in added {
             state.store.remove(*id);
         }
         if !added.is_empty() {
             let _ = state.store.sync(&self.index_path);
         }
-        let _ = state.docs.undo(staged);
+        undo_or_poison(state, staged, cause)
     }
 
     fn read_state(&self) -> Result<RwLockReadGuard<'_, State>, ZenarError> {
@@ -884,6 +900,20 @@ fn healthy(state: &State) -> Result<(), ZenarError> {
 fn poison(state: &mut State, e: ZenarError) -> ZenarError {
     state.poisoned.get_or_insert_with(|| e.to_string());
     e
+}
+
+/// Truncates a staged write after a failure and returns `cause`. If the log cannot be truncated,
+/// the staged bytes stay in it, and the next write would land after them. The collection is then
+/// poisoned, so that only a reopen (which treats those bytes as unsynced documents) can continue.
+fn undo_or_poison(
+    state: &mut State,
+    staged: crate::docstore::Staged,
+    cause: ZenarError,
+) -> ZenarError {
+    if let Err(e) = state.docs.undo(staged) {
+        poison(state, e);
+    }
+    cause
 }
 
 pub fn check_id(id: u64) -> Result<(), ZenarError> {
@@ -1024,6 +1054,7 @@ mod recovery_tests {
     use super::*;
     use crate::database::VectorDB;
     use std::fs;
+    use std::path::Path;
 
     fn temp_dir(tag: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("zenar-rec-{tag}-{}", std::process::id()));
@@ -1112,6 +1143,290 @@ mod recovery_tests {
         // Reopening replays the durable state and clears the poison.
         let db = VectorDB::open(&dir).unwrap();
         assert_eq!(db.get_collection("p").unwrap().count().unwrap(), 1);
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Makes the index file and its directory refuse writes. An incremental sync appends to the
+    /// file, and a full rewrite creates a temporary file next to it, so both fail.
+    #[cfg(unix)]
+    fn fail_index_syncs(index: &Path, failing: bool) {
+        use std::os::unix::fs::PermissionsExt;
+        let (file_mode, dir_mode) = if failing {
+            (0o444, 0o555)
+        } else {
+            (0o644, 0o755)
+        };
+        fs::set_permissions(index, fs::Permissions::from_mode(file_mode)).unwrap();
+        fs::set_permissions(
+            index.parent().unwrap(),
+            fs::Permissions::from_mode(dir_mode),
+        )
+        .unwrap();
+    }
+
+    /// The fault tests need a file that refuses writes. Root is not refused, so fail loudly
+    /// instead of passing without injecting a fault.
+    #[cfg(unix)]
+    fn assert_index_refuses_writes(index: &Path) {
+        assert!(
+            fs::OpenOptions::new().append(true).open(index).is_err(),
+            "the fault tests need an index file that refuses writes (is this running as root?)"
+        );
+    }
+
+    /// A delete whose index sync fails poisons the collection. The tombstone was never written,
+    /// so reopening keeps the document and its vector.
+    #[cfg(unix)]
+    #[test]
+    fn failed_delete_poisons_and_reopen_keeps_the_document() {
+        let dir = temp_dir("fail-delete");
+        let index = dir.join("vectors").join("fd.zvec");
+        {
+            let db = VectorDB::open(&dir).unwrap();
+            let c = db.create_collection("fd", Some(8), 4).unwrap();
+            c.add(1, &v(1.0), "one", vec![]).unwrap();
+            c.add(2, &v(2.0), "two", vec![]).unwrap();
+            db.flush().unwrap();
+
+            fail_index_syncs(&index, true);
+            assert_index_refuses_writes(&index);
+            assert!(c.delete(1).is_err());
+            fail_index_syncs(&index, false);
+
+            assert!(matches!(c.get(2), Err(ZenarError::PersistenceError(_))));
+            assert!(matches!(c.delete(2), Err(ZenarError::PersistenceError(_))));
+        }
+        let db = VectorDB::open(&dir).unwrap();
+        assert!(db.recovery_report().is_clean());
+        let c = db.get_collection("fd").unwrap();
+        assert_eq!(c.count().unwrap(), 2);
+        assert!(c.get(1).unwrap().is_some());
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A durable add whose sync fails is undone in memory and on disk. The collection is not
+    /// poisoned, so later writes work, and the failed document never appears after reopen.
+    #[cfg(unix)]
+    #[test]
+    fn failed_add_leaves_no_trace_and_the_collection_stays_usable() {
+        let dir = temp_dir("fail-add");
+        let index = dir.join("vectors").join("fa.zvec");
+        {
+            let db = VectorDB::open_with(&dir, crate::database::MetadataSync::Full).unwrap();
+            let c = db.create_collection("fa", Some(8), 4).unwrap();
+            c.add(1, &v(1.0), "one", vec![]).unwrap();
+
+            fail_index_syncs(&index, true);
+            assert_index_refuses_writes(&index);
+            assert!(c.add(2, &v(2.0), "two", vec![]).is_err());
+            fail_index_syncs(&index, false);
+
+            assert!(c.get(2).unwrap().is_none());
+            assert_eq!(c.count().unwrap(), 1);
+            c.add(3, &v(3.0), "three", vec![]).unwrap();
+        }
+        let db = VectorDB::open(&dir).unwrap();
+        assert!(db.recovery_report().is_clean());
+        let c = db.get_collection("fa").unwrap();
+        assert_eq!(c.count().unwrap(), 2);
+        assert!(c.get(2).unwrap().is_none());
+        assert!(c.get(3).unwrap().is_some());
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A batch whose sync fails is rolled back: none of its ids is stored, and the same ids can
+    /// be added again afterwards.
+    #[cfg(unix)]
+    #[test]
+    fn failed_add_many_is_all_or_nothing_across_reopen() {
+        let dir = temp_dir("fail-batch");
+        let index = dir.join("vectors").join("fb.zvec");
+        let batch = || {
+            vec![
+                Record {
+                    id: 2,
+                    vector: v(2.0),
+                    text: "two".into(),
+                    metadata: vec![],
+                },
+                Record {
+                    id: 3,
+                    vector: v(3.0),
+                    text: "three".into(),
+                    metadata: vec![],
+                },
+            ]
+        };
+        {
+            let db = VectorDB::open(&dir).unwrap();
+            let c = db.create_collection("fb", Some(8), 4).unwrap();
+            c.add(1, &v(1.0), "one", vec![]).unwrap();
+            db.flush().unwrap();
+
+            fail_index_syncs(&index, true);
+            assert_index_refuses_writes(&index);
+            assert!(c.add_many(&batch()).is_err());
+            fail_index_syncs(&index, false);
+
+            assert_eq!(c.count().unwrap(), 1);
+            assert_eq!(c.add_many(&batch()).unwrap(), 2);
+        }
+        let db = VectorDB::open(&dir).unwrap();
+        assert!(db.recovery_report().is_clean());
+        assert_eq!(db.get_collection("fb").unwrap().count().unwrap(), 3);
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A vector index that has disappeared after a sync is refused on open. Recreating it empty
+    /// would make every document an orphan and remove it.
+    #[test]
+    fn missing_vector_index_is_refused_without_changes() {
+        let dir = temp_dir("missing-index");
+        {
+            let db = VectorDB::open(&dir).unwrap();
+            let c = db.create_collection("mi", Some(8), 4).unwrap();
+            c.add(1, &v(1.0), "one", vec![]).unwrap();
+            c.add(2, &v(2.0), "two", vec![]).unwrap();
+            db.flush().unwrap();
+        }
+        let docs = dir.join("docs").join("mi.zdocs");
+        let before = fs::read(&docs).unwrap();
+        fs::remove_file(dir.join("vectors").join("mi.zvec")).unwrap();
+        assert!(matches!(
+            VectorDB::open(&dir).err(),
+            Some(ZenarError::RecoveryError(_))
+        ));
+        assert_eq!(fs::read(&docs).unwrap(), before);
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A document log that has disappeared after a sync is refused, and not recreated empty.
+    #[test]
+    fn missing_document_log_is_refused_and_not_recreated() {
+        let dir = temp_dir("missing-log");
+        {
+            let db = VectorDB::open(&dir).unwrap();
+            let c = db.create_collection("ml", Some(8), 4).unwrap();
+            c.add(1, &v(1.0), "one", vec![]).unwrap();
+            db.flush().unwrap();
+        }
+        let docs = dir.join("docs").join("ml.zdocs");
+        fs::remove_file(&docs).unwrap();
+        assert!(matches!(
+            VectorDB::open(&dir).err(),
+            Some(ZenarError::RecoveryError(_))
+        ));
+        assert!(!docs.exists());
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A synced log cut short is refused before the open truncates anything, so the file is left
+    /// as it was found.
+    #[test]
+    fn log_cut_short_after_sync_is_refused_without_changing_the_file() {
+        let dir = temp_dir("cut-log");
+        {
+            let db = VectorDB::open(&dir).unwrap();
+            let c = db.create_collection("cl", Some(8), 4).unwrap();
+            c.add(1, &v(1.0), "one", vec![]).unwrap();
+            c.add(2, &v(2.0), "two", vec![]).unwrap();
+            db.flush().unwrap();
+        }
+        let docs = dir.join("docs").join("cl.zdocs");
+        let len = fs::metadata(&docs).unwrap().len();
+        fs::OpenOptions::new()
+            .write(true)
+            .open(&docs)
+            .unwrap()
+            .set_len(len - 5)
+            .unwrap();
+        let cut = fs::read(&docs).unwrap();
+        assert!(matches!(
+            VectorDB::open(&dir).err(),
+            Some(ZenarError::RecoveryError(_))
+        ));
+        assert_eq!(fs::read(&docs).unwrap(), cut);
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A synced record damaged at the end of the log is not mistaken for a torn tail: the open
+    /// is refused and the damaged bytes are kept.
+    #[test]
+    fn damaged_synced_record_is_refused_without_truncation() {
+        let dir = temp_dir("damaged-synced");
+        {
+            let db = VectorDB::open(&dir).unwrap();
+            let c = db.create_collection("ds", Some(8), 4).unwrap();
+            c.add(1, &v(1.0), "one", vec![]).unwrap();
+            c.add(2, &v(2.0), "two", vec![]).unwrap();
+            db.flush().unwrap();
+        }
+        let docs = dir.join("docs").join("ds.zdocs");
+        let mut bytes = fs::read(&docs).unwrap();
+        let last = bytes.len() - 1;
+        bytes[last] ^= 0xFF;
+        fs::write(&docs, &bytes).unwrap();
+        assert!(matches!(
+            VectorDB::open(&dir).err(),
+            Some(ZenarError::RecoveryError(_))
+        ));
+        assert_eq!(fs::read(&docs).unwrap(), bytes);
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// If a failed add cannot be truncated out of the log, its bytes stay there. The collection is
+    /// poisoned, so no later add can land after them. On reopen they are unsynced documents and
+    /// are removed, and the same id can be added again without the log holding two live copies.
+    #[cfg(unix)]
+    #[test]
+    fn failed_undo_poisons_and_reopen_removes_the_orphan_frames() {
+        let dir = temp_dir("failed-undo");
+        let index = dir.join("vectors").join("fu.zvec");
+        {
+            let db = VectorDB::open_with(&dir, crate::database::MetadataSync::Full).unwrap();
+            let c = db.create_collection("fu", Some(8), 4).unwrap();
+            c.add(1, &v(1.0), "one", vec![]).unwrap();
+
+            fail_index_syncs(&index, true);
+            assert_index_refuses_writes(&index);
+            c.write_state().unwrap().docs.fail_undo = true;
+            assert!(c.add(2, &v(2.0), "two", vec![]).is_err());
+            fail_index_syncs(&index, false);
+
+            assert!(matches!(c.get(1), Err(ZenarError::PersistenceError(_))));
+        }
+        let db = VectorDB::open(&dir).unwrap();
+        assert_eq!(db.recovery_report().orphaned_rows_removed, 1);
+        let c = db.get_collection("fu").unwrap();
+        assert_eq!(c.count().unwrap(), 1);
+        c.add(2, &v(2.0), "two again", vec![]).unwrap();
+        drop(c);
+        drop(db);
+        let db = VectorDB::open(&dir).unwrap();
+        assert_eq!(db.get_collection("fu").unwrap().count().unwrap(), 2);
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A crash after a delete clears the recorded lengths and before it records them again must
+    /// not hide a missing index. The open is refused, and the documents are not removed.
+    #[test]
+    fn crash_during_delete_does_not_hide_a_missing_index() {
+        let dir = temp_dir("crash-in-delete");
+        {
+            let db = VectorDB::open(&dir).unwrap();
+            let c = db.create_collection("cd", Some(8), 4).unwrap();
+            c.add(1, &v(1.0), "one", vec![]).unwrap();
+            c.add(2, &v(2.0), "two", vec![]).unwrap();
+            db.flush().unwrap();
+            // The window a delete opens, then a crash: poisoning keeps the drop from recording again.
+            c.lower_recorded_lengths(1, false).unwrap();
+            c.write_state().unwrap().poisoned = Some("simulated crash".into());
+        }
+        fs::remove_file(dir.join("vectors").join("cd.zvec")).unwrap();
+        assert!(matches!(
+            VectorDB::open(&dir).err(),
+            Some(ZenarError::RecoveryError(_))
+        ));
         fs::remove_dir_all(&dir).ok();
     }
 }

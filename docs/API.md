@@ -89,6 +89,13 @@ Every error inherits from `zenar.ZenarError`:
 
 `DimensionMismatchError` means a vector's length differs from the collection's dimension. A dimension argument that is out of range (zero, or above the limit) raises `InvalidArgumentError`.
 
+`PersistenceError` after a failed write means the collection is poisoned. Every later call on it raises the same error
+until the database is reopened. A failed write that was cleanly undone leaves the collection usable, but the write may
+still have been applied. Check with `get()` before retrying (STORAGE.md, "What a failure leaves behind").
+
+`RecoveryError` on open means a file was removed, truncated or damaged outside Zenar. The open is refused and the
+files are left as they were.
+
 `CollectionClosedError` means the handle outlived its database, or its collection was dropped. Keep a reference to the
 `VectorDB` for as long as you use its collections. A collection handle cannot write after its database is closed, since
 such a write would look successful and then be lost.

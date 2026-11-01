@@ -80,7 +80,7 @@ impl VectorDB {
                 .get(&name)?
                 .ok_or_else(|| ZenarError::RecoveryError(format!("{name} vanished")))?;
             let schema = entry.schema()?;
-            let docs = open_or_create_docs(&root, &name, schema)?;
+            let docs = open_or_create_docs(&root, &name, schema, entry.durable_log_len)?;
             let index_path = index_path(&root, &name);
             let store = if index_path.exists() {
                 VectorStore::load(&index_path, entry.dimension)?
@@ -257,15 +257,24 @@ impl VectorDB {
     }
 }
 
-/// Opens a collection's document log, creating an empty one if it is missing.
+/// Opens a collection's document log. Creates an empty one if it is missing and nothing was synced to it.
+///
+/// A log that is missing while the catalog says it held synced bytes is refused, not recreated:
+/// recreating it would hide the loss.
 fn open_or_create_docs(
     root: &Path,
     name: &str,
     schema: Vec<(String, crate::value::FieldKind)>,
+    durable_len: u64,
 ) -> Result<DocStore, ZenarError> {
     let path = docs_path(root, name);
     if path.exists() {
-        DocStore::open(&path, schema)
+        DocStore::open_checked(&path, schema, durable_len)
+    } else if durable_len > 0 {
+        Err(ZenarError::RecoveryError(format!(
+            "collection {name:?}: the document log is missing; it held {durable_len} bytes at its \
+             last sync. A file was removed outside Zenar"
+        )))
     } else {
         DocStore::create(&path, schema)
     }

@@ -99,8 +99,9 @@ id to row, and TurboVec keeps its own. Removing either needs a change to the lib
 
 Measured with `/usr/bin/time -l` around the `bench` example (ingest, then all searches, same process). Peak resident
 set size was 415 MB with TurboVec 1.1.2 (410 MB with 1.0.0). The vectors are 4-bit TurboVec codes, about 192 MB at this size (1M × 384 × 4 bits). Each indexed
-field also keeps a 4-byte code per row, about 4 MB per field at 1M rows. The rest is the document log index, the
-in-memory field indexes and the per-row bookkeeping. Raw float32 vectors would need about 1.5 GB for the same rows.
+field keeps 4 bytes per document in its value postings, and 8 bytes per document that has the field in its presence
+list (ARCHITECTURE.md, "Metadata indexes"). For three fields at 1M rows, that is about 36 MB. The 36 MB is computed from
+the struct sizes, not measured. The rest is the document log index, the id map and the per-row bookkeeping. Raw float32 vectors would need about 1.5 GB for the same rows.
 The breakdown of the remainder has not been measured by component.
 
 ### Where the compound filter's time goes (`compound_breakdown`, 1M rows, TurboVec 1.0.0)
