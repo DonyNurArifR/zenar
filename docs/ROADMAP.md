@@ -10,6 +10,9 @@ not. Items marked done are verified in the code and the test suite; the tests ar
 - Cross-file consistency documented: operation order, failure outcomes, reopen guarantees (STORAGE.md,
   "Consistency across the two files").
 - Failure paths tested with real index-write failures, not only by setting the poison flag.
+- Measured the write lock: which operations hold it, for how long, and which of its steps is I/O (BENCHMARKS.md,
+  "Concurrency and write cost"; docs/CONCURRENCY.md). Added the `concurrent_bench`, `write_breakdown`, `write_cost` and
+  `delta_scan` examples.
 - Fixed: a failed truncation was ignored, so the failed write's bytes stayed in the log, and a later add of the same id
   made the database refuse to open ("duplicate live id"). A failed log write, or a failed truncation after one, now poisons the collection.
 - Fixed: a log that was shorter than its last sync was truncated before the shortened-file check, so a refused open
@@ -21,9 +24,17 @@ not. Items marked done are verified in the code and the test suite; the tests ar
 
 ## Open, in priority order
 
-1. **Readers stall during heavy writes.** The writer holds the collection lock across the index sync and the fsyncs. With
-   a continuous writer, 8 readers run about 760 searches/s, against about 6,800/s with no writer (p50 11 ms). Group commit,
-   or moving the fsyncs out of the lock, would fix it. Both change the lock protocol, so they need a design decision.
+1. **Reader throughput collapses under a continuous writer.** With 8 readers, search falls from about 33,000/s to about
+   680/s while one writer runs batches of 50. The write lock is held 8.6 ms per batch, and 89% of that is two fsyncs. Readers
+   are not starved indefinitely: p99 is about three batch times. The cost is throughput. The proposal (docs/CONCURRENCY.md)
+   moves the log fsync out of the lock, behind a per-collection writer gate. That changes the locking protocol, so it
+   waits for your decision. Its estimates are a model until a prototype is measured.
+1a. **Deletes hold the write lock for about 25 ms.** Two catalog writes account for about 17 ms of it (by subtraction;
+   not timed alone). Each catalog write syncs a temporary file and a directory. Keeping exact refusal costs that time.
+   Budgeting the recorded lengths (docs/CONCURRENCY.md, option J2) would bring it to about 8 ms, but it changes the bound
+   on the shortened-file check. That is a decision for you.
+1b. **Compaction holds the write lock for the whole rewrite.** 115 ms at 100,000 live rows and 261 ms at 500,000. A
+   long delete can stall every reader for that long. Moving the rewrite out of the lock is option K1 in the proposal.
 2. **Open time grows with the log.** 0.44 s at 1M rows, and linear in the log. A persisted index or checkpoint would avoid
    the replay, and it would need its own recovery rules. Not started.
 3. **Power-loss behaviour is not tested on hardware.** The process-level crash tests and the byte-level torn-record tests

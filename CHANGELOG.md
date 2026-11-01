@@ -19,6 +19,9 @@ project follows [semantic versioning](https://semver.org/) while it is pre-1.0.
 - STORAGE.md states that the vector index and the document log are not one transaction. It covers the order of durable
   steps, the outcome of each failure, the poisoning rule, and reconciliation on open.
 - ROADMAP.md lists the open production-readiness items in priority order.
+- CONCURRENCY.md is a design proposal for reader throughput under a continuous writer. It measures the write lock and
+  proposes a locking change. Nothing in it is implemented yet.
+- BENCHMARKS.md corrects the delete cost (about 25 ms, not 8 ms) and adds the concurrency and write-cost measurements.
 
 ## 0.2.0
 

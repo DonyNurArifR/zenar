@@ -37,8 +37,14 @@ durability per batch. That costs one sync per 1000 rows instead of one per row.
 
 ### Delete
 
-One `delete` costs about 8 ms, at 10K and at 100K rows alike. The cost is the two fsyncs (index file and log), not the
-collection size. `delete_many` pays them once per batch. Use it for bulk removal.
+One `delete` costs about 25 ms on the reference machine (`write_cost`, 10,000 rows): 24.8 ms measured. Its cost is
+the index sync and the log sync, plus two writes of the catalog (before and after the delete). Each catalog write is a
+temporary file, a file sync, a rename and a directory sync. The earlier figure of 8 ms predates those two catalog
+writes. `delete_many` pays the index and log syncs and the catalog writes once per batch: 23 to 31 ms per 1,000 ids.
+Use it for bulk removal.
+
+A delete also holds the write lock while it compacts. Compaction runs when dead rows exceed live rows and 4096. See the
+"Concurrency and write cost" section for the measured stall.
 
 ### Search, in-process (same process as ingest), 1M rows
 
@@ -149,6 +155,78 @@ was 3.6 ms.
   not built.
 - The allowlist search in TurboVec costs more per candidate than an unfiltered search. Changing that would mean changing
   TurboVec.
+
+## Concurrency and write cost
+
+Reader and writer behaviour on one collection, and the cost of each write step. These show where the write lock is
+held and for how long (docs/CONCURRENCY.md has the analysis and the proposal). Reference machine, release build,
+dimension 384, top-10 unfiltered searches, 8 reader threads, 5 s per case. The table is the median of three runs; the
+readers-only search rate ranged from 28,700 to 33,800 across the three runs. The continuous-writer rate ranged from 657 to
+687 in those runs, and 696 to 873 in earlier runs of the same case.
+
+Reproduce:
+
+```sh
+cargo run --release -p zenar-core --example concurrent_bench -- 100000 384 8 5 50
+cargo run --release -p zenar-core --example write_breakdown
+cargo run --release -p zenar-core --example write_cost -- 1000000
+cargo run --release -p zenar-core --example delta_scan
+```
+
+### Readers and a writer (`concurrent_bench`, 100,000 rows)
+
+| Case | Search/s | Search p50 | Search p99 | Writer batches/s | Batch p50 |
+|---|---|---|---|---|---|
+| 1 reader, no writer | 8,817 | 0.081 ms | 1.4 ms | | |
+| 8 readers, no writer | 33,455 | 0.236 ms | 0.52 ms | | |
+| 8 readers, 1 batch/s | 31,963 | 0.238 ms | 0.56 ms | 1.0 | 8.7 ms |
+| 8 readers, 10 batch/s | 28,468 | 0.245 ms | 0.70 ms | 9.0 | 7.8 ms |
+| 8 readers, continuous writer | 679 | 11.1 ms | 27.6 ms | 90.4 | 10.9 ms |
+| Writer alone, continuous | | | | 116.4 | 8.6 ms |
+
+A batch is 50 rows through `add_many`. The batch time includes waiting for the write lock, so with readers present it
+is longer than alone. The continuous-writer row is the one under study: search throughput drops by about 98% while the
+writer runs, and the readers' p50 is one batch time.
+
+### Write steps (`write_breakdown`, 50-row batch, sequential)
+
+| Step | Time per batch |
+|---|---|
+| Encode and write the log bytes | 0.09 ms |
+| Add 50 vectors in memory | 0.80 ms |
+| Index sync (write and fsync) | 3.93 ms |
+| Log sync (fsync) | 3.71 ms |
+| Commit (make visible, in memory) | 0.03 ms |
+| Total | 8.57 ms |
+
+Both syncs are about one fsync each (3.7 ms, measured with `write_breakdown`'s log sync on this machine). They are 89% of a
+batch.
+
+### Write cost through the public API (`write_cost`)
+
+| Operation | Time |
+|---|---|
+| `add`, default durability | 0.01 ms |
+| `add`, `durable=True` | 7.4 to 7.9 ms |
+| `add_many`, 50 rows | 7.5 to 8.5 ms |
+| `delete`, one id (10,000 rows) | 24.8 ms |
+| `delete_many`, 1,000 ids, no compaction | 23 to 31 ms |
+| `delete_many`, 1,000 ids, the batch that compacts (200,000 rows, 100,000 live after) | 115 ms |
+| `delete_many`, 1,000 ids, the batch that compacts (1,000,000 rows, 500,000 live after) | 261 ms |
+
+Compaction holds the write lock for the whole rewrite and the reopen that follows it. Its cost grows with the live rows
+left.
+
+### Delta scan cost (`delta_scan`, dimension 384, naive scalar loops)
+
+| Vectors scanned per query | Time per query |
+|---|---|
+| 1,024 | 0.17 ms |
+| 4,096 | 0.47 ms |
+| 16,384 | 1.86 ms |
+
+Compare with a single unfiltered search of 0.08 ms (1 reader, above). A scan of recent vectors would cost each reader
+this much on every query, so it is the wrong way to avoid the write lock (docs/CONCURRENCY.md, option G).
 
 ## History
 
