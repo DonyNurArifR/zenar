@@ -1,0 +1,37 @@
+# Manual smoke test on an Intel macOS runner. It builds the wheel natively on Intel (not cross-compiled), installs it,
+# and runs the Python test suite against the installed wheel. Start it with:
+#   gh workflow run macos-intel-smoke.yml --ref <branch>
+# The runner label must be checked when it is first run: GitHub retires hosted image labels.
+name: macOS Intel smoke (manual)
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  smoke:
+    name: Build and test on Intel macOS
+    runs-on: macos-13
+    steps:
+      - uses: actions/checkout@v7
+      - name: Confirm the architecture
+        run: |
+          uname -m
+          sysctl -n machdep.cpu.brand_string
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+      - uses: dtolnay/rust-toolchain@v1
+        with:
+          toolchain: "1.89"
+      - name: Build the wheel on this runner
+        run: |
+          python -m pip install --upgrade pip maturin
+          maturin build --release --locked --out dist
+      - name: Install the wheel and test it
+        run: |
+          python -m pip install --find-links dist zenar pytest numpy jsonschema
+          python -c "import zenar, platform; print(zenar.__file__, platform.machine())"
+          python -m pytest -q tests

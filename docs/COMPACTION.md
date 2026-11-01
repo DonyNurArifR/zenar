@@ -1,6 +1,8 @@
 # Compaction: investigation and design proposal
 
-Status: **proposal, revised after the memory and failure analysis below**. The only change made is a sequential rewrite of
+Status: **investigation. The design is now in R3.md**, which supersedes the swap described in option C here.
+
+Status of this page: **proposal, revised after the memory and failure analysis below**. The only change made is a sequential rewrite of
 the log, which keeps the same format and the same lock protocol. The background swap is not implemented, and the revision
 shows the swap as written cannot reclaim memory, so it is not ready to implement. It changes when the collection lock is held
 and what happens on disk, so it waits for review.

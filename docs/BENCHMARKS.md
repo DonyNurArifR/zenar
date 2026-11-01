@@ -311,6 +311,26 @@ A dead row costs about 105 bytes of heap. Without compaction, the store grows by
 vectors. The vector index reuses its freed capacity, so only the document store accumulates dead rows. `docs/COMPACTION.md`
 discusses what this means for the compaction design.
 
+### Compaction under load: baseline (`compaction_bench`)
+
+A sliding window on one collection (200,000 live documents, dimension 64), +20,000 / −20,000 per round, 40 rounds, with eight
+reader threads. The deletes trigger the compactions, which run inside the delete. This is the baseline that the background
+design in `docs/R3.md` is measured against. Reproduce with `compaction_bench -- 200000 40 8`.
+
+| Measure | Baseline (current reopen-based compaction) |
+|---|---|
+| Delete batch that compacts (lock held) | 86 to 100 ms |
+| Delete batch that does not compact, p50 | 22 ms |
+| Searches that started during a compacting batch, p50 / p95 / p99 (n = 365) | 0.28 / 74 / 79 ms |
+| All searches, p50 / p95 / p99 | 0.32 / 12.8 / 15.0 ms (the writer's 1,000-row batches set the tail) |
+| Writer batch of 1,000 rows, p50 / p95 | 16.2 / 19.7 ms |
+| Heap in use before a compaction | 51 to 53 MB |
+| Heap in use after a compaction | 35 to 37.5 MB |
+| Peak heap during a compacting batch | 73.6 to 75.2 MB (the reopen replay adds about 22 MB) |
+
+Each compaction reclaims about 16 MB of dead-row memory at 200,000 dead rows, about 80 bytes per dead row. The heap follows
+the live set across rounds, with no growth. The figures are measured, not estimated.
+
 ### Delta scan cost (`delta_scan`, dimension 384, naive scalar loops)
 
 | Vectors scanned per query | Time per query |
