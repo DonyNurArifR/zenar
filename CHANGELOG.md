@@ -25,6 +25,9 @@ project follows [semantic versioning](https://semver.org/) while it is pre-1.0.
 - BENCHMARKS.md corrects the delete cost (about 25 ms, not 8 ms) and adds the concurrency and write-cost measurements.
 
 ### Performance
+- Compaction reads the log once, from the front, instead of one read per live row. A compacting delete batch at a million
+  rows falls from about 260 ms to about 130 ms, and the compaction in `DocStore::compact` from about 370 ms to about 190 ms
+  (the reopen replay is most of the rest). The file format is unchanged.
 - A write syncs its document log with the collection lock released. The index is still synced under the lock. With
   8 readers and one continuous writer, search throughput rises from about 700 to about 6,200 per second, and p99 falls
   from about 30 ms to about 6 ms. Single-writer write costs are unchanged within noise.

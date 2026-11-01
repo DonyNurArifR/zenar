@@ -35,8 +35,8 @@ On open, the log is replayed from the start:
 | Zeros from the last valid frame to the end | Torn tail. Truncated. (A file system may extend a file before writing data.) |
 | A bad CRC or undecodable frame followed by more data | `RecoveryError`. The database does not open. Later records are never dropped silently. |
 
-Compaction runs when dead records outnumber live ones and there are more than 4096 dead. It writes the live records to a
-temporary file, syncs it, releases the log's file handle (Windows refuses to rename over an open file), renames the
+Compaction runs when dead records outnumber live ones and there are more than 4096 dead. It reads the log once, from the
+front, and writes the live records to a temporary file, syncs it, releases the log's file handle (Windows refuses to rename over an open file), renames the
 temporary file over the log, syncs the directory, and reopens the log. If the rename fails, the old log is reopened and
 nothing changes. Any other error in compaction poisons the collection (see below). The safe course is a reopen, which
 replays whichever log is on disk.

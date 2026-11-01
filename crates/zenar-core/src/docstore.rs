@@ -13,7 +13,7 @@
 
 use std::collections::{BTreeMap, HashMap};
 use std::fs::{self, File, OpenOptions};
-use std::io::{BufReader, Read, Seek, SeekFrom, Write};
+use std::io::{self, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::ops::Bound;
 use std::path::{Path, PathBuf};
 
@@ -534,18 +534,17 @@ impl DocStore {
     /// success path and the failure path.
     pub fn compact(&mut self) -> Result<(), ZenarError> {
         let tmp = self.path.with_extension("log.compact");
-        let mut out = File::create(&tmp).map_err(io_err)?;
-        let mut buf = Vec::new();
-        for row in self.rows.iter().filter(|r| r.live) {
-            let mut payload = vec![0u8; row.payload_len as usize];
-            read_exact_at(self.handle()?, &mut payload, row.payload_off)?;
-            push_frame(&mut buf, &payload);
-            if buf.len() >= 1 << 20 {
-                out.write_all(&buf).map_err(io_err)?;
-                buf.clear();
-            }
-        }
-        out.write_all(&buf).map_err(io_err)?;
+        let out = File::create(&tmp).map_err(io_err)?;
+        // Live rows were appended in log order, so their payload offsets ascend.
+        let wanted: Vec<(u64, u32)> = self
+            .rows
+            .iter()
+            .filter(|r| r.live)
+            .map(|r| (r.payload_off, r.payload_len))
+            .collect();
+        let mut out = BufWriter::with_capacity(1 << 20, out);
+        copy_live_frames(&self.path, &wanted, &mut out)?;
+        let out = out.into_inner().map_err(|e| io_err(e.into_error()))?;
         out.sync_all().map_err(io_err)?;
         drop(out);
 
@@ -1429,6 +1428,42 @@ fn push_frame(buf: &mut Vec<u8>, payload: &[u8]) {
     buf.extend_from_slice(payload);
 }
 
+/// Copies the frames of the live payloads in `wanted` (payload offset and length, ascending) from the
+/// log at `path` to `out`. The log is read once, from the front. Frames are matched by their exact
+/// offset, not by id: an id can appear twice in a log, once live and once deleted.
+fn copy_live_frames(
+    path: &Path,
+    wanted: &[(u64, u32)],
+    out: &mut impl Write,
+) -> Result<(), ZenarError> {
+    let mut input = BufReader::with_capacity(1 << 20, File::open(path).map_err(io_err)?);
+    let mut pos: u64 = 0;
+    let mut next = 0usize;
+    let mut header = [0u8; FRAME_HEADER];
+    while next < wanted.len() {
+        input.read_exact(&mut header).map_err(io_err)?;
+        let len = u32::from_le_bytes([header[0], header[1], header[2], header[3]]);
+        let payload_off = pos + FRAME_HEADER as u64;
+        if wanted[next].0 == payload_off {
+            if wanted[next].1 != len {
+                return Err(ZenarError::RecoveryError(format!(
+                    "frame at byte {pos} has length {len}, the index says {}",
+                    wanted[next].1
+                )));
+            }
+            let mut payload = vec![0u8; len as usize];
+            input.read_exact(&mut payload).map_err(io_err)?;
+            out.write_all(&header).map_err(io_err)?;
+            out.write_all(&payload).map_err(io_err)?;
+            next += 1;
+        } else {
+            io::copy(&mut (&mut input).take(u64::from(len)), &mut io::sink()).map_err(io_err)?;
+        }
+        pos = payload_off + u64::from(len);
+    }
+    Ok(())
+}
+
 /// CRC-32 (IEEE, reflected), as used by zlib and gzip.
 pub fn crc32(data: &[u8]) -> u32 {
     let mut crc = 0xFFFF_FFFFu32;
@@ -1757,6 +1792,54 @@ mod tests {
             Err(ZenarError::RecoveryError(_))
         ));
         fs::remove_dir_all(path.parent().unwrap()).ok();
+    }
+
+    /// Compaction keeps the live version of an id that was deleted and added again. The two frames share
+    /// an id, so the rewrite must match frames by offset, not by id.
+    #[test]
+    fn compaction_keeps_the_live_copy_of_a_re_added_id() {
+        let path = temp_log("compact-readd");
+        let mut store = DocStore::create(&path, schema()).unwrap();
+        let first = vec![("qty".to_string(), MetaValue::Integer(1))];
+        let staged = store
+            .stage_puts(&[DocRef {
+                id: 7,
+                text: "old",
+                metadata: &first,
+            }])
+            .unwrap();
+        store.commit(staged);
+        del(&mut store, 7);
+        let second = vec![("qty".to_string(), MetaValue::Integer(2))];
+        let staged = store
+            .stage_puts(&[DocRef {
+                id: 7,
+                text: "new",
+                metadata: &second,
+            }])
+            .unwrap();
+        store.commit(staged);
+        // Enough dead rows to make the rewrite worth doing: it keeps the rows that follow the re-add too.
+        for i in 100..5_000u64 {
+            let filler = vec![("qty".to_string(), MetaValue::Integer(0))];
+            let staged = store
+                .stage_puts(&[DocRef {
+                    id: i,
+                    text: "filler",
+                    metadata: &filler,
+                }])
+                .unwrap();
+            store.commit(staged);
+            del(&mut store, i);
+        }
+        assert!(store.should_compact());
+        store.compact().unwrap();
+        assert_eq!(store.fetch(&[7]).unwrap()[0].text, "new");
+        drop(store);
+        let reopened = DocStore::open(&path, schema()).unwrap();
+        assert_eq!(reopened.fetch(&[7]).unwrap()[0].text, "new");
+        assert_eq!(reopened.live_count(), 1);
+        fs::remove_file(&path).ok();
     }
 
     #[test]

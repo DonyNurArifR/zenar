@@ -180,8 +180,9 @@ What the audit did not cover, and the remaining risks:
    encoding and vector add could run before the lock is taken. This is the open item most likely to recover reader
    throughput at several writers. It is not measured yet: the add itself is about 0.8 ms per batch.
 
-1. **Compaction holds the lock for its whole rewrite.** 254 to 265 ms with 500,000 live rows, measured. Moving it out of
-   the lock is the largest remaining reader stall. It needs a plan for deletes that happen during the rewrite.
+1. **Compaction holds the lock for its whole rewrite and reopen.** Now 127 to 132 ms for a compacting batch at a million
+   rows (it was 261 ms). The design for moving it out of the lock, and the argument for deletes during the rewrite, are in
+   docs/COMPACTION.md.
 2. **Deletes write the catalog twice under the lock.** About 17 ms of a 24 ms delete. You chose to keep exact refusal. Its
    cost stays unless the recorded-length scheme changes, and this document does not propose a change that keeps the
    bound exact.

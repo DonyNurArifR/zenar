@@ -35,9 +35,11 @@ not. Items marked done are verified in the code and the test suite; the tests ar
 
 ## Open, in priority order
 
-1. **Compaction holds the write lock for its whole rewrite.** 254 to 265 ms with 500,000 live rows, measured. It is now the
-   largest reader stall. Moving the rewrite out of the lock needs a plan for deletes that happen during the rewrite
-   (docs/CONCURRENCY.md, open item 1).
+1. **Compaction holds the write lock for its whole rewrite and reopen.** The rewrite now reads the log once: a compacting
+   delete batch at a million rows fell from 261 ms to 127 to 132 ms. The reopen replay (156 ms at 500,000 live rows) is
+   now most of the rest. The design that moves the rewrite out of the lock (snapshot, background rewrite, a swap that copies
+   the tail and remaps offsets) is in docs/COMPACTION.md. Its consistency claim is proven at the protocol level by
+   `tests/test_compaction_model.py`. It is not implemented, pending review of the design.
 0. **Staging under the index lock.** A group's leader stages every batch under the lock. Encoding each batch before the
    lock is taken would shorten the lock hold. Not measured yet (docs/CONCURRENCY.md, open item 0).
 1b. **Index sync holds the write lock.** About 3.9 ms per batch. TurboVec syncs from its in-memory state with `&mut self`,

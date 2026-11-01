@@ -38,9 +38,9 @@ durability per batch. That costs one sync per 1000 rows instead of one per row.
 ### Delete
 
 One `delete` costs about 25 ms on the reference machine (`write_cost`, 10,000 rows): 24.8 ms measured. Its cost is
-the index sync and the log sync, plus two writes of the catalog (before and after the delete). Each catalog write is a
-temporary file, a file sync, a rename and a directory sync. The earlier figure of 8 ms predates those two catalog
-writes. `delete_many` pays the index and log syncs and the catalog writes once per batch: 23 to 31 ms per 1,000 ids.
+the index sync and the log sync (about 7.5 ms together), plus two writes of the catalog (about 7.7 ms each, measured with
+`catalog_cost`). Each catalog write is a temporary file, a file sync, a rename and a directory sync. The earlier figure of
+8 ms predates those two catalog writes. `delete_many` pays the index and log syncs and the catalog writes once per batch: 23 to 31 ms per 1,000 ids.
 Use it for bulk removal.
 
 A delete also holds the write lock while it compacts. Compaction runs when dead rows exceed live rows and 4096. See the
@@ -259,11 +259,29 @@ batch.
 | `add_many`, 50 rows | 7.3 to 9.0 ms (7.3 to 8.5 ms before Phase 1) |
 | `delete`, one id (10,000 rows) | 24.8 ms |
 | `delete_many`, 1,000 ids, no compaction | 23 to 31 ms |
-| `delete_many`, 1,000 ids, the batch that compacts (200,000 rows, 100,000 live after) | 115 ms |
-| `delete_many`, 1,000 ids, the batch that compacts (1,000,000 rows, 500,000 live after) | 261 ms |
+| `delete_many`, 1,000 ids, the batch that compacts (200,000 rows, 100,000 live after) | 115 ms before the sequential rewrite |
+| `delete_many`, 1,000 ids, the batch that compacts (1,000,000 rows, 500,000 live after) | 261 ms before, 127 to 132 ms after the sequential rewrite |
 
 Compaction holds the write lock for the whole rewrite and the reopen that follows it. Its cost grows with the live rows
-left.
+left. The rewrite reads the log once, from the front (it used to read each live row with its own `pread`). The reopen
+replays the new log, which is most of what is left. `docs/COMPACTION.md` has the measurements and the design for moving the
+rewrite out of the lock.
+
+### Compaction and catalog costs (`compaction_probe`, `catalog_cost`)
+
+Probe: 1,000,000 documents with three metadata fields, half of them deleted (500,000 live).
+
+| Step | Time |
+|---|---|
+| `compact()`, before the change (per-row reads) | 366 to 375 ms |
+| `compact()`, after the change (one sequential read) | 187 ms |
+| Sequential rewrite alone (read, filter, write, no sync) | 47 ms |
+| Reopen with replay of the 500,000 live rows | 151 to 159 ms |
+| Sync of the rewritten file | 3.5 to 5 ms |
+| One catalog write (atomic replace of `catalog.json`) | 7.6 to 7.8 ms |
+
+A delete makes two catalog writes under the lock, so it pays about 15 ms of catalog time. That is measured, and it accounts
+for most of the difference between a delete and the two syncs it also makes.
 
 ### Syncs per group (`group_cost`, no threads)
 
