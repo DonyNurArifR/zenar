@@ -13,7 +13,7 @@
 
 use std::collections::{BTreeMap, HashMap};
 use std::fs::{self, File, OpenOptions};
-use std::io::{BufReader, Read, Seek, SeekFrom, Write};
+use std::io::{self, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::ops::Bound;
 use std::path::{Path, PathBuf};
 
@@ -198,6 +198,22 @@ pub struct DocStore {
     by_id: HashMap<u64, u32>,
     live: usize,
     dead: usize,
+    /// Test hook: makes the next `undo` fail without truncating, as a failing `set_len` would.
+    #[cfg(test)]
+    pub(crate) fail_undo: bool,
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Test only: how many document structures this thread has dropped.
+    pub static DROPPED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+impl Drop for DocStore {
+    fn drop(&mut self) {
+        DROPPED.with(|d| d.set(d.get() + 1));
+    }
 }
 
 impl DocStore {
@@ -215,10 +231,33 @@ impl DocStore {
 
     /// Opens an existing log and replays it. A torn tail is truncated.
     pub fn open(path: &Path, fields: Vec<(String, FieldKind)>) -> Result<Self, ZenarError> {
+        Self::open_checked(path, fields, 0)
+    }
+
+    /// Opens an existing log, as `open` does, but refuses a log that does not still hold the
+    /// `durable_len` bytes it had at its last sync. The check runs before anything is truncated,
+    /// so a refused open leaves the file as it found it.
+    pub fn open_checked(
+        path: &Path,
+        fields: Vec<(String, FieldKind)>,
+        durable_len: u64,
+    ) -> Result<Self, ZenarError> {
         let file = open_log(path).map_err(io_err)?;
         let file_len = file.metadata().map_err(io_err)?.len();
+        if file_len < durable_len {
+            return Err(ZenarError::RecoveryError(format!(
+                "the document log is {file_len} bytes but was {durable_len} at its last sync; \
+                 a file was truncated outside Zenar"
+            )));
+        }
         let mut store = Self::empty(path.to_path_buf(), Some(file), 0, fields);
         let good_end = store.replay(file_len)?;
+        if good_end < durable_len {
+            return Err(ZenarError::RecoveryError(format!(
+                "the document log is valid to byte {good_end}, but {durable_len} bytes were synced; \
+                 a synced record is damaged"
+            )));
+        }
         if good_end < file_len {
             let file = store.handle()?;
             file.set_len(good_end).map_err(io_err)?;
@@ -248,6 +287,8 @@ impl DocStore {
             by_id: HashMap::new(),
             live: 0,
             dead: 0,
+            #[cfg(test)]
+            fail_undo: false,
         }
     }
 
@@ -262,6 +303,16 @@ impl DocStore {
 
     pub fn fields(&self) -> &[(String, FieldKind)] {
         &self.fields
+    }
+
+    /// Path of the log file.
+    pub fn log_path(&self) -> &Path {
+        &self.path
+    }
+
+    /// Points this structure at `path`. Used by the swap, after the temporary log has been renamed to it.
+    pub fn retarget(&mut self, path: &Path) {
+        self.path = path.to_path_buf();
     }
 
     /// Length of the log file in bytes, as written. Used to record how far it is synced.
@@ -422,8 +473,13 @@ impl DocStore {
         Ok(())
     }
 
-    /// Discards a staged write by truncating the log back to its length before the write.
+    /// Discards a staged write by truncating the log back to its length before the write. If this
+    /// fails, the staged bytes may still be in the log, and the caller must poison the collection.
     pub fn undo(&mut self, staged: Staged) -> Result<(), ZenarError> {
+        #[cfg(test)]
+        if self.fail_undo {
+            return Err(ZenarError::PersistenceError("injected undo failure".into()));
+        }
         self.handle()?.set_len(staged.old_len).map_err(io_err)?;
         self.len = staged.old_len;
         Ok(())
@@ -475,43 +531,158 @@ impl DocStore {
         self.handle()?.sync_data().map_err(io_err)
     }
 
+    /// A second handle to the log, for syncing it without holding the collection lock. Syncing
+    /// through it flushes every write made through the log, since both handles refer to one file.
+    pub fn sync_handle(&self) -> Result<File, ZenarError> {
+        self.handle()?.try_clone().map_err(io_err)
+    }
+
     /// True when dead rows are worth reclaiming: more dead than live, and enough to matter.
     pub fn should_compact(&self) -> bool {
-        self.dead > 4096 && self.dead > self.live
+        self.compaction_due_after(0)
+    }
+
+    /// Whether the log would be due for compaction after `deleting` more documents are removed.
+    /// Called before the delete, so that the recorded lengths can be lowered first.
+    pub fn compaction_due_after(&self, deleting: usize) -> bool {
+        let dead = self.dead + deleting;
+        let live = self.live - deleting;
+        dead > 4096 && dead > live
+    }
+
+    /// Reads the committed bytes from `from` to `to` of the log at `path`. The caller checks that they are committed.
+    pub fn read_log_range(path: &Path, from: u64, to: u64) -> Result<Vec<u8>, ZenarError> {
+        let file = File::open(path).map_err(io_err)?;
+        let mut buf = vec![0u8; (to - from) as usize];
+        read_exact_at(&file, &mut buf, from)?;
+        Ok(buf)
+    }
+
+    /// Number of rows, live and dead, in memory. Used by tests of compaction.
+    pub fn row_count(&self) -> usize {
+        self.rows.len()
+    }
+
+    /// Appends `bytes`, whole frames copied from another log, to the end of this log, and applies their
+    /// frames to the in-memory structure. Used to bring a compacted log up to date with the old log
+    /// (docs/R3.md, section 3). A failure after the write leaves this structure in an unknown state, and
+    /// the caller must not use it.
+    pub fn append_raw(&mut self, bytes: &[u8]) -> Result<(), ZenarError> {
+        let base = self.len;
+        self.write_bytes(bytes, base)?;
+        let mut pos = 0usize;
+        while pos < bytes.len() {
+            if bytes.len() - pos < FRAME_HEADER {
+                return Err(ZenarError::RecoveryError(
+                    "a copied tail ends inside a frame header".into(),
+                ));
+            }
+            let len =
+                u32::from_le_bytes([bytes[pos], bytes[pos + 1], bytes[pos + 2], bytes[pos + 3]])
+                    as usize;
+            let crc = u32::from_le_bytes([
+                bytes[pos + 4],
+                bytes[pos + 5],
+                bytes[pos + 6],
+                bytes[pos + 7],
+            ]);
+            let end = pos + FRAME_HEADER + len;
+            if end > bytes.len() {
+                return Err(ZenarError::RecoveryError(
+                    "a copied tail ends inside a frame".into(),
+                ));
+            }
+            let payload = &bytes[pos + FRAME_HEADER..end];
+            if crc32(payload) != crc {
+                return Err(ZenarError::RecoveryError(
+                    "a copied tail has a bad frame".into(),
+                ));
+            }
+            self.apply_replayed(payload, base + (pos + FRAME_HEADER) as u64)?;
+            pos = end;
+        }
+        Ok(())
+    }
+
+    /// Releases the append handle, so that the log file can be renamed (Windows refuses to rename over an
+    /// open file). `reattach` takes it back.
+    pub fn release_handle(&mut self) {
+        self.file = None;
+    }
+
+    /// Reopens the append handle on the log at its path, after `release_handle`.
+    pub fn reattach(&mut self) -> Result<(), ZenarError> {
+        self.file = Some(open_log(&self.path).map_err(io_err)?);
+        Ok(())
+    }
+
+    /// Writes to `tmp` the live PUT frames that lie entirely below `end` in the log at `path`, in log order,
+    /// and syncs it. The log is not changed. A frame is live at `end` if no later frame below `end` deletes
+    /// it (docs/R3.md, section 3). Returns the length of the written file.
+    pub fn write_snapshot(path: &Path, end: u64, tmp: &Path) -> Result<u64, ZenarError> {
+        let wanted = live_frames_below(path, end)?;
+        let out = File::create(tmp).map_err(io_err)?;
+        let mut out = BufWriter::with_capacity(1 << 20, out);
+        copy_live_frames(path, &wanted, &mut out)?;
+        let out = out.into_inner().map_err(|e| io_err(e.into_error()))?;
+        out.sync_all().map_err(io_err)?;
+        Ok(out.metadata().map_err(io_err)?.len())
+    }
+
+    /// The path of the temporary log that a compaction writes.
+    pub fn compaction_temp_path(&self) -> PathBuf {
+        self.path.with_extension("log.compact")
+    }
+
+    /// Writes the live documents to the temporary log and syncs it. The log itself is unchanged. The
+    /// caller replaces the log with `rename_compacted`, and then `reopen`s it.
+    pub fn write_compacted(&mut self) -> Result<PathBuf, ZenarError> {
+        let tmp = self.compaction_temp_path();
+        let out = File::create(&tmp).map_err(io_err)?;
+        // Live rows were appended in log order, so their payload offsets ascend.
+        let wanted: Vec<(u64, u32)> = self
+            .rows
+            .iter()
+            .filter(|r| r.live)
+            .map(|r| (r.payload_off, r.payload_len))
+            .collect();
+        let mut out = BufWriter::with_capacity(1 << 20, out);
+        copy_live_frames(&self.path, &wanted, &mut out)?;
+        let out = out.into_inner().map_err(|e| io_err(e.into_error()))?;
+        out.sync_all().map_err(io_err)?;
+        Ok(tmp)
+    }
+
+    /// Renames the temporary log over the log. The append handle is released first (Windows refuses to
+    /// rename over an open file). If the rename fails, the old log is reopened, the temporary log is
+    /// removed, and the error is returned: nothing has changed.
+    pub fn rename_compacted(&mut self, tmp: &Path) -> Result<(), ZenarError> {
+        self.file = None;
+        if let Err(e) = fs::rename(tmp, &self.path) {
+            let _ = fs::remove_file(tmp);
+            self.file = Some(open_log(&self.path).map_err(io_err)?);
+            return Err(io_err(e));
+        }
+        Ok(())
+    }
+
+    /// Reopens the log by replaying it. Used after the log has been replaced.
+    pub fn reopen(&mut self) -> Result<(), ZenarError> {
+        let fields = self.fields.clone();
+        *self = Self::open(&self.path.clone(), fields)?;
+        Ok(())
     }
 
     /// Rewrites the log with only live documents, then replaces the old log atomically.
     ///
-    /// The old log stays valid until the rename. Windows refuses to rename over a file that is
-    /// still open, so the append handle is released first and reopened afterwards, on both the
-    /// success path and the failure path.
+    /// The old log stays valid until the rename. Any error after the rename leaves the in-memory log
+    /// stale, so the caller must poison the collection. The background swap, `Collection::swap_locked`, does
+    /// that. This synchronous form is used by tests and examples.
     pub fn compact(&mut self) -> Result<(), ZenarError> {
-        let tmp = self.path.with_extension("log.compact");
-        let mut out = File::create(&tmp).map_err(io_err)?;
-        let mut buf = Vec::new();
-        for row in self.rows.iter().filter(|r| r.live) {
-            let mut payload = vec![0u8; row.payload_len as usize];
-            read_exact_at(self.handle()?, &mut payload, row.payload_off)?;
-            push_frame(&mut buf, &payload);
-            if buf.len() >= 1 << 20 {
-                out.write_all(&buf).map_err(io_err)?;
-                buf.clear();
-            }
-        }
-        out.write_all(&buf).map_err(io_err)?;
-        out.sync_all().map_err(io_err)?;
-        drop(out);
-
-        self.file = None;
-        if let Err(e) = fs::rename(&tmp, &self.path) {
-            let _ = fs::remove_file(&tmp);
-            self.file = Some(open_log(&self.path).map_err(io_err)?);
-            return Err(io_err(e));
-        }
+        let tmp = self.write_compacted()?;
+        self.rename_compacted(&tmp)?;
         sync_parent(&self.path)?;
-        let fields = self.fields.clone();
-        *self = Self::open(&self.path.clone(), fields)?;
-        Ok(())
+        self.reopen()
     }
 
     fn handle(&self) -> Result<&File, ZenarError> {
@@ -1382,6 +1553,73 @@ fn push_frame(buf: &mut Vec<u8>, payload: &[u8]) {
     buf.extend_from_slice(payload);
 }
 
+/// Reads the frames of the log at `path` that lie entirely below `end`, and returns the offset and length of
+/// each PUT that is live at `end`: no DEL below `end` removes it. The offsets are in log order.
+fn live_frames_below(path: &Path, end: u64) -> Result<Vec<(u64, u32)>, ZenarError> {
+    let mut input = BufReader::with_capacity(1 << 20, File::open(path).map_err(io_err)?);
+    let mut live: HashMap<u64, (u64, u32)> = HashMap::new();
+    let mut pos: u64 = 0;
+    let mut header = [0u8; FRAME_HEADER];
+    while pos < end {
+        input.read_exact(&mut header).map_err(io_err)?;
+        let len = u32::from_le_bytes([header[0], header[1], header[2], header[3]]);
+        let mut payload = vec![0u8; len as usize];
+        input.read_exact(&mut payload).map_err(io_err)?;
+        if payload.len() >= 9 {
+            let id = u64::from_le_bytes(payload[1..9].try_into().unwrap());
+            match payload[0] {
+                PUT => {
+                    live.insert(id, (pos + FRAME_HEADER as u64, len));
+                }
+                DEL => {
+                    live.remove(&id);
+                }
+                _ => {}
+            }
+        }
+        pos += FRAME_HEADER as u64 + u64::from(len);
+    }
+    let mut out: Vec<(u64, u32)> = live.into_values().collect();
+    out.sort_unstable();
+    Ok(out)
+}
+
+/// Copies the frames of the live payloads in `wanted` (payload offset and length, ascending) from the
+/// log at `path` to `out`. The log is read once, from the front. Frames are matched by their exact
+/// offset, not by id: an id can appear twice in a log, once live and once deleted.
+fn copy_live_frames(
+    path: &Path,
+    wanted: &[(u64, u32)],
+    out: &mut impl Write,
+) -> Result<(), ZenarError> {
+    let mut input = BufReader::with_capacity(1 << 20, File::open(path).map_err(io_err)?);
+    let mut pos: u64 = 0;
+    let mut next = 0usize;
+    let mut header = [0u8; FRAME_HEADER];
+    while next < wanted.len() {
+        input.read_exact(&mut header).map_err(io_err)?;
+        let len = u32::from_le_bytes([header[0], header[1], header[2], header[3]]);
+        let payload_off = pos + FRAME_HEADER as u64;
+        if wanted[next].0 == payload_off {
+            if wanted[next].1 != len {
+                return Err(ZenarError::RecoveryError(format!(
+                    "frame at byte {pos} has length {len}, the index says {}",
+                    wanted[next].1
+                )));
+            }
+            let mut payload = vec![0u8; len as usize];
+            input.read_exact(&mut payload).map_err(io_err)?;
+            out.write_all(&header).map_err(io_err)?;
+            out.write_all(&payload).map_err(io_err)?;
+            next += 1;
+        } else {
+            io::copy(&mut (&mut input).take(u64::from(len)), &mut io::sink()).map_err(io_err)?;
+        }
+        pos = payload_off + u64::from(len);
+    }
+    Ok(())
+}
+
 /// CRC-32 (IEEE, reflected), as used by zlib and gzip.
 pub fn crc32(data: &[u8]) -> u32 {
     let mut crc = 0xFFFF_FFFFu32;
@@ -1710,6 +1948,54 @@ mod tests {
             Err(ZenarError::RecoveryError(_))
         ));
         fs::remove_dir_all(path.parent().unwrap()).ok();
+    }
+
+    /// Compaction keeps the live version of an id that was deleted and added again. The two frames share
+    /// an id, so the rewrite must match frames by offset, not by id.
+    #[test]
+    fn compaction_keeps_the_live_copy_of_a_re_added_id() {
+        let path = temp_log("compact-readd");
+        let mut store = DocStore::create(&path, schema()).unwrap();
+        let first = vec![("qty".to_string(), MetaValue::Integer(1))];
+        let staged = store
+            .stage_puts(&[DocRef {
+                id: 7,
+                text: "old",
+                metadata: &first,
+            }])
+            .unwrap();
+        store.commit(staged);
+        del(&mut store, 7);
+        let second = vec![("qty".to_string(), MetaValue::Integer(2))];
+        let staged = store
+            .stage_puts(&[DocRef {
+                id: 7,
+                text: "new",
+                metadata: &second,
+            }])
+            .unwrap();
+        store.commit(staged);
+        // Enough dead rows to make the rewrite worth doing: it keeps the rows that follow the re-add too.
+        for i in 100..5_000u64 {
+            let filler = vec![("qty".to_string(), MetaValue::Integer(0))];
+            let staged = store
+                .stage_puts(&[DocRef {
+                    id: i,
+                    text: "filler",
+                    metadata: &filler,
+                }])
+                .unwrap();
+            store.commit(staged);
+            del(&mut store, i);
+        }
+        assert!(store.should_compact());
+        store.compact().unwrap();
+        assert_eq!(store.fetch(&[7]).unwrap()[0].text, "new");
+        drop(store);
+        let reopened = DocStore::open(&path, schema()).unwrap();
+        assert_eq!(reopened.fetch(&[7]).unwrap()[0].text, "new");
+        assert_eq!(reopened.live_count(), 1);
+        fs::remove_file(&path).ok();
     }
 
     #[test]
