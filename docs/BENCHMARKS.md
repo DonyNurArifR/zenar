@@ -461,6 +461,52 @@ recall@10 against an exact committed-set reference rises with `k`. For 1,000 pen
 0.82 at cap 64, 0.83 at cap 256, and 0.84 with the old `k = top_k + pending`. This is the ranking variation under load
 that `docs/CONCURRENCY.md` and `docs/ARCHITECTURE.md` describe.
 
+### Writer admission (`bench_search_workload`, before and after)
+
+Writer starvation: with one continuous reader, the state lock was reader-preferring in practice, and the writer reached
+the lock once every few seconds. The fix is writer-preference admission for the state lock (`Admission` in
+`collection.rs`, described in `docs/CONCURRENCY.md`). Both sides below were measured on this machine, macOS arm64,
+release build, the same harness and 200,000 live documents, dimension 64, top_k 10, 5 s per run. "Before" is `ff1f825`,
+run from a worktree with the same harness. Reproduce with `READERS=1 WRITERS=1 BATCH=1000 cargo test --release -p
+zenar-core bench_search_workload -- --ignored --nocapture`. Where a row has repeats, the value is the median of the runs.
+Run-to-run spread on this machine is about 5 to 10% for throughput and up to 20% for reader throughput at low reader
+counts.
+
+| Configuration | Writer batches/s, before to after | Writer p50 ms, before to after | Writer p95 ms, before to after | Reader searches/s, before to after | Reader p50 / p95 / p99 ms, before to after |
+|---|---|---|---|---|---|
+| 0 readers, 1 writer | 78 to 86 | 12.4 to 11.3 | 14.2 to 13.2 | none | none |
+| 1 reader, 1 writer | 1.4 to 116 | 422 to 8.6 | 2,137 to 9.7 | 9,074 to 2,151 | 0.08 / 0.20 / 0.66 to 0.23 / 3.67 / 4.75 |
+| 2 readers, 1 writer | 35 to 108 | 25 to 8.7 | 54 to 9.9 | 6,276 to 3,332 | 0.26 / 0.55 / 4.01 to 0.29 / 4.67 / 5.55 |
+| 4 readers, 1 writer | 101 to 102 | 9.3 to 8.9 | 10.5 to 10.2 | 5,082 to 4,970 | 0.42 / 5.16 / 5.69 to 0.42 / 5.18 / 5.77 |
+| 8 readers, 1 writer (median of 4) | 92 to 87 | 9.6 to 10.0 | 11.4 to 12.4 | 5,890 to 6,680 | 0.71 / 6.09 / 6.52 to 0.62 / 5.90 / 6.50 |
+| 16 readers, 1 writer (median of 3) | 76 to 68 | 11.4 to 11.9 to 13.0 | 15.7 to 16.4 to 17.4 | 6,451 to 8,076 | 1.45 / 7.50 / 8.52 to 1.11 / 7.37 / 8.40 |
+| 1 reader, 4 writers | 1.0 to 155 | 5,009 to 23.3 | 5,012 to 26.7 | 9,177 to 1,540 | 0.08 / 0.20 / 0.54 to 0.23 / 2.21 / 9.73 |
+| 8 readers, 4 writers | 155 to 140 | 23.2 to 25.0 | 27.5 to 29.8 | 3,700 to 3,615 | 0.97 / 8.83 / 10.45 to 1.02 / 9.97 / 12.35 |
+| 1 reader, batch 50 | 1.0 to 128 (6,406 rows/s) | 961 to 7.9 | 2,006 to 9.0 | 8,987 to 1,485 | 0.08 / 0.19 / 0.87 to 0.26 / 4.16 / 5.30 |
+| 8 readers, batch 50 (median of 3) | 116 to 117 | 8.6 to 8.3 | 10.4 to 9.6 | 4,280 to 4,055 to 5,612 (spread, not a trend) | 0.92 / 5.98 / 6.78 to 0.98 / 6.07 / 6.84 (run 1) |
+| 1 reader, batch 5,000 | 0.8 to 68 | 1,585 to 13.6 | 1,644 to 14.3 | 9,555 to 1,532 | 0.08 / 0.19 / 0.78 to 0.24 / 1.21 / 8.85 |
+| 8 readers, batch 5,000 (median of 3) | 48 to 43 | 15.5 to 16.2 | 24.4 to 25.7 | 6,401 to 7,454 | 0.59 / 9.17 / 10.43 to 0.55 / 2.30 / 10.32 |
+| 1 reader, compaction on (live 20,000, writer-owned deletes, seed burst) | 1.2 to 59; swaps 0 to 1 | 705 to 9.5 | 2,095 to 35.9 | 21,558 to 1,738 | 0.04 / 0.10 / 0.10 to 0.17 / 0.79 / 12.35 |
+| 8 readers, compaction on (median of 3) | 34 to 33 | 29 to 30 | 61 to 66 | 8,403 to 9,131 | 0.43 / 5.68 / 12.36 to 0.37 / 5.60 / 12.34 |
+
+What the lock looks like (lock trace, 8 readers, batch 1,000, median): the stage wait was 0.26 ms before and 0.27 ms after,
+and the commit wait 0.50 ms before and 0.54 ms after. Group size stayed at one write per group. With one reader the
+stage wait fell from 216 ms to 0.06 ms (p50) and the commit wait from 198 ms to 0.11 ms. Readers' lock waits rose: at
+one reader, the mean wait went from 0.001 ms to 0.25 ms, because readers now queue behind the writer's stage hold
+(about 4.3 ms of which is index sync).
+
+Reading the table. The admission gate is a writer-preference rule, so it moves the cost to whoever waits behind the
+writer. At one reader, the writer now gets the lock about 80 times as often, and the reader's share of the time is
+bounded by the writer's lock holds, so reader throughput falls by about three quarters. At eight and sixteen readers
+the writer's lock waits are unchanged, but writer throughput is 6 to 12% lower and reader throughput is 13 to 25%
+higher; the writer completes fewer groups in the same window. The likeliest reason is that the extra reader work takes
+CPU from the writer's encoding and sync work. That is a hypothesis, not a measurement. Reader p99 latency at eight and
+sixteen readers is unchanged within noise, and reader p95 at batch 5,000 with eight readers fell from 9.2 to 2.3 ms.
+
+Known limits: the admission gate does not reduce the state lock's stage hold, which includes the index sync. A reader
+with one connection now waits for those holds, which is the cost of the fix. Platforms other than macOS arm64 were not
+measured.
+
 ### Delta scan cost (`delta_scan`, dimension 384, naive scalar loops)
 
 | Vectors scanned per query | Time per query |

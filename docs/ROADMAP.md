@@ -35,6 +35,10 @@ not. Items marked done are verified in the code and the test suite; the tests ar
 
 ## Open, in priority order
 
+0. **Writer starvation: addressed by writer-preference admission (docs/CONCURRENCY.md, "Writer admission").** A continuous
+   reader no longer keeps a writer waiting for seconds. The trade-off is measured in docs/BENCHMARKS.md: a single reader's
+   throughput falls with a continuous writer, and writer throughput falls 6 to 12% with eight to sixteen readers. Reducing
+   the stage hold (which includes the index sync) is the next lever, and it is not started.
 1. **Concurrent write-path memory transient (next).** With writers and readers at once, the peak heap is 121.6 MB above
    base at 200,000 documents, against 34.8 MB for the writer alone and 1.7 MB for readers alone. The same figure is at
    commit `a3c17ff`, before R3, so this is not a compaction effect. It is larger than the compaction transient

@@ -21,6 +21,11 @@ project follows [semantic versioning](https://semver.org/) while it is pre-1.0.
   successful swap, and the next delete starts the next attempt.
 
 ### Changed
+- Writers have preference for the state lock. A writer announces itself before it waits for the lock, and new readers
+  wait at that point, so one continuous reader no longer starves writers. With one reader and a continuous writer the
+  writer went from about 1 batch per second to about 116, and the background swap now runs during the load. Reader
+  throughput with one writer falls, because readers wait behind writes; with eight to sixteen readers, reader
+  throughput rises 13 to 25% and writer throughput falls 6 to 12%. See docs/CONCURRENCY.md and docs/BENCHMARKS.md.
 - Unfiltered search over-fetches at most 64 extra candidates for uncommitted writes on its first pass, and retries with
   the full extra only when that leaves fewer than `top_k` committed results and more than 64 are pending. The collector
   buffers TurboVec allocates per search scale with `k`, so this cuts the transient allocation of concurrent search and

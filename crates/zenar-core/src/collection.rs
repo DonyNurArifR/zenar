@@ -211,6 +211,135 @@ pub struct WriteStats {
     pub read_wait_max_ns: u64,
 }
 
+/// Writer-preference admission for the state lock.
+///
+/// A writer announces itself before it waits for the state lock, and a reader waits here while any writer is
+/// announced. The gate closes to new readers at the announcement, not when the writer starts waiting on the lock.
+/// Readers that are already past the gate keep their place, so the lock's holders drain and the announced writers
+/// get it. A reader that finishes a search releases the lock and then queues at the gate again, so it cannot
+/// reacquire ahead of a waiting writer.
+///
+/// Lock order: the admission mutex is taken alone and released before the state lock is taken. It is never held
+/// while a read or write guard is waited for, so the two cannot form a cycle.
+///
+/// Guarantees, and what they are not: an announced writer gets the state lock once the readers already past the gate
+/// have released it. This does not give first-come-first-served order among writers, and it is not a fairness bound
+/// for readers: while writers keep announcing, readers wait. In this crate the writers that reach the state lock
+/// are the group leader, the swap, and the other short operations, so the announced count stays small.
+struct Admission {
+    /// Writers announced and not yet past their `write()` call.
+    announced: Mutex<usize>,
+    /// Signalled when `announced` falls to zero.
+    open: Condvar,
+    /// Readers that waited at the gate, counted for tests and diagnostics.
+    gate_waits: AtomicU64,
+    /// Writer announcements, counted for tests.
+    total_announcements: AtomicU64,
+}
+
+impl Admission {
+    fn new() -> Self {
+        Self {
+            announced: Mutex::new(0),
+            open: Condvar::new(),
+            gate_waits: AtomicU64::new(0),
+            total_announcements: AtomicU64::new(0),
+        }
+    }
+
+    /// Blocks while any writer is announced. Returns at once when none is.
+    fn admit_reader(&self) {
+        let mut announced = self.announced.lock().unwrap_or_else(|p| p.into_inner());
+        if *announced == 0 {
+            return;
+        }
+        self.gate_waits.fetch_add(1, Ordering::Relaxed);
+        #[cfg(test)]
+        let deadline = Instant::now() + Duration::from_secs(60);
+        while *announced > 0 {
+            #[cfg(test)]
+            {
+                // A test that leaves an announcement behind fails here, rather than waiting for ever.
+                let left = deadline.saturating_duration_since(Instant::now());
+                assert!(
+                    !left.is_zero(),
+                    "a reader waited 60 s at the admission gate: an announcement was never released"
+                );
+                announced = self
+                    .open
+                    .wait_timeout(announced, left)
+                    .unwrap_or_else(|p| p.into_inner())
+                    .0;
+            }
+            #[cfg(not(test))]
+            {
+                announced = self.open.wait(announced).unwrap_or_else(|p| p.into_inner());
+            }
+        }
+    }
+
+    /// Announces a writer. The gate closes now. The announcement is released when the returned value is
+    /// dropped, which the write path does right after `write()` returns, on success and on error alike, and
+    /// which unwinding also does.
+    fn announce(&self) -> Announcement<'_> {
+        {
+            let mut announced = self.announced.lock().unwrap_or_else(|p| p.into_inner());
+            *announced += 1;
+        }
+        self.total_announcements.fetch_add(1, Ordering::Relaxed);
+        Announcement { admission: self }
+    }
+
+    fn retire(&self) {
+        let mut announced = self.announced.lock().unwrap_or_else(|p| p.into_inner());
+        debug_assert!(*announced > 0, "an announcement was retired twice");
+        *announced -= 1;
+        if *announced == 0 {
+            self.open.notify_all();
+        }
+    }
+
+    #[cfg(test)]
+    fn waiting_writers(&self) -> usize {
+        *self.announced.lock().unwrap_or_else(|p| p.into_inner())
+    }
+}
+
+/// One announced writer, released on drop.
+struct Announcement<'a> {
+    admission: &'a Admission,
+}
+
+impl Drop for Announcement<'_> {
+    fn drop(&mut self) {
+        self.admission.retire();
+    }
+}
+
+thread_local! {
+    /// How many `StateRead` guards this thread holds. A read entry point that runs while another one is held would
+    /// wait at the gate for a writer that is waiting for that very guard, so debug builds refuse it.
+    static READS_HELD: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Shared access to the state. Entry points take one of these; it must not be held while another is taken.
+struct StateRead<'a> {
+    guard: RwLockReadGuard<'a, State>,
+}
+
+impl std::ops::Deref for StateRead<'_> {
+    type Target = State;
+    fn deref(&self) -> &State {
+        &self.guard
+    }
+}
+
+impl Drop for StateRead<'_> {
+    fn drop(&mut self) {
+        READS_HELD.with(|n| n.set(n.get() - 1));
+    }
+}
+
 /// Exclusive access to the state. Dropping it records how long the lock was held.
 struct WriteGuard<'a> {
     guard: RwLockWriteGuard<'a, State>,
@@ -340,11 +469,13 @@ impl Drop for Lead<'_> {
         {
             // The group stopped part way, so its staged writes may be in the index and the log but not in
             // memory. Only a reopen, which reconciles the two files, can make the state consistent again.
+            let announced = self.collection.admission.announce();
             let mut state = self
                 .collection
                 .state
                 .write()
                 .unwrap_or_else(|p| p.into_inner());
+            drop(announced);
             state.poisoned.get_or_insert_with(|| {
                 "a write group was aborted part way; reopen the database to recover".into()
             });
@@ -484,6 +615,8 @@ pub struct Collection {
     /// Test only: how many unfiltered searches retried with the full over-fetch.
     #[cfg(test)]
     search_retries: AtomicU64,
+    /// Writer-preference admission for `state`: see `Admission`.
+    admission: Admission,
 }
 
 impl Collection {
@@ -529,6 +662,7 @@ impl Collection {
             fail_stage: std::sync::atomic::AtomicBool::new(false),
             #[cfg(test)]
             search_retries: AtomicU64::new(0),
+            admission: Admission::new(),
         }
     }
 
@@ -1741,6 +1875,24 @@ impl Collection {
         self.run_compaction()
     }
 
+    /// Test only: writers announced and not yet past their `write()` call.
+    #[cfg(test)]
+    pub(crate) fn waiting_writers(&self) -> usize {
+        self.admission.waiting_writers()
+    }
+
+    /// Test only: readers that waited at the admission gate.
+    #[cfg(test)]
+    pub(crate) fn gate_waits(&self) -> u64 {
+        self.admission.gate_waits.load(Ordering::Relaxed)
+    }
+
+    /// Test only: writer announcements so far.
+    #[cfg(test)]
+    pub(crate) fn writer_announcements(&self) -> u64 {
+        self.admission.total_announcements.load(Ordering::Relaxed)
+    }
+
     /// Test only: how many unfiltered searches retried with the full over-fetch.
     #[cfg(test)]
     pub(crate) fn search_retry_count(&self) -> u64 {
@@ -1792,12 +1944,20 @@ impl Collection {
         Ok(())
     }
 
-    fn read_state(&self) -> Result<RwLockReadGuard<'_, State>, ZenarError> {
+    fn read_state(&self) -> Result<StateRead<'_>, ZenarError> {
+        debug_assert_eq!(
+            READS_HELD.with(|n| n.get()),
+            0,
+            "a state read was taken while this thread holds one; that deadlocks once a writer is waiting"
+        );
         let waiting = Instant::now();
+        self.admission.admit_reader();
         let guard = self
             .state
             .read()
             .map_err(|_| ZenarError::VectorStoreError("collection lock poisoned".into()))?;
+        READS_HELD.with(|n| n.set(n.get() + 1));
+        let guard = StateRead { guard };
         self.counters.record_read_wait(waiting.elapsed());
         self.not_closed(&guard)?;
         Ok(guard)
@@ -1812,10 +1972,12 @@ impl Collection {
 
     /// Marks the collection closed, so that no handle to it can read or write it any more.
     pub(crate) fn close(&self) {
+        let announced = self.admission.announce();
         let mut state = match self.state.write() {
             Ok(state) => state,
             Err(poisoned) => poisoned.into_inner(),
         };
+        drop(announced);
         state.closed = true;
     }
 
@@ -1827,10 +1989,11 @@ impl Collection {
     /// Takes the write lock for the operation `op`, and records the wait for it in the lock trace.
     fn write_state_op(&self, op: &'static str) -> Result<WriteGuard<'_>, ZenarError> {
         let waiting = Instant::now();
-        let guard = self
-            .state
-            .write()
-            .map_err(|_| ZenarError::VectorStoreError("collection lock poisoned".into()))?;
+        let announced = self.admission.announce();
+        let guard = self.state.write();
+        drop(announced);
+        let guard =
+            guard.map_err(|_| ZenarError::VectorStoreError("collection lock poisoned".into()))?;
         let since = Instant::now();
         let waited_ns = u64::try_from((since - waiting).as_nanos()).unwrap_or(u64::MAX);
         self.not_closed(&guard)?;
@@ -4860,6 +5023,370 @@ mod search_overfetch_tests {
         let searched: u64 = readers.into_iter().map(|r| r.join().unwrap()).sum();
         assert!(searched > 0);
         assert_eq!(c.count().unwrap(), 50 + 40 * 150);
+        drop(c);
+        drop(db);
+        fs::remove_dir_all(&dir).ok();
+    }
+}
+
+#[cfg(test)]
+mod admission_tests {
+    use super::*;
+    use crate::database::VectorDB;
+    use std::sync::mpsc;
+
+    const DIM: usize = 8;
+
+    fn temp_dir(name: &str) -> PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("zenar-admission-{name}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        dir
+    }
+
+    fn doc(id: u64) -> Record {
+        let mut vector = vec![0.0f32; DIM];
+        vector[0] = 1.0;
+        vector[1] = 0.001 * id as f32;
+        Record {
+            id,
+            vector,
+            text: format!("doc {id}"),
+            metadata: vec![],
+        }
+    }
+
+    fn collection(dir: &Path, docs: u64) -> (VectorDB, Arc<Collection>) {
+        let db = VectorDB::open(dir).unwrap();
+        let c = db.create_collection("c", Some(DIM), 4).unwrap();
+        if docs > 0 {
+            let records: Vec<Record> = (0..docs).map(doc).collect();
+            c.add_many(&records).unwrap();
+        }
+        (db, c)
+    }
+
+    /// Waits for a condition that another thread will make true. Fails after ten seconds, so a broken gate
+    /// fails the test rather than hanging it.
+    fn until(cond: impl Fn() -> bool, what: &str) {
+        let start = Instant::now();
+        while !cond() {
+            assert!(
+                start.elapsed() < Duration::from_secs(10),
+                "timed out waiting for {what}"
+            );
+            thread::yield_now();
+        }
+    }
+
+    /// Takes a read guard on another thread and waits for it, for at most ten seconds, so a gate that never opens
+    /// fails the test instead of hanging it. Returns whether the read was granted.
+    fn read_within_ten_seconds(c: &Arc<Collection>) -> bool {
+        let (tx, rx) = mpsc::channel();
+        let cr = Arc::clone(c);
+        thread::spawn(move || {
+            let granted = cr.read_state().is_ok();
+            let _ = tx.send(granted);
+        });
+        rx.recv_timeout(Duration::from_secs(10)).unwrap_or(false)
+    }
+
+    /// Case 1: Readers stay concurrent while no writer is announced: two readers hold the lock at the same time.
+    #[test]
+    fn readers_stay_concurrent_when_no_writer_waits() {
+        let dir = temp_dir("concurrent-readers");
+        let (db, c) = collection(&dir, 10);
+        let (a_in, a_in_rx) = mpsc::channel::<()>();
+        let (b_in, b_in_rx) = mpsc::channel::<()>();
+        let c1 = Arc::clone(&c);
+        let first = thread::spawn(move || {
+            let guard = c1.read_state().unwrap();
+            a_in.send(()).unwrap();
+            b_in_rx
+                .recv_timeout(Duration::from_secs(10))
+                .expect("the second reader was blocked by the first");
+            drop(guard);
+        });
+        let c2 = Arc::clone(&c);
+        let second = thread::spawn(move || {
+            let guard = c2.read_state().unwrap();
+            b_in.send(()).unwrap();
+            a_in_rx
+                .recv_timeout(Duration::from_secs(10))
+                .expect("the first reader was blocked by the second");
+            drop(guard);
+        });
+        first.join().unwrap();
+        second.join().unwrap();
+        assert_eq!(c.gate_waits(), 0, "no reader waited at the gate");
+        drop(c);
+        drop(db);
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Cases 2 and 3: A writer that announces itself closes the gate: a reader arriving after it waits, and runs only after
+    /// the writer has held the lock. The reader that already held the lock finishes first.
+    #[test]
+    fn a_waiting_writer_stops_later_readers_and_existing_readers_finish() {
+        let dir = temp_dir("writer-gate");
+        let (db, c) = collection(&dir, 10);
+        let order = Arc::new(Mutex::new(Vec::<&'static str>::new()));
+        let held = c.read_state().unwrap();
+
+        let (cw, ow) = (Arc::clone(&c), Arc::clone(&order));
+        let writer = thread::spawn(move || {
+            let guard = cw.write_state_op("test").unwrap();
+            ow.lock().unwrap().push("writer");
+            drop(guard);
+        });
+        until(|| c.waiting_writers() == 1, "the writer to announce itself");
+
+        let (cr, or) = (Arc::clone(&c), Arc::clone(&order));
+        let reader = thread::spawn(move || {
+            let guard = cr.read_state().unwrap();
+            or.lock().unwrap().push("reader");
+            drop(guard);
+        });
+        until(
+            || c.gate_waits() == 1,
+            "the new reader to queue behind the writer",
+        );
+        assert!(
+            order.lock().unwrap().is_empty(),
+            "the writer or the reader ran while the first reader held the lock"
+        );
+
+        drop(held);
+        writer.join().unwrap();
+        // Bounded: a reader that never gets in fails here rather than blocking the join.
+        until(
+            || order.lock().unwrap().len() == 2,
+            "the reader to run after the writer",
+        );
+        reader.join().unwrap();
+        assert_eq!(*order.lock().unwrap(), vec!["writer", "reader"]);
+        assert_eq!(c.waiting_writers(), 0);
+        drop(c);
+        drop(db);
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Case 4: Several announced writers are counted, the gate stays closed until the last one has its lock, and readers
+    /// resume after all of them finish.
+    #[test]
+    fn multiple_waiting_writers_are_counted_and_readers_resume_after_them() {
+        let dir = temp_dir("many-writers");
+        let (db, c) = collection(&dir, 10);
+        let held = c.read_state().unwrap();
+        let mut writers = Vec::new();
+        for _ in 0..2 {
+            let cw = Arc::clone(&c);
+            writers.push(thread::spawn(move || {
+                let guard = cw.write_state_op("test").unwrap();
+                drop(guard);
+            }));
+        }
+        until(
+            || c.waiting_writers() == 2,
+            "both writers to announce themselves",
+        );
+        drop(held);
+        for w in writers {
+            w.join().unwrap();
+        }
+        assert_eq!(c.waiting_writers(), 0, "every announcement was released");
+        let waits = c.gate_waits();
+        assert!(
+            read_within_ten_seconds(&c),
+            "a reader after the writers was blocked"
+        );
+        assert_eq!(
+            c.gate_waits(),
+            waits,
+            "a reader after the writers did not wait"
+        );
+        drop(c);
+        drop(db);
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Case 5: Accounting is restored when a write fails, and when an announcement is unwound by a panic.
+    #[test]
+    fn accounting_is_restored_after_an_error_and_after_a_panic() {
+        let dir = temp_dir("accounting");
+        let (db, c) = collection(&dir, 10);
+        c.close();
+        assert!(
+            c.write_state_op("test").is_err(),
+            "a closed collection refuses writes"
+        );
+        assert_eq!(
+            c.waiting_writers(),
+            0,
+            "the failed write released its announcement"
+        );
+        assert!(
+            !read_within_ten_seconds(&c),
+            "a closed collection refuses reads"
+        );
+        drop(c);
+        drop(db);
+        fs::remove_dir_all(&dir).ok();
+
+        let gate = Admission::new();
+        let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _announced = gate.announce();
+            panic!("unwinding through an announcement");
+        }));
+        assert!(unwound.is_err());
+        assert_eq!(
+            gate.waiting_writers(),
+            0,
+            "unwinding released the announcement"
+        );
+        gate.admit_reader();
+    }
+
+    /// Case 6: Readers resume once the waiting writers have finished, so admission never stays closed.
+    #[test]
+    fn readers_resume_after_all_waiting_writers_finish() {
+        let dir = temp_dir("resume");
+        let (db, c) = collection(&dir, 10);
+        for _ in 0..3 {
+            let guard = c.write_state_op("test").unwrap();
+            drop(guard);
+            let (tx, rx) = mpsc::channel();
+            let cr = Arc::clone(&c);
+            let reader = thread::spawn(move || {
+                let guard = cr.read_state().unwrap();
+                tx.send(guard.committed_len).unwrap();
+            });
+            rx.recv_timeout(Duration::from_secs(10))
+                .expect("a reader blocked after the writers finished");
+            reader.join().unwrap();
+        }
+        drop(c);
+        drop(db);
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Case 7: A reader that re-acquires the lock as soon as it can does not starve a writer: the writer completes its
+    /// operations while the reader keeps running.
+    #[test]
+    fn a_continuous_reader_cannot_starve_a_writer() {
+        let dir = temp_dir("starvation");
+        let (db, c) = collection(&dir, 10);
+        let stop = Arc::new(AtomicBool::new(false));
+        let (cr, sr) = (Arc::clone(&c), Arc::clone(&stop));
+        let (reads_tx, reads_rx) = mpsc::channel();
+        let reader = thread::spawn(move || {
+            let mut reads = 0u64;
+            while !sr.load(Ordering::SeqCst) {
+                let guard = cr.read_state().unwrap();
+                std::hint::black_box(guard.docs.live_count());
+                drop(guard);
+                reads += 1;
+            }
+            let _ = reads_tx.send(reads);
+        });
+        let (tx, rx) = mpsc::channel();
+        let cw = Arc::clone(&c);
+        let writer = thread::spawn(move || {
+            for _ in 0..100 {
+                let guard = cw.write_state_op("test").unwrap();
+                drop(guard);
+            }
+            tx.send(()).unwrap();
+        });
+        rx.recv_timeout(Duration::from_secs(60))
+            .expect("the writer was starved by a continuous reader");
+        writer.join().unwrap();
+        stop.store(true, Ordering::SeqCst);
+        let reads = reads_rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("the reader did not finish once the writer was done");
+        assert!(reads > 0);
+        reader.join().unwrap();
+        drop(c);
+        drop(db);
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Case 8: Concurrent writers keep group commit correct: every acknowledged document is committed and findable, and
+    /// writes are grouped.
+    #[test]
+    fn concurrent_writes_keep_group_commit_correct() {
+        let dir = temp_dir("group-commit");
+        let (db, c) = collection(&dir, 50);
+        let stop = Arc::new(AtomicBool::new(false));
+        let readers: Vec<_> = (0..2)
+            .map(|_| {
+                let (cr, sr) = (Arc::clone(&c), Arc::clone(&stop));
+                thread::spawn(move || {
+                    while !sr.load(Ordering::SeqCst) {
+                        let hits = cr
+                            .search(&[1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0], 10, None)
+                            .unwrap();
+                        assert!(hits.len() <= 10);
+                    }
+                })
+            })
+            .collect();
+        let writers: Vec<_> = (0..4u64)
+            .map(|w| {
+                let cw = Arc::clone(&c);
+                thread::spawn(move || {
+                    for b in 0..20u64 {
+                        let first = 1000 + (w * 20 + b) * 25;
+                        let records: Vec<Record> = (first..first + 25).map(doc).collect();
+                        cw.add_many(&records).unwrap();
+                    }
+                })
+            })
+            .collect();
+        for w in writers {
+            w.join().unwrap();
+        }
+        stop.store(true, Ordering::SeqCst);
+        for r in readers {
+            r.join().unwrap();
+        }
+        assert_eq!(c.count().unwrap(), 50 + 4 * 20 * 25);
+        for id in [1000u64, 1499, 1975] {
+            assert!(
+                c.get(id).unwrap().is_some(),
+                "acknowledged document {id} is missing"
+            );
+        }
+        let stats = c.write_stats();
+        assert!(stats.sync_groups >= 1);
+        assert!(
+            stats.synced_writes >= 80,
+            "every add was grouped and synced: {stats:?}"
+        );
+        drop(c);
+        drop(db);
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Case 9: Delete and the compaction swap take the same admission as the other writes.
+    #[test]
+    fn delete_and_compaction_swap_use_the_same_admission() {
+        let dir = temp_dir("delete-swap");
+        let (db, c) = collection(&dir, 20);
+        let before = c.writer_announcements();
+        assert_eq!(c.delete_many(&[0, 1]).unwrap(), 2);
+        assert!(
+            c.writer_announcements() > before,
+            "delete did not announce itself"
+        );
+        let before = c.writer_announcements();
+        c.compact_now().unwrap();
+        assert!(
+            c.writer_announcements() > before,
+            "the compaction swap did not announce itself"
+        );
+        assert_eq!(c.count().unwrap(), 18);
         drop(c);
         drop(db);
         fs::remove_dir_all(&dir).ok();

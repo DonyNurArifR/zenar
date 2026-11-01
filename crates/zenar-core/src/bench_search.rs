@@ -107,6 +107,11 @@ fn bench_search_workload() {
     let hot = std::env::var("HOT")
         .ok()
         .and_then(|v| v.parse::<u64>().ok());
+    // DELETES=1: a deleter removes the first writer's rows as they are acknowledged, so dead rows grow and
+    // compactions run. BURST=1 also deletes 80% of the seed rows at the start of the window, which makes the first
+    // compaction due at once.
+    let deletes = env_num("DELETES", 0) > 0;
+    let burst = env_num("BURST", 0) > 0;
 
     let dir = std::env::temp_dir().join(format!("zenar-bench-search-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
@@ -129,6 +134,9 @@ fn bench_search_workload() {
     PEAK.store(base, Ordering::Relaxed);
     let allocs0 = ALLOCS.load(Ordering::Relaxed);
     let bytes0 = BYTES.load(Ordering::Relaxed);
+    let written = Arc::new(AtomicU64::new(10_000_000));
+    col.set_lock_trace(true);
+    let ws0 = col.write_stats();
     let wall0 = Instant::now();
     let reader_handles: Vec<_> = (0..readers)
         .map(|r| {
@@ -149,7 +157,7 @@ fn bench_search_workload() {
         .collect();
     let writer_handles: Vec<_> = (0..writers)
         .map(|w| {
-            let (col, stop) = (Arc::clone(&col), Arc::clone(&stop));
+            let (col, stop, written) = (Arc::clone(&col), Arc::clone(&stop), Arc::clone(&written));
             thread::spawn(move || {
                 let mut lat = Vec::new();
                 let mut id = 10_000_000u64 * (w as u64 + 1);
@@ -167,11 +175,42 @@ fn bench_search_workload() {
                     col.add_many(&recs).unwrap();
                     lat.push(t.elapsed().as_nanos() as u64);
                     id += batch;
+                    if w == 0 {
+                        written.store(id, Ordering::Relaxed);
+                    }
                 }
                 lat
             })
         })
         .collect();
+    let deleter = deletes.then(|| {
+        let (col, stop, written) = (Arc::clone(&col), Arc::clone(&stop), Arc::clone(&written));
+        thread::spawn(move || {
+            let mut removed = 0u64;
+            if burst {
+                let seed_end = live * 4 / 5;
+                let mut at = 0u64;
+                while at < seed_end {
+                    let end = (at + 1000).min(seed_end);
+                    let ids: Vec<u64> = (at..end).collect();
+                    removed += col.delete_many(&ids).unwrap_or(0) as u64;
+                    at = end;
+                }
+            }
+            let mut next = 10_000_000u64;
+            while !stop.load(Ordering::Relaxed) {
+                let high = written.load(Ordering::Relaxed);
+                let end = (next + 1000).min(high);
+                if end > next {
+                    let ids: Vec<u64> = (next..end).collect();
+                    removed += col.delete_many(&ids).unwrap_or(0) as u64;
+                    next = end;
+                }
+                thread::sleep(Duration::from_millis(20));
+            }
+            removed
+        })
+    });
     thread::sleep(Duration::from_secs_f64(secs));
     let peak = PEAK.load(Ordering::Relaxed);
     let heap_at_stop = HEAP.load(Ordering::Relaxed);
@@ -185,9 +224,20 @@ fn bench_search_workload() {
         .flat_map(|h| h.join().unwrap())
         .collect();
     let wall = wall0.elapsed().as_secs_f64();
+    let removed = deleter.map_or(0, |d| d.join().unwrap());
+    let ws1 = col.write_stats();
+    let events = col.take_lock_trace();
+    col.set_lock_trace(false);
     let allocs = ALLOCS.load(Ordering::Relaxed) - allocs0;
     let bytes = BYTES.load(Ordering::Relaxed) - bytes0;
     let retries = col.search_retry_count() - retries0;
+    let groups = ws1.sync_groups - ws0.sync_groups;
+    let grouped = ws1.synced_writes - ws0.synced_writes;
+    let holds = ws1.write_holds - ws0.write_holds;
+    let hold_total = ws1.write_hold_total_ns - ws0.write_hold_total_ns;
+    let reads = ws1.read_waits - ws0.read_waits;
+    let read_total = ws1.read_wait_total_ns - ws0.read_wait_total_ns;
+    let mean_ms = |total: u64, n: u64| total as f64 / n.max(1) as f64 / 1e6;
     let n = search.len().max(1) as f64;
     let mb = |b: usize| b as f64 / (1024.0 * 1024.0);
     println!(
@@ -221,6 +271,41 @@ fn bench_search_workload() {
         bytes as f64 / n,
         100.0 * retries as f64 / n
     );
+    println!(
+        "  groups: {groups} syncs, {:.2} writes per group; state lock held by writes {holds} times (mean {:.3} ms); readers waited {reads} times (mean {:.3} ms)",
+        grouped as f64 / groups.max(1) as f64,
+        mean_ms(hold_total, holds),
+        mean_ms(read_total, reads)
+    );
+    for op in [
+        "add_stage",
+        "add_commit",
+        "delete_stage",
+        "delete_commit",
+        "swap",
+    ] {
+        let of: Vec<&crate::LockEvent> = events.iter().filter(|e| e.op == op).collect();
+        if of.is_empty() {
+            continue;
+        }
+        let mut w: Vec<u64> = of.iter().map(|e| e.wait_ns).collect();
+        let mut h: Vec<u64> = of.iter().map(|e| e.hold_ns).collect();
+        println!(
+            "  lock {op:<13} n {:>5}  wait p50 {:.3} p95 {:.3} max {:.3} ms  hold p50 {:.3} max {:.3} ms",
+            of.len(),
+            percentile(&mut w.clone(), 0.5),
+            percentile(&mut w.clone(), 0.95),
+            percentile(&mut w, 1.0),
+            percentile(&mut h.clone(), 0.5),
+            percentile(&mut h, 1.0)
+        );
+    }
+    if deletes {
+        println!(
+            "  deleted rows: {removed}; compactions swapped: {}",
+            events.iter().filter(|e| e.op == "swap").count()
+        );
+    }
     drop(col);
     drop(db);
     std::fs::remove_dir_all(&dir).ok();

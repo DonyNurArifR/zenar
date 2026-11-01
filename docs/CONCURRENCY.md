@@ -66,6 +66,30 @@ the lock for about 2 ms per section, twice per group.
 - **State lock** (`state: RwLock<State>`): one per collection. Readers take it shared. A write takes it exclusive in
   three short sections: before the index sync, after the log sync, and for the commit.
 - **Database**: a lock over the collection map, a catalog mutex, and the `LOCK` file for the process.
+- **Writer admission** (`Admission` in `collection.rs`): a count of writers that have announced they want the state lock,
+  under its own mutex, and a condition variable. A writer announces before it calls `write()` on the state lock, and
+  releases the announcement as soon as `write()` returns, on success, on error and on unwinding (an RAII guard). A reader
+  calls `admit_reader` before it calls `read()`: it waits while any writer is announced, and does not wait otherwise.
+  The gate closes at the announcement, not when the writer starts to block on the lock. Every acquisition of the state
+  lock goes through it: `read_state`, `write_state_op` (stage, commit, delete, flush, calibrate, reconcile, swap, persist),
+  the poison write in a group that stopped part way, and `close`.
+
+  **Lock order.** The admission mutex is taken alone and released before the state lock is taken. It is never held while
+  a guard is waited for, so the two cannot form a cycle. Search, document fetch, and the other read work run under the
+  state read guard, not under the admission mutex.
+
+  **Recursive reads are not allowed.** A thread that holds a `StateRead` must not call `read_state` again. If a writer is
+  announced, the second call waits at the gate for the first guard to be released, while the writer waits for that guard:
+  a deadlock. Debug builds assert the rule (`READS_HELD`). No code path takes a second read guard today; `retrieve`
+  releases its guard before it searches, and `describe` passes its guard down rather than taking another.
+
+  **What is guaranteed.** Once a writer is announced, readers that have not yet passed the gate wait, so an announced
+  writer gets the state lock after the readers that were already past the gate release it. A reader that finishes a
+  search re-enters the gate and cannot reacquire ahead of an announced writer. Writers that announce while others are
+  announced share the gate. The guarantee is not first-come-first-served among writers, and it is not a fairness bound
+  for readers: while writers keep announcing, readers wait. Here the writers that reach the state lock are the group
+  leader, a swap, and the other short operations, so the announced count stays small. The measured effect is in
+  `docs/BENCHMARKS.md`, "Writer admission".
 
 ### Who takes which lock
 
