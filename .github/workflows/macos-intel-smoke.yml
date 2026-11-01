@@ -1,7 +1,7 @@
 # Manual smoke test on an Intel macOS runner. It builds the wheel natively on Intel (not cross-compiled), installs it,
 # and runs the Python test suite against the installed wheel. Start it with:
 #   gh workflow run macos-intel-smoke.yml --ref <branch>
-# The runner label must be checked when it is first run: GitHub retires hosted image labels.
+# macos-15-intel is an Intel (x86_64) hosted runner. The label is checked by the first dispatch.
 name: macOS Intel smoke (manual)
 
 on:
@@ -13,7 +13,7 @@ permissions:
 jobs:
   smoke:
     name: Build and test on Intel macOS
-    runs-on: macos-13
+    runs-on: macos-15-intel
     steps:
       - uses: actions/checkout@v7
       - name: Confirm the architecture
