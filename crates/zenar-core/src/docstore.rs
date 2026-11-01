@@ -676,7 +676,8 @@ impl DocStore {
     /// Rewrites the log with only live documents, then replaces the old log atomically.
     ///
     /// The old log stays valid until the rename. Any error after the rename leaves the in-memory log
-    /// stale, so the caller must poison the collection (see `Collection::compact_locked`).
+    /// stale, so the caller must poison the collection. The background swap, `Collection::swap_locked`, does
+    /// that. This synchronous form is used by tests and examples.
     pub fn compact(&mut self) -> Result<(), ZenarError> {
         let tmp = self.write_compacted()?;
         self.rename_compacted(&tmp)?;

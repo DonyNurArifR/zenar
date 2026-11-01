@@ -43,8 +43,6 @@ project follows [semantic versioning](https://semver.org/) while it is pre-1.0.
   vector index.
 - `RecoveryError` on open is raised before any file is truncated, and a missing document log is refused instead of
   recreated empty while the catalog says it held synced bytes.
-
-### Changed
 - Compaction records its new log length and the old length in the catalog before it renames the log, and clears that record
   after the directory sync (the pending record, docs/R3.md). Opening settles an interrupted compaction by the rules in
   docs/R3.md, section 5. Catalogs without the record read and write as before. A database with a pending record opened by an
