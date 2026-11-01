@@ -144,6 +144,34 @@ and reconciliation removes them.
 binary was run on the build before Phase 1 and on the build after. Each case reports throughput and p50, p95 and p99.
 `write_cost` gives the public-API write costs, including the compaction batch. The full tables are in BENCHMARKS.md.
 
+## Staging outside the state lock (investigated, not implemented)
+
+The question was whether batch preparation can run outside the state lock, so that readers wait less. The leader is the
+only writer, and groups run one at a time, so no other write changes the schema, the id sets or the log while a leader
+prepares its group. That makes preparation safe to move. The measurement decides whether it is worth moving.
+
+Per 50-row batch, under four writers, from temporary timers around each step (`stage_request`, 400 samples):
+
+| Step | Time | Lock | Movable |
+|---|---|---|---|
+| Validate (ids, vectors, metadata, duplicates) | 0.055 ms | state, exclusive | yes: read-only, given a read lock |
+| Extend the schema (catalog write, only when a batch adds a field) | 0.000 ms in these runs | state, exclusive | no: writes the catalog |
+| Encode and write the log bytes (`stage_puts`) | 0.054 ms | state, exclusive | the encoding is pure; the write is not |
+| Add the vectors to the index (`store.add`) | 0.225 ms | state, exclusive | no: TurboVec needs `&mut` |
+| Index sync per group | about 3.9 ms | state, exclusive | no: TurboVec syncs from its in-memory state |
+
+What could move is the validation and the encoding, about 0.1 ms per batch. At four writers that is about 0.4 ms of a group's
+exclusive time, which is roughly 8% of its estimated 5 ms (four staging steps and one index sync). The index sync is most of
+the hold, and it cannot move without a TurboVec change. Moving the validation and encoding would need a read-lock preparation
+phase, a split of `stage_puts` into encode and write, and a check that the schema and the id sets have not changed. That is
+about 100 lines and two more lock sections, for a gain that is inside the run-to-run noise.
+
+**Decision: not implemented.** The design is sound, but the measured gain is below noise, and the added lock sections raise
+the risk of an ordering mistake. The next lock-hold target is the index sync, which is an engine constraint.
+
+Ordering and visibility, for the record. Nothing becomes visible before the log sync: documents are committed only after the
+sync in `finish_batch`, whatever happens during preparation.
+
 ## Audit
 
 This is the check made before the group-commit change was committed. Each item names where it is enforced and the test

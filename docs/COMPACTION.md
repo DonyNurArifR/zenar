@@ -1,7 +1,8 @@
 # Compaction: investigation and design proposal
 
-Status: **proposal**. The only change made is a sequential rewrite of the log (below), which keeps the same format and the
-same lock protocol. The background swap described here is not implemented. It changes when the collection lock is held
+Status: **proposal, revised after the memory and failure analysis below**. The only change made is a sequential rewrite of
+the log, which keeps the same format and the same lock protocol. The background swap is not implemented, and the revision
+shows the swap as written cannot reclaim memory, so it is not ready to implement. It changes when the collection lock is held
 and what happens on disk, so it waits for review.
 
 ## What compaction does today
@@ -46,14 +47,15 @@ The rest of the in-lock cost is the replay (156 ms at 500,000 live rows) and the
 |---|---|---|---|---|
 | A. In-lock, per-row reads (the old code) | 366 ms | exact | none | replaced |
 | B. In-lock, one sequential read | 187 ms in `compact`; 127 to 132 ms as a delete batch | exact | low: format unchanged | **implemented** |
-| C. Background rewrite, then a swap under the lock: the tail is copied, offsets are remapped, no reopen | estimated 25 to 35 ms: two syncs, one catalog write, a rename, and an O(rows) remap. The remap cost is not measured yet. | proven at the protocol level (below) | medium: a new interleaving of writes and the swap | **proposed** |
-| D. Background rewrite, then the swap rebuilds the indexes from the rows | 80 ms or more for 500k rows, plus the swap | as C | medium | rejected: C avoids the rebuild |
-| E. Background rewrite, then reopen to replay | 156 ms or more | as C | medium | rejected: the replay is the largest cost |
+| C. Background rewrite, then a swap that copies the tail and remaps offsets, without a reopen | not measured | the protocol is modelled | medium | rejected: it leaks dead-row memory (see Memory) |
+| R3. Background build of the new rows and indexes, a tail apply, then the swap | not measured | the protocol is modelled; the Rust tests are planned | medium | **candidate**, pending review |
+| D. In-lock rebuild of the indexes in the swap | 80 ms or more for 500k rows, plus the swap | exact | medium | rejected: it holds the lock about as long as the reopen (R1) |
+| E. Background rewrite, then reopen to replay | 156 ms or more | exact | medium | rejected: the replay is the largest cost |
 
 Option B is an independent improvement with no change to the lock protocol or the format, and it is implemented. Option C
 is the design that removes the stall.
 
-## Option C: the design
+## Option C: the design (superseded by R3 in the Memory section)
 
 ### Steps
 
@@ -117,27 +119,123 @@ Crash points, with the state a reopen finds:
   The stale temporary log is removed.
 - After the rename, before the remap: the new log, which holds the replayed state. Reopen replays it.
 
-### Lock hold, estimated
+### Lock hold
 
-Two syncs (about 4 ms each), one catalog write (about 8 ms), a rename (0.2 ms), the tail copy (the bytes written during the
-rewrite: about 0.1 ms per 100 writes), and the remap. Estimated 25 to 35 ms in total at a million rows, against 127 to 132 ms
-now. The remap is O(rows): a loop over the row table. It has not been measured.
+Not measured. An earlier estimate of 25 to 35 ms is withdrawn. The swap's hold will be measured from `WriteStats` once an
+implementation exists (see the measurements section).
 
-## Test plan (before implementation is accepted)
+## Memory: what dead rows cost, and what a swap without a reopen leaves behind
 
-1. **Model-based test in Rust**, extending `random_operations_agree_with_a_reference_model_across_reopens`: random adds,
-   deletes and compactions, with the compaction moved into the background (a window hook can hold it between the rewrite and
-   the swap). Check the live documents against the reference after every swap, and across reopens.
-2. **Deletes during the rewrite:** a window test that deletes, adds and searches while the rewrite is paused. The results
-   must match a run without the background rewrite.
-3. **Crash points:** the copy-based crash tests, one per crash point above. Each reopen must match the reference.
-4. **Failure injection:** a failing catalog write, a failing rename, and a failing directory sync, each with the expected state.
-5. **Benchmarks:** `write_cost` at one million rows, the compacting batch; `concurrent_bench` with deletes under readers.
-   Acceptance: the swap's lock hold below 40 ms at a million rows, and no change in the ordinary delete path.
+`memory_probe` (heap counted with a global allocator, not resident size, which allocators do not return) runs a sliding-window
+workload: each round adds 100,000 documents and deletes the oldest 90,000.
+
+| Round | Live | Dead | Heap, no compaction | Heap, current compaction (reopen) |
+|---|---|---|---|---|
+| 1 | 10,000 | 90,000 | 12.8 MB | 4.3 MB |
+| 3 | 30,000 | 270,000 | 36.5 MB | 6.1 MB |
+| 6 | 60,000 | 540,000 | 65.7 MB | 9.0 MB |
+
+- Each dead row costs about **105 bytes** of heap (from round 6: (65.7 − 9.0) MB over 540,000 dead rows). It is the row
+  entry (24 bytes), its postings (4 bytes per field), the id and key storage, and the table's spare capacity.
+- Without compaction, memory grows linearly with the total number of deletes, about 9.5 MB per round here, and never falls.
+- With the current compaction, memory follows the live set, because the reopen rebuilds everything.
+
+**The vector index is different.** `vector_memory_probe` (200,000 vectors, dimension 384): 46.7 MB after the adds, still
+46.7 MB after removing 90% (the allocation is kept), and 50.9 MB after adding 180,000 new vectors. TurboVec reuses the freed
+capacity, so the vector side is bounded by its peak live size. Only the document store accumulates dead rows.
+
+**What this means for the swap.** The swap in option C changes the row offsets and keeps the row table and the postings, so
+the dead rows stay in memory. Repeated swaps then grow memory exactly as no compaction does. So a swap alone cannot be the
+design: memory has to be reclaimed too, and reclaiming it means rebuilding the rows and the postings without the dead ones.
+
+Ways to reclaim, with the measured costs:
+
+| Way | Lock held for the reclaiming part | Reclaims memory | Status |
+|---|---|---|---|
+| R1. Reopen (current, via the replay) | 156 ms at 500,000 live rows, plus the rewrite | yes | the baseline |
+| R2. Rebuild the rows and indexes in the swap, under the lock | 80 ms or more at 500,000 rows (in-memory lower bound), plus the swap | yes | rejected: it holds the lock about as long as R1 |
+| R3. Build the new rows and indexes in the background from the snapshot (double buffering), then apply only the tail under the lock, and swap | the tail (writes since the snapshot, a few hundred frames), plus the swap: two syncs, one catalog write, a rename | yes | **the candidate**; not measured |
+| R4. Swap and keep dead rows until a reopen | the swap only | no: dead rows accumulate | rejected |
+
+R3 is the design to pursue. It needs the tail application to be an exact replay of the tail frames into the new structures,
+which is the same logic the reopen already uses, applied to a bounded number of frames.
+
+## Analysis of each stage of the swap
+
+The stages, in order. The lock column says whether the stage needs the collection lock.
+
+| Stage | Lock | Failure | Effect on disk | Effect in memory | Required action |
+|---|---|---|---|---|---|
+| S1 snapshot the live rows and the length `S` | leader op | none expected | none | none | none |
+| S2 build the new rows and indexes in the background (R3) | none | out of memory, or I/O error | none (the temporary log is written separately) | the new structures are discarded | drop them, delete the temporary log |
+| S3 rewrite the live PUT frames to the temporary log | none | I/O error | temporary log is partial | none | delete the temporary log |
+| S4 copy the tail (bytes after `S`) to the temporary log | leader op | I/O error | temporary log is partial | none | delete the temporary log |
+| S5 sync the temporary log | leader op | I/O error | none beyond S4 | none | delete the temporary log |
+| S6 record `durable_log_len = N` in the catalog | leader op | I/O error | `catalog.json` unchanged (atomic replace) | the in-memory catalog reverts | delete the temporary log |
+| S7 rename the temporary log over the log | leader op | I/O error (rename is atomic: old or new) | old log in place | none | delete the temporary log. The catalog's `N` is at most the old length, so reopening the old log passes the check |
+| S8 sync the directory | leader op | I/O error | the rename may or may not be durable | the file is new, the memory still matches the old file | **poison** the collection; reopen |
+| S9 apply the tail to the new structures, then swap them in | leader op | cannot fail once S8 has passed (CPU only) | new log in place | new structures in place | none beyond the swap itself |
+
+Every failure before S7 leaves the old log and the old catalog in a state that replays to the same documents. A failure at
+S8 leaves a new file that the memory does not match, which is why it poisons the collection. A reopen then replays the new
+log, which holds the same documents.
+
+## Crash and power-loss recovery
+
+Crash points (a process crash, and a power loss, which also loses unsynced data):
+
+- **Before S6:** the old log and the old catalog. The temporary log is removed on open. Nothing to do.
+- **After S6, before S7:** the old log, longer than `N`, with `durable_log_len = N`. The shortened-file check passes. The
+  temporary log is removed on open.
+- **After S7, before S8:** either the old log (length at least `N`) or the new log (length `N`), depending on whether the
+  rename reached the disk. Both pass the check, and both replay to the same documents.
+- **After S8:** the new log, length `N`. Reopen replays it. This is the same as any log of length `N`.
+- **Power loss during S5:** the temporary log is synced before the rename, so the rename never points at unsynced bytes.
+- **Power loss during S6:** the catalog's atomic replace syncs the file and the directory, which the catalog already does.
+
+The one ordering requirement is that `N` is recorded in the catalog before the rename, and that the temporary log is synced
+before the catalog write. With both, every crash point replays to the same documents.
+
+## Concurrent inserts and deletes during the rewrite
+
+- Writes during S2 and S3 append to the old log beyond `S`, and deletes append tombstones there too. Those bytes are the tail
+  copied in S4, so the new log holds the same history as the old one from `S` onward.
+- The rewrite reads only bytes below `S`, which never change, so it needs no lock.
+- A row deleted during the rewrite is still copied in S3, if it was live at `S`. Its tombstone is in the tail, so the replay
+  of the new log removes it, as the old log would.
+- A row added during the rewrite is not in the snapshot. It is in the tail, and R3 applies it to the new structures.
+- The model (`tests/test_compaction_model.py`) checks the logical claim over random interleavings: after every swap, the live
+  documents of the new log equal those of the old log, tag for tag. It held at 332,771 swaps. The model is of the protocol.
+
+## Tests in Rust (required before implementation)
+
+The Python model does not exercise the Rust code. The implementation needs these tests, using `cfg(test)` hooks in the same
+way as the existing window hooks:
+
+1. **Model-based test** extending `random_operations_agree_with_a_reference_model_across_reopens` with compactions forced at
+   random points, including while writes are in flight. After each swap and each reopen, the live documents match the
+   reference.
+2. **Writes during the rewrite:** pause the rewrite with a window hook, run adds, deletes and searches, then release it. The
+   results must equal a run without the background rewrite.
+3. **Crash points:** a copy of the directory taken at each stage (S6 done, S7 done, S8 done), then reopened. Each must match
+   the reference.
+4. **Failure injection:** one test per failing stage (S3, S4, S5, S6, S7, S8), each checking the state the stage leaves
+   (usable, or poisoned).
+5. **Memory:** after a swap with reclamation (R3), the heap in use must be close to the live set's size. Use the counting
+   allocator as in `memory_probe`, with a tolerance.
+6. **Lock hold:** `WriteStats` already records the duration of each exclusive hold. The swap's hold is measured from the
+   counters, not estimated.
+
+## Measurements still to make (once R3 exists)
+
+- The swap's lock hold, from `WriteStats`, at a million rows, with and without writes during the rewrite.
+- The reclamation: heap before and after a swap with R3, against the live set's size.
+- The rewrite's duration, which runs off the lock: it must not affect reader latency (measure with `concurrent_bench`).
 
 ## Decisions for review
 
-1. Approve option C, and its one-catalog-write ordering (record `N` before the rename, not after).
-2. Accept that dead rows stay in memory and in the postings until the next reopen. Compaction would then reclaim disk only.
-   The alternative is a background index rebuild, which is more work.
-3. Accept a temporary log of up to the live size on disk during a rewrite.
+1. Approve R3 (background build of the new structures, a tail apply and a swap) as the design, or ask for R1 (reopen) as
+   the baseline to keep.
+2. Accept the one-catalog-write ordering (record `N` before the rename).
+3. Accept that the swap's lock hold is a measured target (below 40 ms at a million rows), not an estimate, and that the
+   withdrawn estimate of 25 to 35 ms is not a target.

@@ -387,6 +387,9 @@ pub struct Collection {
     /// Test hook: the next log sync fails with an injected error.
     #[cfg(test)]
     fail_log_sync: std::sync::atomic::AtomicBool,
+    /// Test hook: the next staging of a batch fails with an injected error, as a failed log write would.
+    #[cfg(test)]
+    fail_stage: std::sync::atomic::AtomicBool,
 }
 
 impl Collection {
@@ -420,6 +423,8 @@ impl Collection {
             window_hook: Mutex::new(None),
             #[cfg(test)]
             fail_log_sync: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(test)]
+            fail_stage: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -634,6 +639,14 @@ impl Collection {
                 metadata: values.as_slice(),
             })
             .collect();
+        #[cfg(test)]
+        if self
+            .fail_stage
+            .swap(false, std::sync::atomic::Ordering::SeqCst)
+        {
+            let e = ZenarError::PersistenceError("injected staging failure".into());
+            return Err(StageError::Batch(poison(state, e)));
+        }
         let staged = state
             .docs
             .stage_puts(&refs)
@@ -2689,6 +2702,133 @@ mod recovery_tests {
         assert_eq!(c.count().unwrap(), 2);
         assert!(c.get(1).unwrap().is_some());
         c.add(2, &along(0.7, 2), "two", vec![]).unwrap();
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A failed staging poisons the collection, as a failed log write does, and nothing it staged is
+    /// visible. A reopen drops the staged documents, which have no vectors.
+    #[test]
+    fn failed_staging_poisons_and_reopen_drops_the_staged_documents() {
+        use std::sync::atomic::Ordering;
+        let dir = temp_dir("fail-stage");
+        {
+            let db = VectorDB::open(&dir).unwrap();
+            let c = db.create_collection("fs", Some(8), 4).unwrap();
+            c.add_many(
+                &(0..3)
+                    .map(|i| Record {
+                        id: i,
+                        vector: along(0.2, i),
+                        text: "kept".into(),
+                        metadata: vec![],
+                    })
+                    .collect::<Vec<_>>(),
+            )
+            .unwrap();
+            c.fail_stage.store(true, Ordering::SeqCst);
+            let batch: Vec<Record> = (10..14)
+                .map(|i| Record {
+                    id: i,
+                    vector: along(0.5, i),
+                    text: "staged".into(),
+                    metadata: vec![],
+                })
+                .collect();
+            assert!(matches!(
+                c.add_many(&batch),
+                Err(ZenarError::PersistenceError(_))
+            ));
+            assert!(matches!(c.count(), Err(ZenarError::PersistenceError(_))));
+            assert!(matches!(
+                c.add(20, &along(0.1, 20), "x", vec![]),
+                Err(ZenarError::PersistenceError(_))
+            ));
+        }
+        let db = VectorDB::open(&dir).unwrap();
+        let c = db.get_collection("fs").unwrap();
+        assert_eq!(c.count().unwrap(), 3);
+        for i in 10..14 {
+            assert!(c.get(i).unwrap().is_none());
+        }
+        c.add_many(&[Record {
+            id: 10,
+            vector: along(0.5, 10),
+            text: "again".into(),
+            metadata: vec![],
+        }])
+        .unwrap();
+        assert_eq!(c.count().unwrap(), 4);
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Writers send valid batches and rejected ones (a repeated id) to the same groups, while readers search.
+    /// Every valid batch commits, every rejected batch fails alone, and no search returns a repeated or
+    /// uncommitted id.
+    #[test]
+    fn rejected_group_members_under_concurrent_readers_do_not_disturb_the_rest() {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        let dir = temp_dir("rejected-readers");
+        let db = VectorDB::open(&dir).unwrap();
+        let c = db.create_collection("rr", Some(8), 4).unwrap();
+        c.add(0, &along(0.5, 0), "seed", vec![]).unwrap();
+        let stop = Arc::new(AtomicBool::new(false));
+        let committed = Arc::new(AtomicUsize::new(0));
+        let mut readers = Vec::new();
+        for _ in 0..2 {
+            let (c, stop) = (Arc::clone(&c), Arc::clone(&stop));
+            readers.push(thread::spawn(move || {
+                while !stop.load(Ordering::SeqCst) {
+                    let hits = c.search(&along(1.0, 0), 1000, None).unwrap();
+                    let mut ids: Vec<u64> = hits.iter().map(|h| h.id).collect();
+                    ids.sort_unstable();
+                    ids.dedup();
+                    assert_eq!(ids.len(), hits.len(), "repeated id in results");
+                }
+            }));
+        }
+        let mut writers = Vec::new();
+        for w in 0..3u64 {
+            let (c, committed) = (Arc::clone(&c), Arc::clone(&committed));
+            writers.push(thread::spawn(move || {
+                for b in 0..30u64 {
+                    let base = 1_000 + w * 1_000 + b * 10;
+                    let ids: Vec<u64> = if b % 3 == 0 {
+                        vec![base, base, base + 1] // a repeated id: rejected on its own
+                    } else {
+                        vec![base, base + 1, base + 2]
+                    };
+                    let records: Vec<Record> = ids
+                        .iter()
+                        .map(|&id| Record {
+                            id,
+                            vector: along(0.6, id),
+                            text: "w".into(),
+                            metadata: vec![],
+                        })
+                        .collect();
+                    match c.add_many(&records) {
+                        Ok(n) => {
+                            assert_ne!(b % 3, 0, "a rejected batch committed");
+                            committed.fetch_add(n, Ordering::SeqCst);
+                        }
+                        Err(e) => {
+                            assert_eq!(b % 3, 0, "a valid batch failed: {e:?}");
+                            assert!(matches!(e, ZenarError::DuplicateId(_)));
+                        }
+                    }
+                }
+            }));
+        }
+        for w in writers {
+            w.join().unwrap();
+        }
+        stop.store(true, Ordering::SeqCst);
+        for r in readers {
+            r.join().unwrap();
+        }
+        // Each writer sends 30 batches: 10 rejected, 20 valid of 3 records each.
+        assert_eq!(committed.load(Ordering::SeqCst), 3 * 20 * 3);
+        assert_eq!(c.count().unwrap(), 1 + 3 * 20 * 3);
         fs::remove_dir_all(&dir).ok();
     }
 }

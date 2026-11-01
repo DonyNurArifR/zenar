@@ -15,7 +15,15 @@ project follows [semantic versioning](https://semver.org/) while it is pre-1.0.
 - `RecoveryError` on open is raised before any file is truncated, and a missing document log is refused instead of
   recreated empty while the catalog says it held synced bytes.
 
+### Testing
+- Fault injection for staging: a failed `stage_puts` poisons the collection, and a reopen drops the staged documents.
+- A stress test: rejected group members (repeated ids) among valid writes, under concurrent readers. Valid writes commit,
+  rejected ones fail alone, and no search returns a repeated or uncommitted id.
+
 ### Documentation
+- COMPACTION.md: memory of dead rows (about 105 bytes each), the reclamation options, the analysis of every stage of a swap
+  and of crashes and power loss, and the Rust test plan. The background swap is not implemented.
+- CONCURRENCY.md: the staging breakdown and the decision not to move validation and encoding out of the lock.
 - ARCHITECTURE.md describes the metadata indexes: structures, lookup and update costs, memory, the alternatives that
   were measured and those that were not.
 - STORAGE.md states that the vector index and the document log are not one transaction. It covers the order of durable

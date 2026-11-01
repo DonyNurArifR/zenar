@@ -294,6 +294,23 @@ for the whole group. This is the saving that group commit makes on the sync path
 | 2 | 9.1 ms per batch | 5.1 ms per batch | 1.78x |
 | 4 | 8.9 ms per batch | 2.9 ms per batch | 3.07x |
 
+### Memory of dead rows and of the vector index (`memory_probe`, `vector_memory_probe`)
+
+Heap in use, counted with a global allocator (resident size is not used, because allocators keep freed pages).
+`memory_probe` runs a sliding window: each round adds 100,000 documents and deletes the oldest 90,000. Reproduce with
+`memory_probe -- 6 retain` and `memory_probe -- 6 compact`.
+
+| Round | Live | Dead | Heap, no compaction | Heap, compaction with reopen |
+|---|---|---|---|---|
+| 1 | 10,000 | 90,000 | 12.8 MB | 4.3 MB |
+| 3 | 30,000 | 270,000 | 36.5 MB | 6.1 MB |
+| 6 | 60,000 | 540,000 | 65.7 MB | 9.0 MB |
+
+A dead row costs about 105 bytes of heap. Without compaction, the store grows by about 9.5 MB per round. `vector_memory_probe`
+(200,000 vectors, dimension 384): 46.7 MB after the adds, 46.7 MB after removing 90%, and 50.9 MB after adding 180,000 new
+vectors. The vector index reuses its freed capacity, so only the document store accumulates dead rows. `docs/COMPACTION.md`
+discusses what this means for the compaction design.
+
 ### Delta scan cost (`delta_scan`, dimension 384, naive scalar loops)
 
 | Vectors scanned per query | Time per query |
