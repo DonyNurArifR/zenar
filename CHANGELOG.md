@@ -15,7 +15,16 @@ project follows [semantic versioning](https://semver.org/) while it is pre-1.0.
 - `RecoveryError` on open is raised before any file is truncated, and a missing document log is refused instead of
   recreated empty while the catalog says it held synced bytes.
 
+### Changed
+- Compaction records its new log length and the old length in the catalog before it renames the log, and clears that record
+  after the directory sync (the pending record, docs/R3.md). Opening settles an interrupted compaction by the rules in
+  docs/R3.md, section 5. Catalogs without the record read and write as before. A database with a pending record opened by an
+  older build would not know the record; the record exists only during a compaction.
+- A failed directory sync after a catalog rename keeps the new catalog in memory and reports the error.
+
 ### Testing
+- Crash tests at each compaction transition (copied directories), failure injection at each transition, a mutation check on
+  the reopen rules, and catalog failure injection before and after the rename.
 - Fault injection for staging: a failed `stage_puts` poisons the collection, and a reopen drops the staged documents.
 - A stress test: rejected group members (repeated ids) among valid writes, under concurrent readers. Valid writes commit,
   rejected ones fail alone, and no search returns a repeated or uncommitted id.

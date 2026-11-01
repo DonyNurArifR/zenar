@@ -79,6 +79,7 @@ impl VectorDB {
             let entry = catalog
                 .get(&name)?
                 .ok_or_else(|| ZenarError::RecoveryError(format!("{name} vanished")))?;
+            let entry = settle_compaction(&catalog, &root, &name, entry)?;
             let schema = entry.schema()?;
             let docs = open_or_create_docs(&root, &name, schema, entry.durable_log_len)?;
             let index_path = index_path(&root, &name);
@@ -163,6 +164,7 @@ impl VectorDB {
         self.catalog.insert(Entry {
             durable_log_len: 0,
             durable_vectors: 0,
+            compaction_pending: None,
             name: name.to_string(),
             dimension,
             bit_width,
@@ -255,6 +257,53 @@ impl VectorDB {
         sync_parent(&self.root.join("docs"))?;
         Ok(())
     }
+}
+
+/// Settles a compaction that did not finish, by the rules of docs/R3.md, section 5. The temporary log is
+/// removed: it is never the log. If a pending record exists, the log's length says which side of the rename
+/// the crash was on:
+///
+/// - the new length: the rename happened. The pending record is cleared.
+/// - the old length: the rename did not happen, or was undone. The recorded length goes back to the old
+///   length, and the pending record is cleared.
+/// - any other length, or no log: the log was changed outside Zenar. Opening refuses.
+fn settle_compaction(
+    catalog: &Catalog,
+    root: &Path,
+    name: &str,
+    entry: Entry,
+) -> Result<Entry, ZenarError> {
+    let log = docs_path(root, name);
+    let _ = fs::remove_file(log.with_extension("log.compact"));
+    let Some(old_len) = entry.compaction_pending else {
+        return Ok(entry);
+    };
+    let file_len = fs::metadata(&log)
+        .map_err(|_| {
+            ZenarError::RecoveryError(format!(
+                "collection {name:?}: a compaction was interrupted and the log is missing"
+            ))
+        })?
+        .len();
+    let settled = if file_len == entry.durable_log_len {
+        entry.durable_log_len
+    } else if file_len == old_len {
+        old_len
+    } else {
+        return Err(ZenarError::RecoveryError(format!(
+            "collection {name:?}: a compaction was interrupted, and the log is {file_len} bytes, which is \
+             neither the compacted length {} nor the length before it, {old_len}. The log was changed \
+             outside Zenar",
+            entry.durable_log_len
+        )));
+    };
+    catalog.update(name, |e| {
+        e.durable_log_len = settled;
+        e.compaction_pending = None;
+    })?;
+    catalog
+        .get(name)?
+        .ok_or_else(|| ZenarError::RecoveryError(format!("{name} vanished")))
 }
 
 /// Opens a collection's document log. Creates an empty one if it is missing and nothing was synced to it.

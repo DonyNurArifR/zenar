@@ -292,6 +292,11 @@ impl DocStore {
         &self.fields
     }
 
+    /// Path of the log file.
+    pub fn log_path(&self) -> &Path {
+        &self.path
+    }
+
     /// Length of the log file in bytes, as written. Used to record how far it is synced.
     pub fn log_len(&self) -> u64 {
         self.len
@@ -527,13 +532,15 @@ impl DocStore {
         dead > 4096 && dead > live
     }
 
-    /// Rewrites the log with only live documents, then replaces the old log atomically.
-    ///
-    /// The old log stays valid until the rename. Windows refuses to rename over a file that is
-    /// still open, so the append handle is released first and reopened afterwards, on both the
-    /// success path and the failure path.
-    pub fn compact(&mut self) -> Result<(), ZenarError> {
-        let tmp = self.path.with_extension("log.compact");
+    /// The path of the temporary log that a compaction writes.
+    pub fn compaction_temp_path(&self) -> PathBuf {
+        self.path.with_extension("log.compact")
+    }
+
+    /// Writes the live documents to the temporary log and syncs it. The log itself is unchanged. The
+    /// caller replaces the log with `rename_compacted`, and then `reopen`s it.
+    pub fn write_compacted(&mut self) -> Result<PathBuf, ZenarError> {
+        let tmp = self.compaction_temp_path();
         let out = File::create(&tmp).map_err(io_err)?;
         // Live rows were appended in log order, so their payload offsets ascend.
         let wanted: Vec<(u64, u32)> = self
@@ -546,18 +553,38 @@ impl DocStore {
         copy_live_frames(&self.path, &wanted, &mut out)?;
         let out = out.into_inner().map_err(|e| io_err(e.into_error()))?;
         out.sync_all().map_err(io_err)?;
-        drop(out);
+        Ok(tmp)
+    }
 
+    /// Renames the temporary log over the log. The append handle is released first (Windows refuses to
+    /// rename over an open file). If the rename fails, the old log is reopened, the temporary log is
+    /// removed, and the error is returned: nothing has changed.
+    pub fn rename_compacted(&mut self, tmp: &Path) -> Result<(), ZenarError> {
         self.file = None;
-        if let Err(e) = fs::rename(&tmp, &self.path) {
-            let _ = fs::remove_file(&tmp);
+        if let Err(e) = fs::rename(tmp, &self.path) {
+            let _ = fs::remove_file(tmp);
             self.file = Some(open_log(&self.path).map_err(io_err)?);
             return Err(io_err(e));
         }
-        sync_parent(&self.path)?;
+        Ok(())
+    }
+
+    /// Reopens the log by replaying it. Used after the log has been replaced.
+    pub fn reopen(&mut self) -> Result<(), ZenarError> {
         let fields = self.fields.clone();
         *self = Self::open(&self.path.clone(), fields)?;
         Ok(())
+    }
+
+    /// Rewrites the log with only live documents, then replaces the old log atomically.
+    ///
+    /// The old log stays valid until the rename. Any error after the rename leaves the in-memory log
+    /// stale, so the caller must poison the collection (see `Collection::compact_locked`).
+    pub fn compact(&mut self) -> Result<(), ZenarError> {
+        let tmp = self.write_compacted()?;
+        self.rename_compacted(&tmp)?;
+        sync_parent(&self.path)?;
+        self.reopen()
     }
 
     fn handle(&self) -> Result<&File, ZenarError> {

@@ -94,6 +94,10 @@ struct State {
     closed: bool,
 }
 
+/// A test observer of the compaction transitions.
+#[cfg(test)]
+type CompactionHook = Arc<dyn Fn(&'static str) + Send + Sync>;
+
 /// Largest group size counted separately in `WriteStats`. Bigger groups share the last bucket.
 pub const GROUP_BUCKETS: usize = 16;
 
@@ -384,6 +388,11 @@ pub struct Collection {
     /// Test hook that runs while a write has released `state` and is syncing its log.
     #[cfg(test)]
     window_hook: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
+    /// Test hooks at each compaction transition: an observer, and one point that fails.
+    #[cfg(test)]
+    compaction_hook: Mutex<Option<CompactionHook>>,
+    #[cfg(test)]
+    fail_compaction_at: Mutex<Option<&'static str>>,
     /// Test hook: the next log sync fails with an injected error.
     #[cfg(test)]
     fail_log_sync: std::sync::atomic::AtomicBool,
@@ -421,6 +430,10 @@ impl Collection {
             }),
             #[cfg(test)]
             window_hook: Mutex::new(None),
+            #[cfg(test)]
+            compaction_hook: Mutex::new(None),
+            #[cfg(test)]
+            fail_compaction_at: Mutex::new(None),
             #[cfg(test)]
             fail_log_sync: std::sync::atomic::AtomicBool::new(false),
             #[cfg(test)]
@@ -819,9 +832,9 @@ impl Collection {
         state.docs.commit(staged);
         state.unsynced = 0;
         if state.docs.should_compact() {
-            // Compaction is best effort. A failure after the rename leaves the in-memory log stale,
-            // so it poisons the collection. Failure before the rename changes nothing.
-            if let Err(e) = state.docs.compact() {
+            // Any failure in the compaction poisons the collection. A reopen then settles it by the rules in
+            // database.rs (docs/R3.md, section 5).
+            if let Err(e) = self.compact_locked(&mut state) {
                 return Err(poison(&mut state, e));
             }
         }
@@ -1313,7 +1326,69 @@ impl Collection {
         self.catalog.update(&self.name, |entry| {
             entry.durable_log_len = log_len;
             entry.durable_vectors = vectors;
+            // Recording the lengths also ends any compaction that was recorded as pending.
+            entry.compaction_pending = None;
         })
+    }
+
+    /// Replaces the log with its compacted form, with the catalog transitions of docs/R3.md, section 4:
+    ///
+    /// 1. write the live documents to the temporary log, and sync it;
+    /// 2. record the new length and the old length in the catalog (P1), before the rename;
+    /// 3. rename the temporary log over the log, and sync the directory;
+    /// 4. reopen the log by replay;
+    /// 5. record the lengths and clear the pending record (P4).
+    ///
+    /// Every failure returns an error, and the caller poisons the collection. Writes do not resume until
+    /// P4 is durable, so the log is only ever one of the two lengths the catalog can name.
+    fn compact_locked(&self, state: &mut State) -> Result<(), ZenarError> {
+        self.compaction_point("before temp log")?;
+        let tmp = state.docs.write_compacted()?;
+        self.compaction_point("temp log synced")?;
+        let new_len = std::fs::metadata(&tmp)
+            .map_err(crate::docstore::io_err)?
+            .len();
+        let old_len = state.docs.log_len();
+        self.catalog.update(&self.name, |entry| {
+            entry.durable_log_len = new_len;
+            entry.compaction_pending = Some(old_len);
+        })?;
+        self.compaction_point("pending recorded")?;
+        state.docs.rename_compacted(&tmp)?;
+        self.compaction_point("renamed")?;
+        crate::docstore::sync_parent(state.docs.log_path())?;
+        self.compaction_point("directory synced")?;
+        state.docs.reopen()?;
+        self.compaction_point("reopened")?;
+        self.record_durable(state)?;
+        self.compaction_point("pending cleared")?;
+        Ok(())
+    }
+
+    /// Test hook at each transition of a compaction. A hook can observe the directory (to copy it, as a
+    /// crash would leave it), and a configured point fails with an injected error.
+    #[cfg(test)]
+    fn compaction_point(&self, point: &'static str) -> Result<(), ZenarError> {
+        let hook = self.compaction_hook.lock().ok().and_then(|h| h.clone());
+        if let Some(hook) = hook {
+            hook(point);
+        }
+        let mut fail = self
+            .fail_compaction_at
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        if *fail == Some(point) {
+            *fail = None;
+            return Err(ZenarError::PersistenceError(format!(
+                "injected failure at {point}"
+            )));
+        }
+        Ok(())
+    }
+
+    #[cfg(not(test))]
+    fn compaction_point(&self, _point: &'static str) -> Result<(), ZenarError> {
+        Ok(())
     }
 
     fn read_state(&self) -> Result<RwLockReadGuard<'_, State>, ZenarError> {
@@ -2829,6 +2904,295 @@ mod recovery_tests {
         // Each writer sends 30 batches: 10 rejected, 20 valid of 3 records each.
         assert_eq!(committed.load(Ordering::SeqCst), 3 * 20 * 3);
         assert_eq!(c.count().unwrap(), 1 + 3 * 20 * 3);
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The transitions of a compaction, in order (see `compact_locked`).
+    const COMPACTION_POINTS: [&str; 7] = [
+        "before temp log",
+        "temp log synced",
+        "pending recorded",
+        "renamed",
+        "directory synced",
+        "reopened",
+        "pending cleared",
+    ];
+
+    /// A collection with 10,000 committed documents and 6,000 of them deleted, which is the state in which the
+    /// delete compacts. Returns the database and the collection.
+    fn compacting_fixture(dir: &Path) -> (VectorDB, Arc<Collection>) {
+        let db = VectorDB::open(dir).unwrap();
+        let c = db.create_collection("cp", Some(8), 4).unwrap();
+        for chunk in (0..10_000u64).collect::<Vec<_>>().chunks(1000) {
+            let records: Vec<Record> = chunk
+                .iter()
+                .map(|&i| Record {
+                    id: i,
+                    vector: along(0.1 + (i % 50) as f32 * 0.01, i),
+                    text: format!("doc {i}"),
+                    metadata: vec![],
+                })
+                .collect();
+            c.add_many(&records).unwrap();
+        }
+        db.flush().unwrap();
+        (db, c)
+    }
+
+    /// The documents a reopened compaction fixture must hold: ids 6000..10000, and nothing deleted.
+    fn check_compacting_fixture(db: &VectorDB) {
+        let c = db.get_collection("cp").unwrap();
+        assert_eq!(c.count().unwrap(), 4000);
+        assert!(c.get(5999).unwrap().is_none());
+        assert!(c.get(6000).unwrap().is_some());
+        assert!(c.get(9999).unwrap().is_some());
+    }
+
+    /// The catalog file of a database, as text.
+    fn catalog_text(dir: &Path) -> String {
+        fs::read_to_string(dir.join("catalog.json")).unwrap()
+    }
+
+    /// A catalog written before the pending record existed reads as before, and is written as before.
+    #[test]
+    fn catalog_without_the_pending_field_reads_and_writes_as_before() {
+        let dir = temp_dir("catalog-compat");
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("catalog.json");
+        fs::write(
+            &path,
+            r#"{"version":3,"collections":[{"name":"x","dimension":8,"bit_width":4,"fields":[],"durable_log_len":5,"durable_vectors":2}]}"#,
+        )
+        .unwrap();
+        let catalog = Catalog::open(&path).unwrap();
+        let entry = catalog.get("x").unwrap().unwrap();
+        assert_eq!(entry.compaction_pending, None);
+        assert_eq!(entry.durable_log_len, 5);
+        catalog.update("x", |e| e.durable_vectors = 3).unwrap();
+        assert!(!catalog_text(&dir).contains("compaction_pending"));
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A pending record round-trips through the catalog file.
+    #[test]
+    fn pending_record_round_trips() {
+        let dir = temp_dir("catalog-pending");
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("catalog.json");
+        fs::write(
+            &path,
+            r#"{"version":3,"collections":[{"name":"x","dimension":8,"bit_width":4,"fields":[],"durable_log_len":5,"durable_vectors":2}]}"#,
+        )
+        .unwrap();
+        let catalog = Catalog::open(&path).unwrap();
+        catalog
+            .update("x", |e| e.compaction_pending = Some(9))
+            .unwrap();
+        drop(catalog);
+        let reopened = Catalog::open(&path).unwrap();
+        assert_eq!(
+            reopened.get("x").unwrap().unwrap().compaction_pending,
+            Some(9)
+        );
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A catalog write that fails before its rename leaves the file and the memory as they were.
+    #[test]
+    fn catalog_failure_before_rename_reverts_memory_and_keeps_the_file() {
+        use std::sync::atomic::Ordering;
+        let dir = temp_dir("catalog-fail-before");
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("catalog.json");
+        fs::write(
+            &path,
+            r#"{"version":3,"collections":[{"name":"x","dimension":8,"bit_width":4,"fields":[],"durable_log_len":5,"durable_vectors":2}]}"#,
+        )
+        .unwrap();
+        let catalog = Catalog::open(&path).unwrap();
+        let before = catalog_text(&dir);
+        catalog
+            .fail_persist_before_rename
+            .store(true, Ordering::SeqCst);
+        assert!(catalog.update("x", |e| e.durable_log_len = 99).is_err());
+        assert_eq!(catalog.get("x").unwrap().unwrap().durable_log_len, 5);
+        assert_eq!(catalog_text(&dir), before);
+        assert!(!path.with_extension("json.tmp").exists());
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A catalog write that fails after its rename keeps the new value in memory, and reports the error,
+    /// because the file holds the new value.
+    #[test]
+    fn catalog_failure_after_rename_keeps_the_new_value() {
+        use std::sync::atomic::Ordering;
+        let dir = temp_dir("catalog-fail-after");
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("catalog.json");
+        fs::write(
+            &path,
+            r#"{"version":3,"collections":[{"name":"x","dimension":8,"bit_width":4,"fields":[],"durable_log_len":5,"durable_vectors":2}]}"#,
+        )
+        .unwrap();
+        let catalog = Catalog::open(&path).unwrap();
+        catalog
+            .fail_persist_after_rename
+            .store(true, Ordering::SeqCst);
+        assert!(catalog.update("x", |e| e.durable_log_len = 99).is_err());
+        assert_eq!(catalog.get("x").unwrap().unwrap().durable_log_len, 99);
+        drop(catalog);
+        assert_eq!(
+            Catalog::open(&path)
+                .unwrap()
+                .get("x")
+                .unwrap()
+                .unwrap()
+                .durable_log_len,
+            99
+        );
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Every transition of a compaction, copied as a crash would leave it, reopens to the committed documents.
+    /// This is the 17-state table of docs/R3.md, section 5, for the synchronous compaction: each copy is a
+    /// state the process could be killed in, and each must reopen without loss or refusal.
+    #[test]
+    fn crash_at_every_compaction_transition_reopens_to_the_committed_documents() {
+        let dir = temp_dir("crash-transitions");
+        let copies = temp_dir("crash-transitions-copies");
+        let (db, c) = compacting_fixture(&dir);
+        let (src, dst) = (dir.clone(), copies.clone());
+        *c.compaction_hook.lock().unwrap() = Some(Arc::new(move |point: &'static str| {
+            copy_tree(&src, &dst.join(point.replace(' ', "_")));
+        }));
+        assert_eq!(
+            c.delete_many(&(0..6000).collect::<Vec<u64>>()).unwrap(),
+            6000
+        );
+        *c.compaction_hook.lock().unwrap() = None;
+        drop(c);
+        drop(db);
+        // The original reopens too.
+        check_compacting_fixture(&VectorDB::open(&dir).unwrap());
+        for point in COMPACTION_POINTS {
+            let copy = copies.join(point.replace(' ', "_"));
+            assert!(copy.exists(), "no copy at {point}");
+            let recovered = VectorDB::open(&copy).unwrap_or_else(|e| panic!("{point}: {e:?}"));
+            check_compacting_fixture(&recovered);
+        }
+        fs::remove_dir_all(&dir).ok();
+        fs::remove_dir_all(&copies).ok();
+    }
+
+    /// A failure at each transition poisons the collection, and reopening recovers the committed documents
+    /// and a usable collection.
+    #[test]
+    fn failure_at_each_compaction_transition_poisons_and_reopen_recovers() {
+        for point in COMPACTION_POINTS {
+            let dir = temp_dir(&format!("fail-{}", point.replace(' ', "-")));
+            let (db, c) = compacting_fixture(&dir);
+            *c.fail_compaction_at.lock().unwrap() = Some(point);
+            assert!(
+                c.delete_many(&(0..6000).collect::<Vec<u64>>()).is_err(),
+                "{point}"
+            );
+            assert!(
+                matches!(c.count(), Err(ZenarError::PersistenceError(_))),
+                "{point}"
+            );
+            drop(c);
+            drop(db);
+            let db = VectorDB::open(&dir).unwrap_or_else(|e| panic!("{point}: {e:?}"));
+            check_compacting_fixture(&db);
+            let c = db.get_collection("cp").unwrap();
+            c.add(20_000, &along(0.3, 20_000), "after", vec![]).unwrap();
+            assert_eq!(c.count().unwrap(), 4001, "{point}");
+            fs::remove_dir_all(&dir).ok();
+        }
+    }
+
+    /// A catalog write that fails while the pending record is recorded poisons the collection. The pending
+    /// record is not on disk, so the reopen sees the old log and the old lengths.
+    #[test]
+    fn failed_pending_record_leaves_the_old_log_and_reopen_recovers() {
+        use std::sync::atomic::Ordering;
+        let dir = temp_dir("fail-pending-write");
+        let (db, c) = compacting_fixture(&dir);
+        // Arm the catalog failure at the point just before the pending record is written. The lowering write
+        // of the delete runs earlier and is not the one that fails.
+        let catalog = Arc::clone(&c.catalog);
+        *c.compaction_hook.lock().unwrap() = Some(Arc::new(move |point: &'static str| {
+            if point == "temp log synced" {
+                catalog
+                    .fail_persist_before_rename
+                    .store(true, Ordering::SeqCst);
+            }
+        }));
+        assert!(c.delete_many(&(0..6000).collect::<Vec<u64>>()).is_err());
+        *c.compaction_hook.lock().unwrap() = None;
+        drop(c);
+        drop(db);
+        check_compacting_fixture(&VectorDB::open(&dir).unwrap());
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A pending record whose log is neither the old nor the new length refuses to open: the log changed
+    /// outside Zenar, and recovery cannot tell which state it is in.
+    #[test]
+    fn pending_compaction_with_an_unexpected_log_length_refuses_to_open() {
+        let dir = temp_dir("pending-unexpected");
+        let copies = temp_dir("pending-unexpected-copy");
+        let (db, c) = compacting_fixture(&dir);
+        let (src, dst) = (dir.clone(), copies.clone());
+        *c.compaction_hook.lock().unwrap() = Some(Arc::new(move |point: &'static str| {
+            if point == "pending recorded" {
+                copy_tree(&src, &dst);
+            }
+        }));
+        c.delete_many(&(0..6000).collect::<Vec<u64>>()).unwrap();
+        *c.compaction_hook.lock().unwrap() = None;
+        drop(c);
+        drop(db);
+        // The copy holds pending = old length, with the old log. Truncate the log to a third length.
+        let log = copies.join("docs").join("cp.zdocs");
+        let len = fs::metadata(&log).unwrap().len();
+        fs::OpenOptions::new()
+            .write(true)
+            .open(&log)
+            .unwrap()
+            .set_len(len - 7)
+            .unwrap();
+        let before = fs::read(&log).unwrap();
+        assert!(matches!(
+            VectorDB::open(&copies),
+            Err(ZenarError::RecoveryError(_))
+        ));
+        assert_eq!(
+            fs::read(&log).unwrap(),
+            before,
+            "a refused open must not change the log"
+        );
+        fs::remove_dir_all(&dir).ok();
+        fs::remove_dir_all(&copies).ok();
+    }
+
+    /// The power-loss rows of the crash table depend on the order of the transitions: the temporary log is
+    /// synced before the pending record, the pending record is written before the rename, and the lengths are
+    /// recorded after the directory sync. This test pins that order.
+    #[test]
+    fn compaction_transitions_run_in_the_documented_order() {
+        let dir = temp_dir("compaction-order");
+        let (db, c) = compacting_fixture(&dir);
+        let seen = Arc::new(Mutex::new(Vec::<&'static str>::new()));
+        let log = Arc::clone(&seen);
+        *c.compaction_hook.lock().unwrap() = Some(Arc::new(move |point: &'static str| {
+            log.lock().unwrap().push(point);
+        }));
+        c.delete_many(&(0..6000).collect::<Vec<u64>>()).unwrap();
+        *c.compaction_hook.lock().unwrap() = None;
+        assert_eq!(*seen.lock().unwrap(), COMPACTION_POINTS.to_vec());
+        drop(c);
+        drop(db);
         fs::remove_dir_all(&dir).ok();
     }
 }

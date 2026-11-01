@@ -117,7 +117,9 @@ If a file is found shorter than that, something outside Zenar truncated or remov
 - a missing log, which is refused and not recreated empty, while the catalog says it held synced bytes;
 - a vector index shorter than its recorded count, or missing.
 
-A file damaged in its middle fails the same way, with its own named error. Databases created before this rule have no
+A compaction that was interrupted is settled on open by the catalog's pending record (docs/R3.md, section 5): the log is
+either the compacted length or the length before the compaction, and anything else refuses to open. A file damaged in its
+middle fails the same way, with its own named error. Databases created before this rule have no
 recorded lengths, so the check does not apply to them.
 
 A delete lowers the recorded lengths before it changes anything on disk. The index loses one vector per deleted document
