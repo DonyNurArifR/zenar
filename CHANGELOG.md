@@ -21,6 +21,11 @@ project follows [semantic versioning](https://semver.org/) while it is pre-1.0.
   successful swap, and the next delete starts the next attempt.
 
 ### Changed
+- Unfiltered search over-fetches at most 64 extra candidates for uncommitted writes on its first pass, and retries with
+  the full extra only when that leaves fewer than `top_k` committed results and more than 64 are pending. The collector
+  buffers TurboVec allocates per search scale with `k`, so this cuts the transient allocation of concurrent search and
+  write from about 94 MB to about 11 MB at 8 readers, batch 1,000 and 200,000 documents. Visibility and availability of
+  results are unchanged; the approximate ranking can differ slightly under load.
 - Compaction runs in the background. A build writes the live documents without the collection lock, and only the swap
   holds it, for about 20 ms at 200,000 live documents. Searches during a build keep their latency: p95 12.6 ms against
   74 ms for the blocking compaction it replaces. Peak heap during a build rises, because the old and new row tables both

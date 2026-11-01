@@ -69,7 +69,8 @@ and the log sync among its writes, and a failure rolls back the whole group (doc
    is removed, the index is synced again, and the log is truncated back. If the re-sync or the truncation fails, the
    collection is poisoned.
    Between the index sync and the commit, the vector is in the index and its document is not committed. Searches
-   exclude such documents, and ask for extra results to make up for them (see the search rule in ARCHITECTURE.md).
+   exclude such documents, and ask for up to 64 extra results to make up for them, retrying with all of the pending count
+   only when that is not enough (see the search rule in ARCHITECTURE.md).
 
 ### `add_many`
 

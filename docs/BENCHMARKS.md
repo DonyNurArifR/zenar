@@ -414,6 +414,53 @@ same time and no compaction, the peak rose by +121.6 MB at 200,000 documents, wi
 alone +1.7 MB. The same probe at commit `a3c17ff` (before R3) gives the same figures. The spike is an existing transient
 in the concurrent write path. Its cause is not yet identified, and it is the larger memory issue for production use.
 
+### Search under concurrent writes: bounded over-fetch (`bench_search_workload`)
+
+The production crate, 200,000 live documents, dimension 64, 8 reader threads running unfiltered top-10 searches, and one
+writer adding batches of the stated size, for 5 s. Reproduce with `BATCH=1000 cargo test --release -p zenar-core
+bench_search_workload -- --ignored --nocapture` (the test is in `crates/zenar-core/src/bench_search.rs`; `HOT=8` adds the
+adversarial case). Transient is the peak heap minus the heap at the end of the window, so retained data growth is not
+counted. "Before" is commit `27535e5`, which searches with `k = top_k + pending`. "After" searches with
+`k = top_k + min(pending, 64)` and retries with the full `k` only when fewer than `top_k` committed results come back and
+more than 64 are pending. Measured.
+
+| Batch | Before: search/s, p50 / p95 / p99 ms | After: search/s, p50 / p95 / p99 ms | Before: transient | After: transient | Before: writer batches/s, p50 / p95 ms | After: writer batches/s, p50 / p95 ms | Before: allocations per search | After: allocations per search | Retries after |
+|---|---|---|---|---|---|---|---|---|---|
+| 50 | 5,697: 0.72 / 5.10 / 5.67 | 6,331: 0.69 / 4.71 / 5.46 | 7.0 MB | 6.3 MB | 121: 8.09 / 9.57 | 121: 8.00 / 9.73 | 490 (1.07 MB) | 491 (1.08 MB) | 0 |
+| 200 | 2,925: 1.80 / 6.81 / 7.27 | 4,722: 0.85 / 5.48 / 6.99 | 19.7 MB | 5.4 MB | 109: 9.08 / 10.46 | 120: 7.99 / 10.23 | 1,271 (2.32 MB) | 683 (1.04 MB) | 0 |
+| 1,000 | 2,435: 0.59 / 14.52 / 15.43 | 5,699 to 6,040: 0.71 / 5.98 to 6.10 / 6.49 to 7.64 | 94.1 MB | 10.2 to 13.7 MB | 57: 15.84 / 20.53 | 95: 9.47 / 11.39 | 2,265 (3.48 MB) | 935 to 1,000 (0.91 MB) | 0 |
+| 5,000 | 2,650: 0.50 / 14.11 / 52.78 | 5,498: 0.63 / 9.60 / 10.80 | 469.9 MB | 31.8 MB | 15: 57.14 / 78.02 | 51: 15.55 / 21.61 | 2,637 (4.25 MB) | 1,946 (0.83 MB) | 0 |
+
+The batch-1,000 "after" row is four runs (the transient varied from 10.2 to 13.7 MB); the other rows are single runs.
+
+Adversarial, batch 1,000, `HOT=8` (readers query 8 vectors and every write is a copy of one of them). Before was measured
+in the same build with the cap disabled, which is the old behaviour:
+
+| | Search/s, p50 / p95 / p99 ms | Transient | Allocations and bytes per search | Writer batches/s, p50 ms | Retries |
+|---|---|---|---|---|---|
+| Before | 1,155: 3.00 / 18.14 / 19.66 | 111.2 MB | 4,578 and 12.6 MB | not recorded | none |
+| After | 2,480: 1.86 / 7.99 / 10.14 | 10.5 MB | 1,726 and 2.96 MB | 83: 10.95 | 8 of 12,419 searches (0.06%) |
+
+With `HOT=8` at batch 5,000 the after run had 12 retries in 12,117 searches (0.10%) and a 34.8 MB transient.
+
+Why retries are rare: a retry needs more than 64 of the first pass's `top_k + 64` candidates to be uncommitted, so that
+fewer than `top_k` are committed. Pending vectors must therefore outrank nearly all committed vectors for that query.
+Earlier batches are committed, so pending copies usually compete with committed copies rather than replacing them. The
+hot workload retried in 0.06% to 0.10% of searches.
+
+Agreement with the scratchpad prototype at cap 64 (measured before this change, `scratchpad` experiment, not production):
+transient 8.0 MB, 5,683 searches per second, p95 6.2 ms, writer p50 10.0 ms, 983 allocations per search. The production
+run gives 10.2 to 13.7 MB, 5,699 to 6,040 per second, p95 6.0 to 6.1 ms, writer p50 9.5 ms, and 935 to 1,000 allocations per
+search. Throughput, latency and allocation counts agree to within the run-to-run spread. The transient differs by about
+2 to 6 MB. The prototype was a single run, and repeated runs of the cap-16 prototype spread from 11 to 14 MB, so the
+difference is within the spread of the measurement. The production path also does the same document fetch, so it is not
+a source of the difference.
+
+Recall, measured at the index level and not part of the production benchmark: TurboVec's scores are approximate, and
+recall@10 against an exact committed-set reference rises with `k`. For 1,000 pending vectors, recall was 0.80 at cap 16,
+0.82 at cap 64, 0.83 at cap 256, and 0.84 with the old `k = top_k + pending`. This is the ranking variation under load
+that `docs/CONCURRENCY.md` and `docs/ARCHITECTURE.md` describe.
+
 ### Delta scan cost (`delta_scan`, dimension 384, naive scalar loops)
 
 | Vectors scanned per query | Time per query |

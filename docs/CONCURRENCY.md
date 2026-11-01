@@ -93,9 +93,14 @@ the first and third sections.
 Between the index sync and the commit, a write's vectors are in the index and its documents are not committed.
 
 - **Filtered search** is unaffected. Candidates come from the document indexes, which change only at commit.
-- **Unfiltered search** ranks over the index. It asks TurboVec for `top_k` plus the number of pending vectors, drops the
-  hits that have no committed document, and returns the first `top_k` that remain. Pending vectors are at most one
-  write's batch, so `top_k` committed results come back whenever that many committed documents exist.
+- **Unfiltered search** ranks over the index and drops the hits that have no committed document. It asks TurboVec for
+  `top_k` plus at most 64 extra (`min(pending, 64)`, the bounded over-fetch). If the first pass returns fewer than
+  `top_k` committed documents, and more than 64 vectors are pending, the search retries once with the full
+  `top_k + pending`. Both passes run under one read guard, so they see the same index and the same pending count. The
+  retry is the only case that asks for more than 64 extra, and it runs only when the first pass cannot supply `top_k`
+  committed results. The result returns `top_k` committed documents whenever that many exist, and all committed
+  documents that the index holds otherwise. Arithmetic saturates, so a very large `top_k` cannot overflow.
+  `SEARCH_OVERFETCH_CAP` in `collection.rs` holds the cap of 64.
 - **`get` and `count`** reflect committed state only, as before.
 - **A delete** removes its vector in the first section, so search stops returning the document at once. `get` still
   returns it until the commit. Search skips a removed vector without shrinking the result, since the removed vector
@@ -180,7 +185,7 @@ that covers it. The tests are in `crates/zenar-core/src/collection.rs` unless no
 | Requirement | Where it is enforced | Test |
 |---|---|---|
 | Pending vectors are never exposed as committed documents | `get` and `count` read only committed documents. Search keeps only hits with a committed document. | `pending_documents_are_invisible_to_get_count_and_search`, `search_in_window_returns_full_top_k_from_committed_documents`, `filtered_search_in_window_never_returns_uncommitted_documents` |
-| `top_k` correct, unfiltered and filtered | Unfiltered search asks for `top_k` plus the pending count. Filtered search ranks only committed candidates, so it needs no extra. | the same, and `acknowledged_writes_are_seen_and_acknowledged_deletes_are_not` (top_k 10,000 across concurrent writes) |
+| `top_k` correct, unfiltered and filtered | Unfiltered search over-fetches `min(pending, 64)` and retries with the full `top_k + pending` only when the first pass has fewer than `top_k` committed results. Filtered search ranks only committed candidates, so it needs no extra. | `search_overfetch_tests` in `collection.rs` (no pending, pending at and above the cap, a crowded first pass, fewer committed than `top_k`, no committed documents, rollback, deletes, concurrent writes, and an overflowing `top_k`); `acknowledged_writes_are_seen_and_acknowledged_deletes_are_not` (top_k 10,000 across concurrent writes) |
 | Distance metrics | Zenar has one metric: the inner product, which TurboVec computes. No other metric is offered, so there is none to check. The scores are approximate, because the vectors are quantized to 4 bits, so the order is approximate too. | `non_multiple_of_8_dimension_is_padded_and_ranks_correctly` in `storage.rs`. The audit checked which results may appear, not that they match exact scores. |
 | Concurrent insert, update and delete do not expose inconsistent results | There is no update operation. Insert and delete are queued and grouped. A search never returns a delete acknowledged before it starts, and never misses an insert acknowledged before it starts. | `acknowledged_writes_are_seen_and_acknowledged_deletes_are_not`, `concurrent_inserts_and_searches_return_committed_full_results`, `tests/test_concurrency.py` |
 | A failed log sync rolls back the affected writes | `rollback_batch` removes the vectors, re-syncs the index, and truncates the log to the group's start. | `failed_log_sync_in_window_rolls_back_and_stays_usable`, `group_that_fails_its_log_sync_rolls_back_every_member` |

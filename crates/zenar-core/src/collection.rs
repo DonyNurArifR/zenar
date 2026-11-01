@@ -20,6 +20,10 @@ pub const MAX_ID: u64 = i64::MAX as u64;
 /// Scopes whose statistics are kept between calls.
 const SCOPE_CACHE_ENTRIES: usize = 16;
 
+/// The most uncommitted vectors an unfiltered search over-fetches for on its first pass. Above it, a search
+/// retries with the full over-fetch, and only when the first pass returned fewer than `top_k` committed results.
+const SEARCH_OVERFETCH_CAP: usize = 64;
+
 /// Statistics for one scope, as cached by `Collection::stats_for_scope`.
 struct ScopedEntry {
     key: String,
@@ -477,6 +481,9 @@ pub struct Collection {
     /// Test hook: the next staging of a batch fails with an injected error, as a failed log write would.
     #[cfg(test)]
     fail_stage: std::sync::atomic::AtomicBool,
+    /// Test only: how many unfiltered searches retried with the full over-fetch.
+    #[cfg(test)]
+    search_retries: AtomicU64,
 }
 
 impl Collection {
@@ -520,6 +527,8 @@ impl Collection {
             fail_log_sync: std::sync::atomic::AtomicBool::new(false),
             #[cfg(test)]
             fail_stage: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(test)]
+            search_retries: AtomicU64::new(0),
         }
     }
 
@@ -1075,11 +1084,7 @@ impl Collection {
                 if state.store.is_empty() {
                     return Ok((Vec::new(), 0));
                 }
-                // Vectors whose documents are not committed yet can rank in the top results. Ask for
-                // as many extra as there are of them, and drop the uncommitted hits below. Then at
-                // least `top_k` committed results come back whenever that many exist.
-                let k = top_k.saturating_add(state.pending).min(state.store.len());
-                let (scores, ids) = state.store.search(query, k, None)?;
+                let (scores, ids) = self.unfiltered_candidates(&state, query, top_k)?;
                 (scores, ids, matched)
             }
             Some(filter) => {
@@ -1121,6 +1126,43 @@ impl Collection {
             .take(top_k)
             .collect();
         Ok((hits, matched))
+    }
+
+    /// Candidates for an unfiltered search, best first, as `(score, id)` pairs of the index: the first pass, or the
+    /// full over-fetch when the first pass lacks committed results.
+    ///
+    /// Vectors whose documents are not committed yet can rank in the top results (`pending` of them at most).
+    /// The first pass over-fetches only `min(pending, SEARCH_OVERFETCH_CAP)` for them. If it returns fewer than
+    /// `top_k` committed candidates while more than the cap is pending, a retry asks for the full
+    /// `top_k + pending`, which always holds at least `min(top_k, committed)` committed candidates. Both passes
+    /// run under the caller's read guard, so they see the same index and the same `pending`. The caller drops
+    /// the uncommitted candidates. Arithmetic saturates, so a very large `top_k` cannot wrap.
+    fn unfiltered_candidates(
+        &self,
+        state: &State,
+        query: &[f32],
+        top_k: usize,
+    ) -> Result<(Vec<f32>, Vec<u64>), ZenarError> {
+        let pending = state.pending;
+        let full = top_k.saturating_add(pending).min(state.store.len());
+        let first = top_k
+            .saturating_add(pending.min(SEARCH_OVERFETCH_CAP))
+            .min(state.store.len());
+        let (scores, ids) = state.store.search(query, first, None)?;
+        if pending <= SEARCH_OVERFETCH_CAP || first >= full {
+            return Ok((scores, ids));
+        }
+        let committed = ids
+            .iter()
+            .filter(|id| state.docs.contains(**id))
+            .take(top_k)
+            .count();
+        if committed >= top_k {
+            return Ok((scores, ids));
+        }
+        #[cfg(test)]
+        self.search_retries.fetch_add(1, Ordering::Relaxed);
+        state.store.search(query, full, None)
     }
 
     /// Discovery: every field with its type, the documents that carry it, and its values with
@@ -1697,6 +1739,12 @@ impl Collection {
             slot.running = true;
         }
         self.run_compaction()
+    }
+
+    /// Test only: how many unfiltered searches retried with the full over-fetch.
+    #[cfg(test)]
+    pub(crate) fn search_retry_count(&self) -> u64 {
+        self.search_retries.load(Ordering::Relaxed)
     }
 
     /// Waits for a background compaction to finish. Test use only.
@@ -4468,6 +4516,352 @@ mod recovery_tests {
         drop(db);
         let db = VectorDB::open(&dir).unwrap();
         assert_eq!(db.get_collection("cc").unwrap().count().unwrap(), expected);
+        fs::remove_dir_all(&dir).ok();
+    }
+}
+
+#[cfg(test)]
+mod search_overfetch_tests {
+    use super::*;
+    use crate::database::VectorDB;
+
+    const DIM: usize = 8;
+
+    fn temp_dir(name: &str) -> PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("zenar-overfetch-{name}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        dir
+    }
+
+    /// A document whose vector scores `score` against `query()`. The second coordinate only tells documents apart.
+    fn doc(id: u64, score: f32) -> Record {
+        let mut vector = vec![0.0f32; DIM];
+        vector[0] = score;
+        vector[1] = 0.001 * (id % 97) as f32;
+        Record {
+            id,
+            vector,
+            text: format!("doc {id}"),
+            metadata: vec![],
+        }
+    }
+
+    fn query() -> Vec<f32> {
+        let mut q = vec![0.0f32; DIM];
+        q[0] = 1.0;
+        q
+    }
+
+    fn ids(hits: &[Hit]) -> Vec<u64> {
+        hits.iter().map(|h| h.id).collect()
+    }
+
+    /// A collection with `committed` documents of score `committed_score` (ids 0..committed), and their
+    /// documents only: no pending write.
+    fn committed_collection(
+        dir: &Path,
+        committed: u64,
+        committed_score: f32,
+    ) -> (VectorDB, Arc<Collection>) {
+        let db = VectorDB::open(dir).unwrap();
+        let c = db.create_collection("c", Some(DIM), 4).unwrap();
+        let records: Vec<Record> = (0..committed).map(|i| doc(i, committed_score)).collect();
+        if !records.is_empty() {
+            c.add_many(&records).unwrap();
+        }
+        (db, c)
+    }
+
+    /// Runs `probe` once, while `records` are pending: after their index sync and before their commit. Returns what
+    /// `probe` returned, and the add's result.
+    fn probe_while_pending<T: Send + 'static>(
+        c: &Arc<Collection>,
+        records: Vec<Record>,
+        probe: impl Fn(&Collection) -> T + Send + Sync + 'static,
+    ) -> (Option<T>, Result<usize, ZenarError>) {
+        let slot: Arc<Mutex<Option<T>>> = Arc::new(Mutex::new(None));
+        let (sink, reader) = (Arc::clone(&slot), Arc::clone(c));
+        let fired = AtomicBool::new(false);
+        *c.window_hook.lock().unwrap() = Some(Arc::new(move || {
+            if !fired.swap(true, Ordering::SeqCst) {
+                *sink.lock().unwrap() = Some(probe(&reader));
+            }
+        }));
+        let added = c.add_many(&records);
+        *c.window_hook.lock().unwrap() = None;
+        let out = slot.lock().unwrap().take();
+        (out, added)
+    }
+
+    fn assert_committed_only(hits: &[Hit], committed: u64) {
+        let mut seen = HashSet::new();
+        for h in hits {
+            assert!(
+                h.id < committed,
+                "an uncommitted document was returned: {}",
+                h.id
+            );
+            assert!(seen.insert(h.id), "document {} returned twice", h.id);
+        }
+    }
+
+    #[test]
+    fn no_pending_writes_search_once_and_never_retry() {
+        let dir = temp_dir("none");
+        let (db, c) = committed_collection(&dir, 20, 0.5);
+        let hits = c.search(&query(), 5, None).unwrap();
+        assert_eq!(hits.len(), 5);
+        assert_committed_only(&hits, 20);
+        assert_eq!(c.search_retry_count(), 0);
+        drop(c);
+        drop(db);
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn pending_at_the_cap_does_not_retry() {
+        let dir = temp_dir("at-cap");
+        let (db, c) = committed_collection(&dir, 100, 0.1);
+        let pending: Vec<Record> = (1000..1064).map(|i| doc(i, 0.9)).collect();
+        let (hits, added) =
+            probe_while_pending(&c, pending, |c| c.search(&query(), 5, None).unwrap());
+        assert_eq!(added.unwrap(), 64);
+        let hits = hits.unwrap();
+        assert_eq!(
+            hits.len(),
+            5,
+            "committed results are returned from the first pass"
+        );
+        assert_committed_only(&hits, 100);
+        assert_eq!(c.search_retry_count(), 0, "pending == cap must not retry");
+        drop(c);
+        drop(db);
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn pending_above_the_cap_with_enough_committed_does_not_retry() {
+        let dir = temp_dir("enough");
+        let (db, c) = committed_collection(&dir, 200, 0.5);
+        let pending: Vec<Record> = (1000..1100).map(|i| doc(i, 0.1)).collect();
+        let (hits, added) =
+            probe_while_pending(&c, pending, |c| c.search(&query(), 5, None).unwrap());
+        assert_eq!(added.unwrap(), 100);
+        let hits = hits.unwrap();
+        assert_eq!(hits.len(), 5);
+        assert_committed_only(&hits, 200);
+        assert_eq!(
+            c.search_retry_count(),
+            0,
+            "the first pass had enough committed results"
+        );
+        drop(c);
+        drop(db);
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn pending_above_the_cap_that_crowds_out_the_committed_retries() {
+        let dir = temp_dir("crowded");
+        let (db, c) = committed_collection(&dir, 300, 0.1);
+        // The 100 pending documents score highest, so the first pass of top_k + 64 holds only uncommitted ones.
+        let pending: Vec<Record> = (1000..1100).map(|i| doc(i, 0.9)).collect();
+        let (hits, added) =
+            probe_while_pending(&c, pending, |c| c.search(&query(), 5, None).unwrap());
+        assert_eq!(added.unwrap(), 100);
+        let hits = hits.unwrap();
+        assert_eq!(hits.len(), 5, "the retry returns top_k committed results");
+        assert_committed_only(&hits, 300);
+        assert_eq!(c.search_retry_count(), 1);
+        drop(c);
+        drop(db);
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn fewer_committed_documents_than_top_k_returns_all_of_them() {
+        let dir = temp_dir("few");
+        let (db, c) = committed_collection(&dir, 3, 0.1);
+        let pending: Vec<Record> = (1000..1100).map(|i| doc(i, 0.9)).collect();
+        let (hits, added) =
+            probe_while_pending(&c, pending, |c| c.search(&query(), 10, None).unwrap());
+        assert_eq!(added.unwrap(), 100);
+        let hits = hits.unwrap();
+        assert_eq!(hits.len(), 3, "every committed document is returned");
+        assert_committed_only(&hits, 3);
+        assert_eq!(c.search_retry_count(), 1);
+        drop(c);
+        drop(db);
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn no_committed_documents_returns_nothing_while_pending() {
+        let dir = temp_dir("no-committed");
+        let (db, c) = committed_collection(&dir, 0, 0.0);
+        let pending: Vec<Record> = (1000..1100).map(|i| doc(i, 0.9)).collect();
+        let (hits, added) =
+            probe_while_pending(&c, pending, |c| c.search(&query(), 5, None).unwrap());
+        assert_eq!(added.unwrap(), 100);
+        assert!(hits.unwrap().is_empty(), "no committed document exists");
+        drop(c);
+        drop(db);
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn top_k_larger_than_the_population_returns_every_committed_document() {
+        let dir = temp_dir("big-k");
+        let (db, c) = committed_collection(&dir, 20, 0.5);
+        assert_eq!(c.search(&query(), 100, None).unwrap().len(), 20);
+        let pending: Vec<Record> = (1000..1100).map(|i| doc(i, 0.9)).collect();
+        let (hits, added) =
+            probe_while_pending(&c, pending, |c| c.search(&query(), 100, None).unwrap());
+        assert_eq!(added.unwrap(), 100);
+        let hits = hits.unwrap();
+        assert_eq!(hits.len(), 20);
+        assert_committed_only(&hits, 20);
+        drop(c);
+        drop(db);
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn huge_top_k_does_not_overflow_the_over_fetch() {
+        let dir = temp_dir("overflow");
+        let (db, c) = committed_collection(&dir, 20, 0.5);
+        let pending: Vec<Record> = (1000..1100).map(|i| doc(i, 0.9)).collect();
+        let (hits, added) =
+            probe_while_pending(&c, pending, |c| c.search(&query(), usize::MAX - 2, None));
+        assert_eq!(added.unwrap(), 100);
+        let hits = hits.unwrap().unwrap();
+        assert_eq!(hits.len(), 20);
+        assert_committed_only(&hits, 20);
+        drop(c);
+        drop(db);
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_rolled_back_write_leaves_no_pending_state() {
+        let dir = temp_dir("rollback");
+        let (db, c) = committed_collection(&dir, 300, 0.1);
+        let pending: Vec<Record> = (1000..1100).map(|i| doc(i, 0.9)).collect();
+        let (hits, added) = probe_while_pending(&c, pending, |c| {
+            // Make the write's log sync fail when it resumes: the write is rolled back.
+            c.fail_log_sync.store(true, Ordering::SeqCst);
+            c.search(&query(), 5, None).unwrap()
+        });
+        assert!(added.is_err(), "the write failed");
+        let hits = hits.unwrap();
+        assert_eq!(hits.len(), 5);
+        assert_committed_only(&hits, 300);
+        assert_eq!(
+            c.state.read().unwrap().pending,
+            0,
+            "rollback cleared the pending count"
+        );
+        let retries = c.search_retry_count();
+        let after = c.search(&query(), 5, None).unwrap();
+        assert_eq!(after.len(), 5);
+        assert_committed_only(&after, 300);
+        assert_eq!(
+            c.search_retry_count(),
+            retries,
+            "no retry once nothing is pending"
+        );
+        drop(c);
+        drop(db);
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn deletes_during_searches_are_not_returned() {
+        let dir = temp_dir("deletes");
+        let (db, c) = committed_collection(&dir, 200, 0.5);
+        // The deleted documents score highest, so without the delete they would fill the results.
+        let high: Vec<Record> = (1000..1040).map(|i| doc(i, 0.9)).collect();
+        c.add_many(&high).unwrap();
+        let deleted: Vec<u64> = (1000..1040).collect();
+        let slot: Arc<Mutex<Option<Vec<u64>>>> = Arc::new(Mutex::new(None));
+        let (sink, reader) = (Arc::clone(&slot), Arc::clone(&c));
+        let fired = AtomicBool::new(false);
+        *c.window_hook.lock().unwrap() = Some(Arc::new(move || {
+            if !fired.swap(true, Ordering::SeqCst) {
+                let hits = reader.search(&query(), 10, None).unwrap();
+                *sink.lock().unwrap() = Some(ids(&hits));
+            }
+        }));
+        assert_eq!(c.delete_many(&deleted).unwrap(), 40);
+        *c.window_hook.lock().unwrap() = None;
+        let during = slot.lock().unwrap().take().unwrap();
+        assert_eq!(during.len(), 10);
+        assert!(
+            during.iter().all(|id| *id >= 40),
+            "a deleted document was returned: {during:?}"
+        );
+        let after = c.search(&query(), 10, None).unwrap();
+        assert_eq!(after.len(), 10);
+        assert!(after.iter().all(|h| h.id < 200));
+        drop(c);
+        drop(db);
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn concurrent_writes_and_searches_return_committed_results() {
+        let dir = temp_dir("concurrent");
+        let (db, c) = committed_collection(&dir, 50, 0.5);
+        let acked = Arc::new(AtomicU64::new(50));
+        let stop = Arc::new(AtomicBool::new(false));
+        let writer = {
+            let (c, acked, stop) = (Arc::clone(&c), Arc::clone(&acked), Arc::clone(&stop));
+            thread::spawn(move || {
+                let mut next = 50u64;
+                for _ in 0..40 {
+                    // Each batch scores above the committed documents, so pending writes compete for the top.
+                    let records: Vec<Record> = (next..next + 150).map(|i| doc(i, 0.8)).collect();
+                    c.add_many(&records).unwrap();
+                    next += 150;
+                    acked.store(next, Ordering::SeqCst);
+                }
+                stop.store(true, Ordering::SeqCst);
+            })
+        };
+        let readers: Vec<_> = (0..4)
+            .map(|_| {
+                let (c, acked, stop) = (Arc::clone(&c), Arc::clone(&acked), Arc::clone(&stop));
+                thread::spawn(move || {
+                    let mut searches = 0u64;
+                    while !stop.load(Ordering::SeqCst) {
+                        // Documents acknowledged before the search are committed, so they must be available.
+                        let committed_before = acked.load(Ordering::SeqCst);
+                        let hits = c.search(&query(), 10, None).unwrap();
+                        let issued = acked.load(Ordering::SeqCst) + 150;
+                        assert!(
+                            hits.len() >= 10.min(committed_before as usize),
+                            "{} hits",
+                            hits.len()
+                        );
+                        assert!(hits.len() <= 10);
+                        let mut seen = HashSet::new();
+                        for h in &hits {
+                            assert!(h.id < issued, "an id that was never written: {}", h.id);
+                            assert!(seen.insert(h.id), "document {} returned twice", h.id);
+                        }
+                        searches += 1;
+                    }
+                    searches
+                })
+            })
+            .collect();
+        writer.join().unwrap();
+        let searched: u64 = readers.into_iter().map(|r| r.join().unwrap()).sum();
+        assert!(searched > 0);
+        assert_eq!(c.count().unwrap(), 50 + 40 * 150);
+        drop(c);
+        drop(db);
         fs::remove_dir_all(&dir).ok();
     }
 }

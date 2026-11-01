@@ -14,6 +14,10 @@ pub mod names;
 pub mod storage;
 pub mod value;
 
+/// Test-only workload benchmarks of concurrent search and write (ignored by default).
+#[cfg(test)]
+mod bench_search;
+
 pub use collection::{
     Collection, GROUP_BUCKETS, Hit, LockEvent, Record, RecoveryReport, Retrieval, WriteStats,
 };

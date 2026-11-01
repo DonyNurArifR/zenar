@@ -142,8 +142,11 @@ search(vector, top_k, filter)
 - A write syncs its vector index while holding the lock, since TurboVec syncs from its in-memory state. It then syncs its
   document log with the lock released, and takes the lock again to commit. Only the index sync and the in-memory work hold
   the lock during an add. Flush and compaction still hold it for their whole run (docs/CONCURRENCY.md).
-- A search whose results include vectors of uncommitted writes asks for extra results and drops those hits, so it still
-  returns `top_k` committed results when that many exist.
+- A search whose results include vectors of uncommitted writes asks for up to 64 extra results and drops those hits. If
+  fewer than `top_k` committed results come back while more than 64 are pending, it retries once with the full extra.
+  So it still returns `top_k` committed results when that many exist. Which results rank highest is approximate: TurboVec
+  scores are quantized, and a larger `k` can change the approximate ordering, so a search under concurrent writes may
+  rank slightly differently from the same search on a quiet index.
 - The document log is read with positioned reads (`pread`), so readers do not share a file cursor.
 - The GIL is released around every core call (`py.detach`).
 - No panic crosses into Python. Each core call is wrapped in `catch_unwind` and reported as `VectorStoreError`.
