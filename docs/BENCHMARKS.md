@@ -351,7 +351,7 @@ between runs (3,759 to 4,672 per second across the stage 2 runs).
 | Writer batch of 1,000 rows, p50 / p95 | 16.2 / 19.7 ms | 15.7 / 20.1 ms |
 | Peak heap | 73.6 to 75.2 MB | 154.3 MB |
 | Heap at the round after each swap (rounds 10, 20, 30) | 35 to 37.5 MB | 35.6, 36.9, 37.3 MB |
-| Longest write-lock hold, whole run | not measured | 103 ms (the max of every write; the swap is 20 ms, so the 103 ms hold is another write, not yet attributed) |
+| Longest write-lock hold, steady state | not measured | 24.9 ms, the swap (fs 23.0 ms of it). The 80 ms maximum of the run is the create's first index persist, see "Write-lock holds by operation" |
 
 What this shows. Searches during a compaction are no longer blocked for the length of the rewrite, and the swap's
 lock hold is about 20 ms rather than the 86 to 100 ms of the reopen. The cost is memory: while a build runs, the old
@@ -359,9 +359,60 @@ and the new row tables are both in memory, and the peak heap rises by about 80 M
 the transient the design lists in section 11. It is measured here, not estimated. The writer's 1,000-row batch time is
 unchanged, and the search p95 and p99 over the whole run are unchanged within noise.
 
-Known limits, not measured here: deletes made during a build stay as dead rows in the swapped structure until the next
-compaction (`docs/R3.md`, section 14); the 103 ms maximum hold is not yet attributed; and power loss was not tested on
-hardware.
+Known limits: deletes made during a build stay as dead rows in the swapped structure until the next compaction, and
+the scheduling of the rest is in `docs/R3.md`, section 15; power loss was not tested on hardware.
+
+### Write-lock holds by operation (`compaction_bench`, lock trace)
+
+`Collection::set_lock_trace` records every exclusive hold of the collection lock: the operation that took it, the wait
+for the lock, the hold, and the filesystem time timed inside the hold (`WriteGuard::timed`, `add_fs`). The trace covers
+the seeding and the 40 rounds, with eight readers. Milliseconds, measured.
+
+| Operation | n | Wait p50 / p95 / max | Hold p50 / p95 / p99 / max | Filesystem time in the hold, mean / max |
+|---|---|---|---|---|
+| `add_commit` | 1,000 | 6.31 / 10.22 / 19.72 | 0.15 / 0.20 / 0.37 / 2.45 | 0 (commit only) |
+| `add_stage` | 1,000 | 0.17 / 0.36 / 1.79 | 5.01 / 6.31 / 7.13 / 13.62 | 4.20 / 11.74 (log write, index sync, sync handle) |
+| `delete_stage` | 800 | 0.33 / 0.55 / 0.85 | 11.11 / 12.44 / 13.34 / 18.41 | 10.81 / 18.10 (catalog write, index sync, log write) |
+| `delete_commit` | 800 | 0.18 / 0.34 / 0.58 | 6.95 / 7.94 / 8.07 / 13.57 | 7.19 / 13.54 (catalog write) |
+| `swap` | 3 | 0.38 / 0.41 / 0.41 | 22.44 / 24.93 / 24.93 (max) | 22.98 / 24.92 (catalog, rename, directory sync, tail sync) |
+| `flush` | 1 | 0 | 8.67 | 0 (the sync is not timed) |
+
+The write lock is held for 5 to 11 ms per group, and most of that is filesystem time. Two things are in the hold for
+each delete: the catalog write before the log (`lower_recorded_lengths`) and the catalog write after the commit
+(`record_durable`). Each is about 7 ms, the cost of an atomic catalog replace with its syncs (`catalog_cost`). The
+index sync under the lock follows the TurboVec design (`docs/CONCURRENCY.md`). Nothing in the hold is serialization,
+allocation or destruction of the document structure: the old structure is dropped after the lock is released.
+
+The longest hold of the run (about 80 ms) is not a steady-state write. It is the first index persist of a new database,
+done by `create_collection`: 79.6 to 82.4 ms on the first create in a process, and 7.1 ms for the next create. The
+persist is one index sync, and the collection is not yet visible to other threads at that point, so it blocks no reader.
+The trace starts after the create, so this hold is reported on its own.
+
+### Memory of background compaction (`build_memory`)
+
+`build_memory -- live collections rounds [readers] [writer]` loads collections, then deletes 60% of each one at once, so
+each compacts in the background, and waits for every swap. The heap is counted with a global allocator. Above base is
+the peak during the round, minus the heap before the deletes. Measured, one collection, no concurrent load, three rounds:
+
+| Live documents | Base heap | Peak above base | Heap after the swap | Rounds |
+|---|---|---|---|---|
+| 50,000 | 7.6 MB | +3.9 MB | 6.2 MB | 6.2, 6.2, 7.2 MB after successive swaps |
+| 200,000 | 30.1 MB | +12.6 MB | 24.2 MB | 24.2, 24.2, 28.5 MB after successive swaps |
+| 500,000 | 81.1 MB | +47.5 MB | 65.4 MB | 65.4, 65.4, 65.4 MB after successive swaps |
+
+Three collections of 200,000 each, compacting together: base 90.0 MB, peak above base +24.9 MB, and +27.2 MB in the next
+round, with 72.4 MB after the swaps.
+
+The compaction transient is the new row table, plus the frame map that a snapshot builds over the whole log (a
+`HashMap` with an entry per frame, dead frames included). It is bounded by the size of the new table, and it is
+returned after the swap. Repeated compactions do not grow the heap at 500,000, and at 50,000 the third swap left 1 MB more. At 200,000 the third
+swap left 4 MB more. That rise was not attributed. It may be the vector index's retained capacity (`docs/STORAGE.md`),
+but that is not verified.
+
+A write-path spike is larger than the compaction transient, and it is not R3. With writers and readers running at the
+same time and no compaction, the peak rose by +121.6 MB at 200,000 documents, with the writer alone +34.8 MB, and readers
+alone +1.7 MB. The same probe at commit `a3c17ff` (before R3) gives the same figures. The spike is an existing transient
+in the concurrent write path. Its cause is not yet identified, and it is the larger memory issue for production use.
 
 ### Delta scan cost (`delta_scan`, dimension 384, naive scalar loops)
 

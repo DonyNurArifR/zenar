@@ -5,6 +5,21 @@ project follows [semantic versioning](https://semver.org/) while it is pre-1.0.
 
 ## Unreleased
 
+### Added
+- `Collection::set_lock_trace` and `take_lock_trace` record every exclusive hold of the collection lock: the operation,
+  the wait, the hold and the filesystem time inside it (`LockEvent`). A diagnostic; off by default.
+- Tests for background compaction: a swap waits for a group in flight, a row or an id deleted or re-added during a build
+  keeps its state through the swap and a reopen, a rolled-back group in a build window is absent after the swap,
+  reopen rules for the pending record (old and new lengths), a stale temporary log is removed on open, the old
+  structure is dropped at the swap, filtered search is the same during the build and after it, and a random run with
+  compactions agrees with a reference model. A Python test kills a process during a compaction and checks the reopened
+  database.
+
+### Fixed
+- A failed compaction no longer starts another build by itself. The check that a finished build may be due again ran after
+  a failed swap too, so while the threshold stayed crossed a failing swap started a new build. It now runs only after a
+  successful swap, and the next delete starts the next attempt.
+
 ### Changed
 - Compaction runs in the background. A build writes the live documents without the collection lock, and only the swap
   holds it, for about 20 ms at 200,000 live documents. Searches during a build keep their latency: p95 12.6 ms against

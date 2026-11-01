@@ -43,7 +43,11 @@ rename over an open file), renames the temporary file over the log, syncs the di
 The old row table is freed after the lock is released. A failed build removes its temporary file. A failure before the
 rename undoes itself, and the collection stays usable. A failure after the rename poisons the collection, and a reopen
 settles it by the rules in `docs/R3.md`, section 5. Deletes made during a build remain as dead rows until the next
-compaction (`docs/R3.md`, section 14).
+compaction (`docs/R3.md`, section 14). When a swap succeeds and the threshold is still crossed (the deletes made during
+the build were enough), the next compaction starts at once. A failed compaction is not retried by itself: the next
+delete starts the next attempt. Dead records below the threshold are kept until the threshold is crossed, which is the
+policy, not a defect. On Windows the directory sync that makes the rename durable is not performed (`sync_parent`
+does nothing outside Unix), and the swap there is untested (`docs/R3.md`, section 15).
 
 `drop_collection` deletes the collection's files. On Windows that fails while a Python object still holds the collection
 open. Drop the handle first, then drop the collection.

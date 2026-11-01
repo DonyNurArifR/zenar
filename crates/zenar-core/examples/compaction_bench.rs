@@ -11,7 +11,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::thread;
 use std::time::Instant;
 
-use zenar_core::{MetaValue, Record, VectorDB};
+use zenar_core::{LockEvent, MetaValue, Record, VectorDB};
 
 struct Counting;
 
@@ -92,7 +92,24 @@ fn main() {
     let _ = std::fs::remove_dir_all(&dir);
     let db = VectorDB::open(&dir).expect("open");
     let col = db.create_collection("w", Some(DIM), 4).expect("create");
+    // A second create, for comparison: the first persist of a new index may cost more than later ones.
+    let second = db.create_collection("w2", Some(DIM), 4).expect("create");
+    println!(
+        "create (second collection): holds {} max {:.2} ms",
+        second.write_stats().write_holds,
+        second.write_stats().write_hold_max_ns as f64 / 1e6
+    );
+    drop(second);
+    // The create's one-time index persist runs before the collection exists to trace it, so it is reported on its own.
+    let created = col.write_stats();
+    println!(
+        "create: the one-time index persist ran before the trace could start: holds {} max {:.2} ms",
+        created.write_holds,
+        created.write_hold_max_ns as f64 / 1e6
+    );
     let log = dir.join("docs").join("w.zdocs");
+    // The trace covers the seeding, so every hold after the create is listed.
+    col.set_lock_trace(true);
     let mut next = 0u64;
     while next < live {
         let records: Vec<Record> = (next..next + batch).map(record).collect();
@@ -133,14 +150,23 @@ fn main() {
         let (stop, log, tmp_log) = (Arc::clone(&sampler_stop), log.clone(), tmp_log.clone());
         thread::spawn(move || {
             let mut samples: Vec<(f64, bool, u64)> = Vec::new();
+            // The peak heap of each build: the counter's peak is reset when a build starts, and read when it ends.
+            let (mut was_building, mut build_peak_max) = (false, 0usize);
             while !stop.load(Ordering::Relaxed) {
                 let t = epoch.elapsed().as_secs_f64();
                 let building = tmp_log.exists();
+                if building && !was_building {
+                    PEAK.store(HEAP.load(Ordering::Relaxed), Ordering::Relaxed);
+                }
+                if !building && was_building {
+                    build_peak_max = build_peak_max.max(PEAK.load(Ordering::Relaxed));
+                }
+                was_building = building;
                 let len = std::fs::metadata(&log).map_or(0, |m| m.len());
                 samples.push((t, building, len));
                 thread::sleep(std::time::Duration::from_millis(1));
             }
-            samples
+            (samples, build_peak_max)
         })
     };
 
@@ -167,9 +193,10 @@ fn main() {
     let wall = run_start.elapsed().as_secs_f64();
     stop.store(true, Ordering::Relaxed);
     sampler_stop.store(true, Ordering::Relaxed);
-    let log_samples = sampler.join().expect("sampler");
+    let (log_samples, build_peak_max) = sampler.join().expect("sampler");
     // A build runs from the step where the temporary log appears to the step where it is gone; the swap is in
     // that step, and the log shrinks there.
+    println!("peak heap during a build: {:.1} MB", mb(build_peak_max));
     let mut builds: Vec<(f64, f64)> = Vec::new();
     let mut swaps: Vec<(f64, u64)> = Vec::new();
     let mut build_start: Option<f64> = None;
@@ -252,6 +279,8 @@ fn main() {
             .collect::<Vec<_>>()
             .join(" ")
     );
+    print_lock_trace(&col.take_lock_trace());
+    col.set_lock_trace(false);
     let stats = col.write_stats();
     println!(
         "write lock (whole run, includes the swap): holds {}  mean {:.2} ms  max {:.2} ms; readers waited max {:.3} ms",
@@ -263,4 +292,37 @@ fn main() {
     drop(col);
     drop(db);
     std::fs::remove_dir_all(&dir).ok();
+}
+
+/// Per-operation percentiles of the exclusive holds of the collection lock: the wait for it, the hold, and the
+/// filesystem time inside the hold. Times are in milliseconds.
+fn print_lock_trace(events: &[LockEvent]) {
+    let mut ops: Vec<&'static str> = events.iter().map(|e| e.op).collect();
+    ops.sort();
+    ops.dedup();
+    println!(
+        "lock holds by operation (ms): n, wait p50/p95/p99/max, hold p50/p95/p99/max, fs mean/max"
+    );
+    for op in ops {
+        let of: Vec<&LockEvent> = events.iter().filter(|e| e.op == op).collect();
+        let ms = |f: fn(&LockEvent) -> u64| -> Vec<f64> {
+            of.iter().map(|e| f(e) as f64 / 1e6).collect()
+        };
+        let (mut wait, mut hold, mut fs) = (ms(|e| e.wait_ns), ms(|e| e.hold_ns), ms(|e| e.fs_ns));
+        let fs_mean = fs.iter().sum::<f64>() / fs.len() as f64;
+        println!(
+            "  {op:<14} n {:>5}  wait {:>7.2} {:>7.2} {:>7.2} {:>8.2}  hold {:>7.2} {:>7.2} {:>7.2} {:>8.2}  fs {:>7.2} {:>8.2}",
+            of.len(),
+            pct(&mut wait.clone(), 0.50),
+            pct(&mut wait.clone(), 0.95),
+            pct(&mut wait.clone(), 0.99),
+            pct(&mut wait, 1.0),
+            pct(&mut hold.clone(), 0.50),
+            pct(&mut hold.clone(), 0.95),
+            pct(&mut hold.clone(), 0.99),
+            pct(&mut hold, 1.0),
+            fs_mean,
+            pct(&mut fs, 1.0),
+        );
+    }
 }

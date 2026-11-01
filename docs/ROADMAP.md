@@ -35,11 +35,19 @@ not. Items marked done are verified in the code and the test suite; the tests ar
 
 ## Open, in priority order
 
-1. **Background compaction: implemented (R3, stage 2).** The build runs without the lock, the swap holds it for about 20 ms
-   at 200,000 live documents, and the old row table is freed outside the lock. Open items, measured in
-   `docs/BENCHMARKS.md`: the peak heap during a build is about 154 MB against 74 MB, because the old and new row tables
-   coexist; deletes made during a build stay dead until the next compaction; a 103 ms write-lock hold is not yet
-   attributed; power loss is not tested on hardware (`docs/R3.md`, sections 12 and 14).
+1. **Concurrent write-path memory transient (next).** With writers and readers at once, the peak heap is 121.6 MB above
+   base at 200,000 documents, against 34.8 MB for the writer alone and 1.7 MB for readers alone. The same figure is at
+   commit `a3c17ff`, before R3, so this is not a compaction effect. It is larger than the compaction transient
+   (12.6 MB at 200,000). The first step is to attribute it: per-allocation-site counts during a writer-and-reader run.
+   `docs/BENCHMARKS.md`, "Memory of background compaction", has the measurements.
+2. **Windows is not verified for R3.** CI runs on `windows-latest`, but only on pushes to `main` and on pull requests, and
+   this branch's code has not run there. Directory sync is not performed on Windows (`sync_parent`). Whether to run CI on
+   this branch is a decision for the owner: it needs a trigger change or a pull request.
+3. **Background compaction: implemented (R3, stages 1 and 2, verified in section 15 of `docs/R3.md`).** The build runs
+   without the lock, and the swap holds it for about 22 to 25 ms at 200,000 live documents, 23 ms of it filesystem time.
+   The old row table is freed outside the lock. Open: the peak heap during a build is about 166 MB against 74 MB, of which
+   the write-path transient (item 1) is most; power loss is not tested on hardware; mapping items 4, 10 and 19 are
+   partial.
 0. **Staging under the index lock: investigated, not implemented.** Validation and encoding are about 0.1 ms per batch of
    about 5 ms of a four-writer group's exclusive time. Moving them out would gain less than the run-to-run noise
    (docs/CONCURRENCY.md, "Staging outside the state lock"). The index sync is most of the hold, and it needs a TurboVec change.

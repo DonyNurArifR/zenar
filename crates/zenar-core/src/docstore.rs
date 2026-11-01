@@ -203,6 +203,19 @@ pub struct DocStore {
     pub(crate) fail_undo: bool,
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Test only: how many document structures this thread has dropped.
+    pub static DROPPED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+impl Drop for DocStore {
+    fn drop(&mut self) {
+        DROPPED.with(|d| d.set(d.get() + 1));
+    }
+}
+
 impl DocStore {
     /// Creates an empty log at `path`. Fails if the file exists.
     pub fn create(path: &Path, fields: Vec<(String, FieldKind)>) -> Result<Self, ZenarError> {

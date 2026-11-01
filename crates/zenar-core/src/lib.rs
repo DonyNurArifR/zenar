@@ -15,7 +15,7 @@ pub mod storage;
 pub mod value;
 
 pub use collection::{
-    Collection, GROUP_BUCKETS, Hit, Record, RecoveryReport, Retrieval, WriteStats,
+    Collection, GROUP_BUCKETS, Hit, LockEvent, Record, RecoveryReport, Retrieval, WriteStats,
 };
 pub use database::{MetadataSync, VectorDB};
 pub use docstore::{DocumentRow, FieldStats};

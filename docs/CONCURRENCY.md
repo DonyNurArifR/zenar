@@ -209,11 +209,17 @@ What the audit did not cover, and the remaining risks:
    throughput at several writers. It is not measured yet: the add itself is about 0.8 ms per batch.
 
 1. **Compaction holds the lock only for its swap.** The build runs without the lock. The swap holds it for about 20 ms
-   at 200,000 live documents (measured, `docs/BENCHMARKS.md`), down from 86 to 100 ms for the reopen-based compaction. The
-   design is in docs/R3.md, and the argument for deletes during the build is in docs/COMPACTION.md.
-2. **Deletes write the catalog twice under the lock.** About 17 ms of a 24 ms delete. You chose to keep exact refusal. Its
-   cost stays unless the recorded-length scheme changes, and this document does not propose a change that keeps the
-   bound exact.
+   at 200,000 live documents, down from 86 to 100 ms for the reopen-based compaction. Of the 22 to 25 ms swap hold, 23 ms
+   is filesystem time: the tail sync, the catalog writes, the rename and the directory sync (`docs/BENCHMARKS.md`,
+   "Write-lock holds by operation"). The design is in docs/R3.md, and the argument for deletes during the build is in
+   docs/COMPACTION.md.
+2. **Deletes write the catalog twice under the lock.** Measured per delete group: the catalog write before the log is
+   10.8 ms of filesystem time in a 11.1 ms hold (`delete_stage`), and the write after the commit is 7.2 ms of a 7.0 ms
+   hold (`delete_commit`). You chose to keep exact refusal. Its cost stays unless the recorded-length scheme changes, and
+   this document does not propose a change that keeps the bound exact.
+3. **The first index persist of a new database holds the lock for 80 ms.** `create_collection` syncs the new index
+   under the collection lock. It is one-time, and the collection is not visible to other threads then, so it blocks no
+   reader. The next create takes 7 ms. Noted so that the figure is not mistaken for steady-state behaviour.
 3. **Index sync holds the lock.** About 3.9 ms per batch. TurboVec's sync takes `&mut self` and syncs from its in-memory
    state, so the fsync cannot leave the lock without a change to TurboVec. This is now the dominant hold.
 4. ~~Group commit~~. Built. See "Group commit" above.
