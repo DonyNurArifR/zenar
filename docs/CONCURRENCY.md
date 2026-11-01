@@ -208,9 +208,9 @@ What the audit did not cover, and the remaining risks:
    encoding and vector add could run before the lock is taken. This is the open item most likely to recover reader
    throughput at several writers. It is not measured yet: the add itself is about 0.8 ms per batch.
 
-1. **Compaction holds the lock for its whole rewrite and reopen.** Now 127 to 132 ms for a compacting batch at a million
-   rows (it was 261 ms). The design for moving it out of the lock, and the argument for deletes during the rewrite, are in
-   docs/COMPACTION.md.
+1. **Compaction holds the lock only for its swap.** The build runs without the lock. The swap holds it for about 20 ms
+   at 200,000 live documents (measured, `docs/BENCHMARKS.md`), down from 86 to 100 ms for the reopen-based compaction. The
+   design is in docs/R3.md, and the argument for deletes during the build is in docs/COMPACTION.md.
 2. **Deletes write the catalog twice under the lock.** About 17 ms of a 24 ms delete. You chose to keep exact refusal. Its
    cost stays unless the recorded-length scheme changes, and this document does not propose a change that keeps the
    bound exact.

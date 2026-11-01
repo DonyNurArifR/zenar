@@ -297,6 +297,11 @@ impl DocStore {
         &self.path
     }
 
+    /// Points this structure at `path`. Used by the swap, after the temporary log has been renamed to it.
+    pub fn retarget(&mut self, path: &Path) {
+        self.path = path.to_path_buf();
+    }
+
     /// Length of the log file in bytes, as written. Used to record how far it is synced.
     pub fn log_len(&self) -> u64 {
         self.len
@@ -530,6 +535,85 @@ impl DocStore {
         let dead = self.dead + deleting;
         let live = self.live - deleting;
         dead > 4096 && dead > live
+    }
+
+    /// Reads the committed bytes from `from` to `to` of the log at `path`. The caller checks that they are committed.
+    pub fn read_log_range(path: &Path, from: u64, to: u64) -> Result<Vec<u8>, ZenarError> {
+        let file = File::open(path).map_err(io_err)?;
+        let mut buf = vec![0u8; (to - from) as usize];
+        read_exact_at(&file, &mut buf, from)?;
+        Ok(buf)
+    }
+
+    /// Number of rows, live and dead, in memory. Used by tests of compaction.
+    pub fn row_count(&self) -> usize {
+        self.rows.len()
+    }
+
+    /// Appends `bytes`, whole frames copied from another log, to the end of this log, and applies their
+    /// frames to the in-memory structure. Used to bring a compacted log up to date with the old log
+    /// (docs/R3.md, section 3). A failure after the write leaves this structure in an unknown state, and
+    /// the caller must not use it.
+    pub fn append_raw(&mut self, bytes: &[u8]) -> Result<(), ZenarError> {
+        let base = self.len;
+        self.write_bytes(bytes, base)?;
+        let mut pos = 0usize;
+        while pos < bytes.len() {
+            if bytes.len() - pos < FRAME_HEADER {
+                return Err(ZenarError::RecoveryError(
+                    "a copied tail ends inside a frame header".into(),
+                ));
+            }
+            let len =
+                u32::from_le_bytes([bytes[pos], bytes[pos + 1], bytes[pos + 2], bytes[pos + 3]])
+                    as usize;
+            let crc = u32::from_le_bytes([
+                bytes[pos + 4],
+                bytes[pos + 5],
+                bytes[pos + 6],
+                bytes[pos + 7],
+            ]);
+            let end = pos + FRAME_HEADER + len;
+            if end > bytes.len() {
+                return Err(ZenarError::RecoveryError(
+                    "a copied tail ends inside a frame".into(),
+                ));
+            }
+            let payload = &bytes[pos + FRAME_HEADER..end];
+            if crc32(payload) != crc {
+                return Err(ZenarError::RecoveryError(
+                    "a copied tail has a bad frame".into(),
+                ));
+            }
+            self.apply_replayed(payload, base + (pos + FRAME_HEADER) as u64)?;
+            pos = end;
+        }
+        Ok(())
+    }
+
+    /// Releases the append handle, so that the log file can be renamed (Windows refuses to rename over an
+    /// open file). `reattach` takes it back.
+    pub fn release_handle(&mut self) {
+        self.file = None;
+    }
+
+    /// Reopens the append handle on the log at its path, after `release_handle`.
+    pub fn reattach(&mut self) -> Result<(), ZenarError> {
+        self.file = Some(open_log(&self.path).map_err(io_err)?);
+        Ok(())
+    }
+
+    /// Writes to `tmp` the live PUT frames that lie entirely below `end` in the log at `path`, in log order,
+    /// and syncs it. The log is not changed. A frame is live at `end` if no later frame below `end` deletes
+    /// it (docs/R3.md, section 3). Returns the length of the written file.
+    pub fn write_snapshot(path: &Path, end: u64, tmp: &Path) -> Result<u64, ZenarError> {
+        let wanted = live_frames_below(path, end)?;
+        let out = File::create(tmp).map_err(io_err)?;
+        let mut out = BufWriter::with_capacity(1 << 20, out);
+        copy_live_frames(path, &wanted, &mut out)?;
+        let out = out.into_inner().map_err(|e| io_err(e.into_error()))?;
+        out.sync_all().map_err(io_err)?;
+        Ok(out.metadata().map_err(io_err)?.len())
     }
 
     /// The path of the temporary log that a compaction writes.
@@ -1453,6 +1537,37 @@ fn push_frame(buf: &mut Vec<u8>, payload: &[u8]) {
     buf.extend_from_slice(&(payload.len() as u32).to_le_bytes());
     buf.extend_from_slice(&crc32(payload).to_le_bytes());
     buf.extend_from_slice(payload);
+}
+
+/// Reads the frames of the log at `path` that lie entirely below `end`, and returns the offset and length of
+/// each PUT that is live at `end`: no DEL below `end` removes it. The offsets are in log order.
+fn live_frames_below(path: &Path, end: u64) -> Result<Vec<(u64, u32)>, ZenarError> {
+    let mut input = BufReader::with_capacity(1 << 20, File::open(path).map_err(io_err)?);
+    let mut live: HashMap<u64, (u64, u32)> = HashMap::new();
+    let mut pos: u64 = 0;
+    let mut header = [0u8; FRAME_HEADER];
+    while pos < end {
+        input.read_exact(&mut header).map_err(io_err)?;
+        let len = u32::from_le_bytes([header[0], header[1], header[2], header[3]]);
+        let mut payload = vec![0u8; len as usize];
+        input.read_exact(&mut payload).map_err(io_err)?;
+        if payload.len() >= 9 {
+            let id = u64::from_le_bytes(payload[1..9].try_into().unwrap());
+            match payload[0] {
+                PUT => {
+                    live.insert(id, (pos + FRAME_HEADER as u64, len));
+                }
+                DEL => {
+                    live.remove(&id);
+                }
+                _ => {}
+            }
+        }
+        pos += FRAME_HEADER as u64 + u64::from(len);
+    }
+    let mut out: Vec<(u64, u32)> = live.into_values().collect();
+    out.sort_unstable();
+    Ok(out)
 }
 
 /// Copies the frames of the live payloads in `wanted` (payload offset and length, ascending) from the

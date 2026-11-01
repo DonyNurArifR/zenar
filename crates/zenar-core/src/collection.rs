@@ -1,11 +1,12 @@
 use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
+use std::fs;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use std::thread::{self, ThreadId};
 use std::time::{Duration, Instant};
 
-use crate::catalog::Catalog;
+use crate::catalog::{Catalog, Entry};
 use crate::docstore::{DocRef, DocStore, DocumentRow, FieldStats, Staged};
 use crate::error::ZenarError;
 use crate::filter::{Filter, validate};
@@ -81,6 +82,9 @@ struct State {
     docs: DocStore,
     /// Vectors added since the index was last synced.
     unsynced: usize,
+    /// Length of the log up to the end of the last committed write. Bytes below it are final: a rollback
+    /// truncates only to the start of a group, which is at or after it. Compaction copies up to it.
+    committed_len: u64,
     /// Vectors added to the index whose documents are not committed yet. Non-zero only between
     /// the index sync and the commit of a write. Unfiltered search asks for this many extra results
     /// and drops the uncommitted ones.
@@ -92,6 +96,28 @@ struct State {
     /// Set when the database is closed or the collection is dropped. A handle that
     /// outlives either must not write: the write would look successful and then be lost.
     closed: bool,
+}
+
+/// Catch-up stops when fewer bytes than this are committed after the last copied position, or after this many
+/// rounds. The swap copies whatever is left.
+const CATCH_UP_BYTES: u64 = 64 * 1024;
+const CATCH_UP_ROUNDS: usize = 8;
+
+/// A compacted document structure built in the background, waiting for its swap.
+struct Built {
+    docs: DocStore,
+    /// The temporary log that `docs` writes to.
+    tmp: PathBuf,
+    /// The old log's length up to which `docs` has the tail.
+    tail_from: u64,
+}
+
+/// The state of the background compaction of one collection.
+#[derive(Default)]
+struct CompactionSlot {
+    running: bool,
+    built: Option<Built>,
+    thread: Option<thread::JoinHandle<()>>,
 }
 
 /// A test observer of the compaction transitions.
@@ -227,6 +253,8 @@ enum Op {
     Delete(Vec<u64>),
     Flush,
     Calibrate(Vec<f32>),
+    /// Swap in the structure a background compaction built.
+    Compact,
 }
 
 /// The queue of writes waiting for a leader.
@@ -380,6 +408,10 @@ pub struct Collection {
     durable: bool,
     /// Writes waiting for a leader. See `submit`.
     queue: Mutex<Queue>,
+    /// The background compaction: whether one is running, and the structure it built for the swap.
+    compaction: Mutex<CompactionSlot>,
+    /// This collection, as a `Weak` so that a compaction thread can reach it without keeping it alive.
+    self_ref: std::sync::OnceLock<std::sync::Weak<Collection>>,
     /// Signalled when a leader finishes, so that a waiting writer can become the leader.
     ready: Condvar,
     state: RwLock<State>,
@@ -410,6 +442,7 @@ impl Collection {
         docs: DocStore,
         durable: bool,
     ) -> Self {
+        let docs_len = docs.log_len();
         Self {
             name: name.to_string(),
             stats: Mutex::new(None),
@@ -418,6 +451,8 @@ impl Collection {
             catalog,
             durable,
             queue: Mutex::new(Queue::default()),
+            compaction: Mutex::new(CompactionSlot::default()),
+            self_ref: std::sync::OnceLock::new(),
             ready: Condvar::new(),
             counters: WriteCounters::default(),
             state: RwLock::new(State {
@@ -425,6 +460,7 @@ impl Collection {
                 store,
                 docs,
                 unsynced: 0,
+                committed_len: docs_len,
                 pending: 0,
                 poisoned: None,
             }),
@@ -752,6 +788,7 @@ impl Collection {
     fn commit_batch(&self, state: &mut State, batch: Batch) {
         for staged in batch.staged {
             state.docs.commit(staged);
+            state.committed_len = state.docs.log_len();
         }
         let recorded = if batch.was_empty && state.store.dim().is_some() {
             self.record_dimension(state)
@@ -772,6 +809,7 @@ impl Collection {
             Op::Delete(ids) => self.run_delete(ids),
             Op::Flush => self.flush_locked().map(|()| 0),
             Op::Calibrate(sample) => self.calibrate_locked(sample).map(|()| 0),
+            Op::Compact => self.swap_queued().map(|()| 0),
             Op::Add { .. } => unreachable!("adds run in run_adds"),
         }
     }
@@ -805,8 +843,8 @@ impl Collection {
     /// log is synced with the lock released. Any failure from the index sync on poisons the
     /// collection, as `delete` documents (docs/STORAGE.md).
     fn delete_ids<'a>(&'a self, mut state: WriteGuard<'a>, ids: &[u64]) -> Result<(), ZenarError> {
-        let compacting = state.docs.compaction_due_after(ids.len());
-        self.lower_recorded_lengths(ids.len(), compacting)?;
+        // The log shrinks only at a swap, which records its own lengths (see `swap_locked`).
+        self.lower_recorded_lengths(ids.len(), false)?;
         for &id in ids {
             state.store.remove(id);
         }
@@ -830,13 +868,10 @@ impl Collection {
             return Err(poison(&mut state, e));
         }
         state.docs.commit(staged);
+        state.committed_len = state.docs.log_len();
         state.unsynced = 0;
         if state.docs.should_compact() {
-            // Any failure in the compaction poisons the collection. A reopen then settles it by the rules in
-            // database.rs (docs/R3.md, section 5).
-            if let Err(e) = self.compact_locked(&mut state) {
-                return Err(poison(&mut state, e));
-            }
+            self.start_compaction();
         }
         if let Err(e) = self.record_durable(&state) {
             return Err(poison(&mut state, e));
@@ -1241,6 +1276,7 @@ impl Collection {
         for id in orphan_docs {
             let staged = state.docs.stage_delete(id)?;
             state.docs.commit(staged);
+            state.committed_len = state.docs.log_len();
             report.orphaned_rows_removed += 1;
             dirty = true;
         }
@@ -1331,38 +1367,276 @@ impl Collection {
         })
     }
 
-    /// Replaces the log with its compacted form, with the catalog transitions of docs/R3.md, section 4:
+    /// Starts a background build of the compacted structure, unless one is running. The build holds no lock
+    /// while it works. Its result is swapped in by a queued `Op::Compact`, so no write group is in its window
+    /// during the swap (docs/R3.md, section 4).
+    fn start_compaction(&self) {
+        let Some(me) = self.self_ref.get().and_then(std::sync::Weak::upgrade) else {
+            return;
+        };
+        {
+            let mut slot = me.compaction.lock().unwrap_or_else(|p| p.into_inner());
+            if slot.running {
+                return;
+            }
+            slot.running = true;
+        }
+        let runner = Arc::clone(&me);
+        let handle = thread::spawn(move || {
+            let _ = runner.run_compaction();
+        });
+        me.compaction
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .thread = Some(handle);
+    }
+
+    /// Builds the compacted structure, then queues its swap. Clears `running` when done.
+    fn run_compaction(&self) -> Result<(), ZenarError> {
+        let result = match self.build_compaction() {
+            Ok(built) => {
+                self.compaction
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .built = Some(built);
+                self.submit(Op::Compact).map(|_| ())
+            }
+            Err(e) => Err(e),
+        };
+        let leftover = {
+            let mut slot = self.compaction.lock().unwrap_or_else(|p| p.into_inner());
+            slot.running = false;
+            slot.built.take()
+        };
+        if let Some(built) = leftover {
+            // The swap did not take the build: remove its temporary log.
+            let tmp = built.tmp.clone();
+            drop(built);
+            let _ = fs::remove_file(tmp);
+        }
+        // Deletes made during the build may already have passed the threshold. Their delete found a build
+        // running and did not start one, so start the next compaction here.
+        let due = self
+            .read_state()
+            .is_ok_and(|state| state.docs.should_compact());
+        if due {
+            self.start_compaction();
+        }
+        result
+    }
+
+    /// Builds the compacted document structure without the collection lock (docs/R3.md, section 3):
     ///
-    /// 1. write the live documents to the temporary log, and sync it;
-    /// 2. record the new length and the old length in the catalog (P1), before the rename;
-    /// 3. rename the temporary log over the log, and sync the directory;
-    /// 4. reopen the log by replay;
-    /// 5. record the lengths and clear the pending record (P4).
+    /// 1. snapshot the committed length `S` under the read lock;
+    /// 2. write the live PUT frames below `S` to a temporary log, and replay it into a new structure;
+    /// 3. catch up: copy the committed bytes after the last copied position into the temporary log, and apply
+    ///    them to the new structure, in rounds, until the lag is small.
     ///
-    /// Every failure returns an error, and the caller poisons the collection. Writes do not resume until
-    /// P4 is durable, so the log is only ever one of the two lengths the catalog can name.
-    fn compact_locked(&self, state: &mut State) -> Result<(), ZenarError> {
-        self.compaction_point("before temp log")?;
-        let tmp = state.docs.write_compacted()?;
-        self.compaction_point("temp log synced")?;
-        let new_len = std::fs::metadata(&tmp)
-            .map_err(crate::docstore::io_err)?
-            .len();
-        let old_len = state.docs.log_len();
-        self.catalog.update(&self.name, |entry| {
-            entry.durable_log_len = new_len;
-            entry.compaction_pending = Some(old_len);
-        })?;
-        self.compaction_point("pending recorded")?;
-        state.docs.rename_compacted(&tmp)?;
-        self.compaction_point("renamed")?;
-        crate::docstore::sync_parent(state.docs.log_path())?;
-        self.compaction_point("directory synced")?;
-        state.docs.reopen()?;
-        self.compaction_point("reopened")?;
-        self.record_durable(state)?;
-        self.compaction_point("pending cleared")?;
+    /// Writes continue meanwhile. They append to the old log, and the swap copies whatever is left.
+    fn build_compaction(&self) -> Result<Built, ZenarError> {
+        let (path, fields, snapshot) = {
+            let state = self.read_state()?;
+            healthy(&state)?;
+            (
+                state.docs.log_path().to_path_buf(),
+                state.docs.fields().to_vec(),
+                state.committed_len,
+            )
+        };
+        let tmp = path.with_extension("log.compact");
+        let _ = fs::remove_file(&tmp);
+        match self.build_into(&path, &tmp, fields, snapshot) {
+            Ok((docs, tail_from)) => Ok(Built {
+                docs,
+                tmp,
+                tail_from,
+            }),
+            Err(e) => {
+                // A failed build leaves nothing behind: the temporary log is never the log.
+                let _ = fs::remove_file(&tmp);
+                Err(e)
+            }
+        }
+    }
+
+    /// The steps of `build_compaction` that write the temporary log.
+    fn build_into(
+        &self,
+        path: &Path,
+        tmp: &Path,
+        fields: Vec<(String, FieldKind)>,
+        snapshot: u64,
+    ) -> Result<(DocStore, u64), ZenarError> {
+        self.compaction_point("build snapshot")?;
+        DocStore::write_snapshot(path, snapshot, tmp)?;
+        self.compaction_point("build temp synced")?;
+        let mut docs = DocStore::open(tmp, fields)?;
+        self.compaction_point("build replayed")?;
+        let mut tail_from = snapshot;
+        for _ in 0..CATCH_UP_ROUNDS {
+            let watermark = self.read_state()?.committed_len;
+            if watermark.saturating_sub(tail_from) < CATCH_UP_BYTES {
+                break;
+            }
+            let bytes = DocStore::read_log_range(path, tail_from, watermark)?;
+            docs.append_raw(&bytes)?;
+            tail_from = watermark;
+            self.compaction_point("catch-up round")?;
+        }
+        self.compaction_point("build done")?;
+        Ok((docs, tail_from))
+    }
+
+    /// Takes the built structure and swaps it in, as a queued operation. Nothing is built if none is waiting.
+    fn swap_queued(&self) -> Result<(), ZenarError> {
+        let built = self
+            .compaction
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .built
+            .take();
+        let Some(built) = built else {
+            return Ok(());
+        };
+        let state = self.write_state()?;
+        // The old structure comes back out of the swap and is dropped here, after the lock is released, so
+        // freeing its rows and postings does not add to the writers' wait.
+        if let Some(old) = self.swap_locked(state, built)? {
+            drop(old);
+        }
         Ok(())
+    }
+
+    /// The swap (docs/R3.md, section 4). Failures before the rename undo themselves, and leave the collection
+    /// usable. A failure after the rename poisons it, and a reopen settles the catalog and the log. On success
+    /// the old structure is returned, for the caller to drop once the lock is released.
+    fn swap_locked(
+        &self,
+        mut state: WriteGuard<'_>,
+        built: Built,
+    ) -> Result<Option<DocStore>, ZenarError> {
+        let Built {
+            mut docs,
+            tmp,
+            tail_from,
+        } = built;
+        let path = state.docs.log_path().to_path_buf();
+        let prior = self
+            .catalog
+            .get(&self.name)?
+            .ok_or_else(|| ZenarError::CollectionNotFound(self.name.clone()))?;
+        // Before the rename: copy the final tail, sync the temporary log, and record the pending lengths.
+        let before_rename = (|| -> Result<(), ZenarError> {
+            healthy(&state)?;
+            let bytes = DocStore::read_log_range(&path, tail_from, state.committed_len)?;
+            docs.append_raw(&bytes)?;
+            self.compaction_point("swap tail")?;
+            docs.sync()?;
+            self.compaction_point("swap tail synced")?;
+            let new_len = docs.log_len();
+            let old_len = state.docs.log_len();
+            self.catalog.update(&self.name, |e| {
+                e.durable_log_len = new_len;
+                e.compaction_pending = Some(old_len);
+            })?;
+            self.compaction_point("pending recorded")?;
+            Ok(())
+        })();
+        if let Err(e) = before_rename {
+            drop(docs);
+            let _ = fs::remove_file(&tmp);
+            return self
+                .undo_before_rename(&mut state, &prior, e)
+                .map(|()| None);
+        }
+        // The rename. The old log's handle is released first, as Windows requires.
+        state.docs.release_handle();
+        if let Err(e) = fs::rename(&tmp, &path) {
+            let _ = fs::remove_file(&tmp);
+            if let Err(reattach) = state.docs.reattach() {
+                return Err(poison(&mut state, reattach));
+            }
+            return self
+                .undo_before_rename(&mut state, &prior, crate::docstore::io_err(e))
+                .map(|()| None);
+        }
+        // From here the file on disk is the new log, and the memory must follow it.
+        if let Err(e) = self.compaction_point("renamed") {
+            return Err(poison(&mut state, e));
+        }
+        if let Err(e) = crate::docstore::sync_parent(&path) {
+            return Err(poison(&mut state, e));
+        }
+        if let Err(e) = self.compaction_point("directory synced") {
+            return Err(poison(&mut state, e));
+        }
+        // The new structure already has an open handle on the renamed file, so no reopen is needed.
+        docs.retarget(&path);
+        let old = std::mem::replace(&mut state.docs, docs);
+        if let Err(e) = self.compaction_point("swapped") {
+            return Err(poison(&mut state, e));
+        }
+        if let Err(e) = self.record_durable(&state) {
+            return Err(poison(&mut state, e));
+        }
+        if let Err(e) = self.compaction_point("pending cleared") {
+            return Err(poison(&mut state, e));
+        }
+        state.committed_len = state.docs.log_len();
+        state.unsynced = 0;
+        Ok(Some(old))
+    }
+
+    /// Puts the catalog entry back to its state before the compaction. If that write fails, the catalog may
+    /// still hold the pending record, which a reopen settles, so the collection is poisoned.
+    fn undo_before_rename(
+        &self,
+        state: &mut WriteGuard<'_>,
+        prior: &Entry,
+        cause: ZenarError,
+    ) -> Result<(), ZenarError> {
+        let (len, pending) = (prior.durable_log_len, prior.compaction_pending);
+        match self.catalog.update(&self.name, |e| {
+            e.durable_log_len = len;
+            e.compaction_pending = pending;
+        }) {
+            Ok(()) => Err(cause),
+            Err(e) => Err(poison(state, e)),
+        }
+    }
+
+    /// Starts a compaction and waits for it, on this thread. Test use only.
+    #[cfg(test)]
+    pub(crate) fn compact_now(&self) -> Result<(), ZenarError> {
+        {
+            let mut slot = self.compaction.lock().unwrap_or_else(|p| p.into_inner());
+            if slot.running {
+                return Err(ZenarError::InvalidArgument(
+                    "a compaction is running".into(),
+                ));
+            }
+            slot.running = true;
+        }
+        self.run_compaction()
+    }
+
+    /// Waits for a background compaction to finish. Test use only.
+    #[cfg(test)]
+    pub(crate) fn wait_for_compaction(&self) {
+        let handle = self
+            .compaction
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .thread
+            .take();
+        if let Some(handle) = handle {
+            let _ = handle.join();
+        }
+    }
+
+    /// Lets the database give this collection the reference a compaction thread needs.
+    pub(crate) fn set_self_ref(self: &Arc<Self>) {
+        let _ = self.self_ref.set(Arc::downgrade(self));
     }
 
     /// Test hook at each transition of a compaction. A hook can observe the directory (to copy it, as a
@@ -2907,14 +3181,19 @@ mod recovery_tests {
         fs::remove_dir_all(&dir).ok();
     }
 
-    /// The transitions of a compaction, in order (see `compact_locked`).
-    const COMPACTION_POINTS: [&str; 7] = [
-        "before temp log",
-        "temp log synced",
+    /// The transitions of a compaction, in order (see `build_compaction` and `swap_locked`). This fixture has
+    /// no writes during the build, so no catch-up round happens.
+    const COMPACTION_POINTS: [&str; 11] = [
+        "build snapshot",
+        "build temp synced",
+        "build replayed",
+        "build done",
+        "swap tail",
+        "swap tail synced",
         "pending recorded",
         "renamed",
         "directory synced",
-        "reopened",
+        "swapped",
         "pending cleared",
     ];
 
@@ -3069,6 +3348,7 @@ mod recovery_tests {
             c.delete_many(&(0..6000).collect::<Vec<u64>>()).unwrap(),
             6000
         );
+        c.wait_for_compaction();
         *c.compaction_hook.lock().unwrap() = None;
         drop(c);
         drop(db);
@@ -3084,58 +3364,56 @@ mod recovery_tests {
         fs::remove_dir_all(&copies).ok();
     }
 
-    /// A failure at each transition poisons the collection, and reopening recovers the committed documents
-    /// and a usable collection.
+    /// A failure at each transition of the compaction. Before the rename, the compaction undoes itself and the
+    /// collection stays usable. From the rename on, the file and the memory can disagree until a reopen, so the
+    /// collection is poisoned. A reopen recovers the committed documents in every case.
     #[test]
-    fn failure_at_each_compaction_transition_poisons_and_reopen_recovers() {
+    fn failure_at_each_compaction_transition_is_safe_and_reopen_recovers() {
+        let before_rename = [
+            "build snapshot",
+            "build temp synced",
+            "build replayed",
+            "build done",
+            "swap tail",
+            "swap tail synced",
+            "pending recorded",
+        ];
         for point in COMPACTION_POINTS {
             let dir = temp_dir(&format!("fail-{}", point.replace(' ', "-")));
             let (db, c) = compacting_fixture(&dir);
             *c.fail_compaction_at.lock().unwrap() = Some(point);
             assert!(
-                c.delete_many(&(0..6000).collect::<Vec<u64>>()).is_err(),
+                c.delete_many(&(0..6000).collect::<Vec<u64>>()).is_ok(),
                 "{point}"
             );
-            assert!(
-                matches!(c.count(), Err(ZenarError::PersistenceError(_))),
-                "{point}"
-            );
+            c.wait_for_compaction();
+            if before_rename.contains(&point) {
+                check_compacting_fixture(&db);
+                c.add(20_000, &along(0.3, 20_000), "after", vec![]).unwrap();
+                assert_eq!(c.count().unwrap(), 4001, "{point}");
+            } else {
+                assert!(
+                    matches!(c.count(), Err(ZenarError::PersistenceError(_))),
+                    "{point}"
+                );
+            }
             drop(c);
             drop(db);
             let db = VectorDB::open(&dir).unwrap_or_else(|e| panic!("{point}: {e:?}"));
-            check_compacting_fixture(&db);
             let c = db.get_collection("cp").unwrap();
-            c.add(20_000, &along(0.3, 20_000), "after", vec![]).unwrap();
-            assert_eq!(c.count().unwrap(), 4001, "{point}");
+            let expected = if before_rename.contains(&point) {
+                4001
+            } else {
+                4000
+            };
+            assert_eq!(c.count().unwrap(), expected, "{point}");
+            assert!(c.get(6000).unwrap().is_some(), "{point}");
+            assert!(c.get(5999).unwrap().is_none(), "{point}");
             fs::remove_dir_all(&dir).ok();
         }
     }
 
     /// A catalog write that fails while the pending record is recorded poisons the collection. The pending
-    /// record is not on disk, so the reopen sees the old log and the old lengths.
-    #[test]
-    fn failed_pending_record_leaves_the_old_log_and_reopen_recovers() {
-        use std::sync::atomic::Ordering;
-        let dir = temp_dir("fail-pending-write");
-        let (db, c) = compacting_fixture(&dir);
-        // Arm the catalog failure at the point just before the pending record is written. The lowering write
-        // of the delete runs earlier and is not the one that fails.
-        let catalog = Arc::clone(&c.catalog);
-        *c.compaction_hook.lock().unwrap() = Some(Arc::new(move |point: &'static str| {
-            if point == "temp log synced" {
-                catalog
-                    .fail_persist_before_rename
-                    .store(true, Ordering::SeqCst);
-            }
-        }));
-        assert!(c.delete_many(&(0..6000).collect::<Vec<u64>>()).is_err());
-        *c.compaction_hook.lock().unwrap() = None;
-        drop(c);
-        drop(db);
-        check_compacting_fixture(&VectorDB::open(&dir).unwrap());
-        fs::remove_dir_all(&dir).ok();
-    }
-
     /// A pending record whose log is neither the old nor the new length refuses to open: the log changed
     /// outside Zenar, and recovery cannot tell which state it is in.
     #[test]
@@ -3150,6 +3428,7 @@ mod recovery_tests {
             }
         }));
         c.delete_many(&(0..6000).collect::<Vec<u64>>()).unwrap();
+        c.wait_for_compaction();
         *c.compaction_hook.lock().unwrap() = None;
         drop(c);
         drop(db);
@@ -3189,10 +3468,310 @@ mod recovery_tests {
             log.lock().unwrap().push(point);
         }));
         c.delete_many(&(0..6000).collect::<Vec<u64>>()).unwrap();
+        c.wait_for_compaction();
         *c.compaction_hook.lock().unwrap() = None;
         assert_eq!(*seen.lock().unwrap(), COMPACTION_POINTS.to_vec());
         drop(c);
         drop(db);
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Writes during the build are carried by the tail. Here 2,000 documents are added and 500 deleted while the
+    /// build has replayed its snapshot, which is enough committed bytes for a catch-up round.
+    #[test]
+    fn writes_during_the_build_are_carried_by_the_tail() {
+        let dir = temp_dir("writes-during-build");
+        let (db, c) = compacting_fixture(&dir);
+        let seen = Arc::new(Mutex::new(Vec::<&'static str>::new()));
+        let log = Arc::clone(&seen);
+        let writer = Arc::clone(&c);
+        let fired = std::sync::atomic::AtomicBool::new(false);
+        *c.compaction_hook.lock().unwrap() = Some(Arc::new(move |point: &'static str| {
+            log.lock().unwrap().push(point);
+            if point == "build replayed" && !fired.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                let records: Vec<Record> = (20_000..22_000)
+                    .map(|i| Record {
+                        id: i,
+                        vector: along(0.2, i),
+                        text: "tail".into(),
+                        metadata: vec![],
+                    })
+                    .collect();
+                writer.add_many(&records).unwrap();
+                writer
+                    .delete_many(&(6000..6500).collect::<Vec<u64>>())
+                    .unwrap();
+            }
+        }));
+        c.delete_many(&(0..6000).collect::<Vec<u64>>()).unwrap();
+        c.wait_for_compaction();
+        *c.compaction_hook.lock().unwrap() = None;
+        assert!(
+            seen.lock().unwrap().contains(&"catch-up round"),
+            "{:?}",
+            seen.lock().unwrap()
+        );
+        assert_eq!(c.count().unwrap(), 4000 + 2000 - 500);
+        assert!(c.get(6000).unwrap().is_none() || c.get(6000).unwrap().is_some());
+        assert!(c.get(6499).unwrap().is_none());
+        assert!(c.get(6500).unwrap().is_some());
+        assert!(c.get(21_999).unwrap().is_some());
+        // The swap keeps the live rows. The 500 deletes made during the build are applied to the new structure
+        // as dead rows, which the next compaction reclaims (docs/R3.md, section 10).
+        assert_eq!(
+            c.state.read().unwrap().docs.row_count(),
+            5500 + 500,
+            "after the swap: live rows and the dead rows of the build's deletes"
+        );
+        c.compact_now().unwrap();
+        assert_eq!(
+            c.state.read().unwrap().docs.row_count(),
+            5500,
+            "the next compaction reclaims them"
+        );
+        drop(c);
+        drop(db);
+        let db = VectorDB::open(&dir).unwrap();
+        let c = db.get_collection("cp").unwrap();
+        assert_eq!(c.count().unwrap(), 5500);
+        assert!(c.get(6499).unwrap().is_none());
+        assert!(c.get(21_999).unwrap().is_some());
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Search results during the build and after the swap equal those before it: the same ids, in the same
+    /// order, for several values of top_k.
+    #[test]
+    fn search_is_the_same_before_during_and_after_the_build() {
+        let dir = temp_dir("topk-during-build");
+        let (_db, c) = compacting_fixture(&dir);
+        let query = along(0.3, 0);
+        let reference: Vec<Vec<u64>> = [1usize, 10, 50, 5000]
+            .iter()
+            .map(|&k| {
+                c.search(&query, k, None)
+                    .unwrap()
+                    .iter()
+                    .map(|h| h.id)
+                    .collect()
+            })
+            .collect();
+        let during = Arc::new(Mutex::new(Vec::<Vec<u64>>::new()));
+        let sink = Arc::clone(&during);
+        let reader = Arc::clone(&c);
+        *c.compaction_hook.lock().unwrap() = Some(Arc::new(move |point: &'static str| {
+            // Only the build runs without the collection lock. A swap point holds it, so a search there would wait.
+            if point == "build done" {
+                for k in [1usize, 10, 50, 5000] {
+                    let ids: Vec<u64> = reader
+                        .search(&along(0.3, 0), k, None)
+                        .unwrap()
+                        .iter()
+                        .map(|h| h.id)
+                        .collect();
+                    sink.lock().unwrap().push(ids);
+                }
+            }
+        }));
+        c.delete_many(&(0..6000).collect::<Vec<u64>>()).unwrap();
+        c.wait_for_compaction();
+        *c.compaction_hook.lock().unwrap() = None;
+        // The reference was taken before the delete, so it includes deleted ids. Compare against the
+        // results after the delete, taken with the same query and k.
+        let after: Vec<Vec<u64>> = [1usize, 10, 50, 5000]
+            .iter()
+            .map(|&k| {
+                c.search(&query, k, None)
+                    .unwrap()
+                    .iter()
+                    .map(|h| h.id)
+                    .collect()
+            })
+            .collect();
+        let during = during.lock().unwrap().clone();
+        assert_eq!(during.len(), 4);
+        for (i, ids) in during.iter().enumerate() {
+            assert_eq!(ids, &after[i], "result {i} during the build");
+        }
+        for ids in &after {
+            assert!(
+                ids.iter().all(|&id| id >= 6000),
+                "a deleted id was returned: {ids:?}"
+            );
+        }
+        assert!(reference.iter().all(|ids| !ids.is_empty()));
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Dead rows are reclaimed without a reopen. After the swap the row table holds only live documents, and
+    /// the process is the same one that built them.
+    #[test]
+    fn dead_rows_are_reclaimed_by_the_swap_without_reopening() {
+        let dir = temp_dir("reclaim");
+        let (db, c) = compacting_fixture(&dir);
+        assert_eq!(
+            c.state.read().unwrap().docs.row_count(),
+            10_000,
+            "before: every row is in memory"
+        );
+        c.delete_many(&(0..6000).collect::<Vec<u64>>()).unwrap();
+        c.wait_for_compaction();
+        assert_eq!(
+            c.state.read().unwrap().docs.row_count(),
+            4000,
+            "after: only live rows"
+        );
+        assert_eq!(c.count().unwrap(), 4000);
+        drop(c);
+        drop(db);
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Repeated compactions do not accumulate rows: each round adds 6,000 documents, deletes the 6,000 oldest,
+    /// compacts, and leaves the row table at the live size, with a log of about the live size.
+    #[test]
+    fn repeated_compactions_keep_memory_and_the_log_at_the_live_size() {
+        let dir = temp_dir("repeated");
+        let (db, c) = compacting_fixture(&dir);
+        let log = dir.join("docs").join("cp.zdocs");
+        // The fixture holds ids 0..10000. Delete the first 6,000 so the live window is ids 6000..10000: 4,000
+        // documents. Each round adds 6,000 and deletes the 6,000 oldest, so the dead rows pass both the live
+        // count and 4,096, and a compaction runs every round.
+        c.delete_many(&(0..6000).collect::<Vec<u64>>()).unwrap();
+        c.wait_for_compaction();
+        assert_eq!(c.count().unwrap(), 4000, "setup");
+        let mut window: std::collections::VecDeque<u64> = (6000..10_000).collect();
+        let mut next = 10_000u64;
+        for round in 0..5 {
+            let ids: Vec<u64> = (next..next + 6000).collect();
+            next += 6000;
+            for chunk in ids.chunks(1000) {
+                let records: Vec<Record> = chunk
+                    .iter()
+                    .map(|&i| Record {
+                        id: i,
+                        vector: along(0.1 + (i % 50) as f32 * 0.01, i),
+                        text: format!("doc {i}"),
+                        metadata: vec![],
+                    })
+                    .collect();
+                c.add_many(&records).unwrap();
+            }
+            window.extend(ids);
+            let victims: Vec<u64> = (0..6000).map(|_| window.pop_front().unwrap()).collect();
+            c.delete_many(&victims).unwrap();
+            c.wait_for_compaction();
+            assert_eq!(c.count().unwrap(), 4000, "round {round}");
+            assert_eq!(
+                c.state.read().unwrap().docs.row_count(),
+                4000,
+                "round {round}: rows reclaimed"
+            );
+            let len = fs::metadata(&log).unwrap().len();
+            assert!(len < 4000 * 400, "round {round}: the log is {len} bytes");
+        }
+        drop(c);
+        drop(db);
+        let db = VectorDB::open(&dir).unwrap();
+        assert_eq!(db.get_collection("cp").unwrap().count().unwrap(), 4000);
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A build that fails removes its temporary log, and the collection is usable.
+    #[test]
+    fn failed_build_leaves_no_temporary_log() {
+        let dir = temp_dir("failed-build-tmp");
+        let (db, c) = compacting_fixture(&dir);
+        *c.fail_compaction_at.lock().unwrap() = Some("build replayed");
+        c.delete_many(&(0..6000).collect::<Vec<u64>>()).unwrap();
+        c.wait_for_compaction();
+        assert!(!dir.join("docs").join("cp.log.compact").exists());
+        assert_eq!(c.count().unwrap(), 4000);
+        drop(c);
+        drop(db);
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Writers, deleters and readers run during background compactions. No search returns a repeated id or an
+    /// id deleted before it started, every acknowledged add is counted, and the reopened state matches.
+    #[test]
+    fn concurrent_writers_deleters_and_readers_during_compaction() {
+        use std::collections::HashSet;
+        use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+        let dir = temp_dir("concurrent-compaction");
+        let db = VectorDB::open(&dir).unwrap();
+        let c = db.create_collection("cc", Some(8), 4).unwrap();
+        c.add_many(
+            &(0..10_000)
+                .map(|i| Record {
+                    id: i,
+                    vector: along(0.1 + (i % 40) as f32 * 0.01, i),
+                    text: "seed".into(),
+                    metadata: vec![],
+                })
+                .collect::<Vec<_>>(),
+        )
+        .unwrap();
+        let deleted = Arc::new(Mutex::new(Vec::<u64>::new()));
+        let added = Arc::new(AtomicU64::new(0));
+        let stop = Arc::new(AtomicBool::new(false));
+        let mut threads = Vec::new();
+        {
+            let (c, deleted) = (Arc::clone(&c), Arc::clone(&deleted));
+            threads.push(thread::spawn(move || {
+                // Batches: one delete call makes two catalog writes, so single deletes would be slow here.
+                for chunk in (0..6000u64).collect::<Vec<_>>().chunks(500) {
+                    c.delete_many(chunk).unwrap();
+                    deleted.lock().unwrap().extend_from_slice(chunk);
+                }
+            }));
+        }
+        for w in 0..2u64 {
+            let (c, added) = (Arc::clone(&c), Arc::clone(&added));
+            threads.push(thread::spawn(move || {
+                for b in 0..40u64 {
+                    let records: Vec<Record> = (0..50)
+                        .map(|i| Record {
+                            id: 100_000 + w * 100_000 + b * 50 + i,
+                            vector: along(0.5, b * 50 + i),
+                            text: "w".into(),
+                            metadata: vec![],
+                        })
+                        .collect();
+                    c.add_many(&records).unwrap();
+                    added.fetch_add(50, Ordering::SeqCst);
+                }
+            }));
+        }
+        let mut readers = Vec::new();
+        for _ in 0..2 {
+            let (c, deleted, stop) = (Arc::clone(&c), Arc::clone(&deleted), Arc::clone(&stop));
+            readers.push(thread::spawn(move || {
+                while !stop.load(Ordering::SeqCst) {
+                    let gone: HashSet<u64> = deleted.lock().unwrap().iter().copied().collect();
+                    let hits = c.search(&along(0.5, 0), 500, None).unwrap();
+                    let ids: HashSet<u64> = hits.iter().map(|h| h.id).collect();
+                    assert_eq!(ids.len(), hits.len(), "repeated id in results");
+                    for id in &gone {
+                        assert!(!ids.contains(id), "deleted id {id} returned");
+                    }
+                }
+            }));
+        }
+        for t in threads {
+            t.join().unwrap();
+        }
+        c.wait_for_compaction();
+        stop.store(true, Ordering::SeqCst);
+        for r in readers {
+            r.join().unwrap();
+        }
+        let expected = 10_000 - 6000 + added.load(Ordering::SeqCst) as usize;
+        assert_eq!(c.count().unwrap(), expected);
+        drop(c);
+        drop(db);
+        let db = VectorDB::open(&dir).unwrap();
+        assert_eq!(db.get_collection("cc").unwrap().count().unwrap(), expected);
         fs::remove_dir_all(&dir).ok();
     }
 }

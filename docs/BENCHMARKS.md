@@ -331,6 +331,38 @@ design in `docs/R3.md` is measured against. Reproduce with `compaction_bench -- 
 Each compaction reclaims about 16 MB of dead-row memory at 200,000 dead rows, about 80 bytes per dead row. The heap follows
 the live set across rounds, with no growth. The figures are measured, not estimated.
 
+### Compaction under load: background build (`compaction_bench`, stage 2)
+
+The same run after the background build and the short swap of `docs/R3.md` (sections 3 and 4). The build runs without
+the collection lock, and only the swap holds it. Reproduce with `compaction_bench -- 200000 40 8`. The bench's sampler
+reads the temporary log every millisecond: a build is the time that log exists, and a swap is the step where the log
+gets shorter. All figures below are measured on the same reference machine. Search throughput varied by about 20%
+between runs (3,759 to 4,672 per second across the stage 2 runs).
+
+| Measure | Baseline (reopen-based) | Stage 2 (background build) |
+|---|---|---|
+| Builds / swaps in the run | compaction inside a delete | 3 / 3 |
+| Duration of one build (sampler, 294 ticks over 3 builds) | not separated | about 98 ms (measured) |
+| Lock held by the swap, 3 swaps (temporary probe) | not separated | 19.6, 21.6, 22.6 ms (measured) |
+| Delete batch that compacted, lock held | 86 to 100 ms | not separate: the delete call is 22.9 ms p50, 24.8 ms p95, 41.3 ms max |
+| Searches that started during a build (n = 1,660) | 0.28 / 74 / 79 ms, during the compacting batch (n = 365) | 0.32 / 12.6 / 22.0 ms (p50 / p95 / p99) |
+| All searches, p50 / p95 / p99 | 0.32 / 12.8 / 15.0 ms | 0.27 / 12.4 / 14.4 ms |
+| Search throughput, 8 readers | 3,811/s | 4,517/s (4,672/s in an earlier run) |
+| Writer batch of 1,000 rows, p50 / p95 | 16.2 / 19.7 ms | 15.7 / 20.1 ms |
+| Peak heap | 73.6 to 75.2 MB | 154.3 MB |
+| Heap at the round after each swap (rounds 10, 20, 30) | 35 to 37.5 MB | 35.6, 36.9, 37.3 MB |
+| Longest write-lock hold, whole run | not measured | 103 ms (the max of every write; the swap is 20 ms, so the 103 ms hold is another write, not yet attributed) |
+
+What this shows. Searches during a compaction are no longer blocked for the length of the rewrite, and the swap's
+lock hold is about 20 ms rather than the 86 to 100 ms of the reopen. The cost is memory: while a build runs, the old
+and the new row tables are both in memory, and the peak heap rises by about 80 MB at 200,000 live documents. That is
+the transient the design lists in section 11. It is measured here, not estimated. The writer's 1,000-row batch time is
+unchanged, and the search p95 and p99 over the whole run are unchanged within noise.
+
+Known limits, not measured here: deletes made during a build stay as dead rows in the swapped structure until the next
+compaction (`docs/R3.md`, section 14); the 103 ms maximum hold is not yet attributed; and power loss was not tested on
+hardware.
+
 ### Delta scan cost (`delta_scan`, dimension 384, naive scalar loops)
 
 | Vectors scanned per query | Time per query |

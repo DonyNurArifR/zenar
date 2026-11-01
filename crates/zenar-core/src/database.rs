@@ -102,18 +102,19 @@ impl VectorDB {
                     entry.durable_vectors,
                 )));
             }
-            let collection = Collection::new(
+            let collection = Arc::new(Collection::new(
                 &name,
                 index_path,
                 Arc::clone(&catalog),
                 store,
                 docs,
                 durable,
-            );
+            ));
+            collection.set_self_ref();
             let report = collection.reconcile()?;
             recovery.orphaned_rows_removed += report.orphaned_rows_removed;
             recovery.orphaned_vectors_removed += report.orphaned_vectors_removed;
-            collections.insert(name, Arc::new(collection));
+            collections.insert(name, collection);
         }
 
         Ok(Self {
@@ -198,6 +199,7 @@ impl VectorDB {
             docs,
             self.durable,
         ));
+        collection.set_self_ref();
         // A new index file is written only when the dimension is known. A lazy index has no
         // dimension to write until its first add.
         if dimension.is_some() {

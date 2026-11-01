@@ -6,6 +6,10 @@ project follows [semantic versioning](https://semver.org/) while it is pre-1.0.
 ## Unreleased
 
 ### Changed
+- Compaction runs in the background. A build writes the live documents without the collection lock, and only the swap
+  holds it, for about 20 ms at 200,000 live documents. Searches during a build keep their latency: p95 12.6 ms against
+  74 ms for the blocking compaction it replaces. Peak heap during a build rises, because the old and new row tables both
+  exist until the swap. Deletes made during a build stay as dead rows until the next compaction (docs/R3.md, section 14).
 - Unfiltered search returns `top_k` committed results when that many exist, even while a write is between its index sync
   and its commit. Documents of a write that has not returned yet are not returned.
 - A failed write to the document log poisons the collection, and so does a failed truncation after one. Before, the

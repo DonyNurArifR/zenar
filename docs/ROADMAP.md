@@ -35,11 +35,11 @@ not. Items marked done are verified in the code and the test suite; the tests ar
 
 ## Open, in priority order
 
-1. **Compaction holds the write lock for its whole rewrite and reopen.** The rewrite now reads the log once: a compacting
-   delete batch at a million rows fell from 261 ms to 127 to 132 ms. The reopen replay (156 ms at 500,000 live rows) is
-   now most of the rest. The design that moves the rewrite out of the lock (snapshot, background rewrite, a swap that copies
-   the tail and remaps offsets) is in docs/COMPACTION.md. Its consistency claim is proven at the protocol level by
-   `tests/test_compaction_model.py`. It is not implemented, pending review of the design.
+1. **Background compaction: implemented (R3, stage 2).** The build runs without the lock, the swap holds it for about 20 ms
+   at 200,000 live documents, and the old row table is freed outside the lock. Open items, measured in
+   `docs/BENCHMARKS.md`: the peak heap during a build is about 154 MB against 74 MB, because the old and new row tables
+   coexist; deletes made during a build stay dead until the next compaction; a 103 ms write-lock hold is not yet
+   attributed; power loss is not tested on hardware (`docs/R3.md`, sections 12 and 14).
 0. **Staging under the index lock: investigated, not implemented.** Validation and encoding are about 0.1 ms per batch of
    about 5 ms of a four-writer group's exclusive time. Moving them out would gain less than the run-to-run noise
    (docs/CONCURRENCY.md, "Staging outside the state lock"). The index sync is most of the hold, and it needs a TurboVec change.

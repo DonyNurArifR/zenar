@@ -125,14 +125,31 @@ fn main() {
         }));
     }
 
+    // A sampler checks every millisecond whether a build's temporary log exists and how long the log is. A build
+    // is the time the temporary log exists, and a swap is the step where the log gets shorter.
+    let tmp_log = dir.join("docs").join("w.log.compact");
+    let sampler_stop = Arc::new(AtomicBool::new(false));
+    let sampler = {
+        let (stop, log, tmp_log) = (Arc::clone(&sampler_stop), log.clone(), tmp_log.clone());
+        thread::spawn(move || {
+            let mut samples: Vec<(f64, bool, u64)> = Vec::new();
+            while !stop.load(Ordering::Relaxed) {
+                let t = epoch.elapsed().as_secs_f64();
+                let building = tmp_log.exists();
+                let len = std::fs::metadata(&log).map_or(0, |m| m.len());
+                samples.push((t, building, len));
+                thread::sleep(std::time::Duration::from_millis(1));
+            }
+            samples
+        })
+    };
+
     let mut delete_holds = Vec::new();
-    // (round, start, end, duration ms, peak heap in MB) for each delete batch that compacted.
-    let mut compactions: Vec<(usize, f64, f64, f64, f64)> = Vec::new();
     let mut round_heap = Vec::new();
     let mut oldest = 0u64;
     let mut writer_batches = Vec::new();
     let run_start = Instant::now();
-    for round in 0..rounds {
+    for _ in 0..rounds {
         for _ in 0..(per_round / batch) {
             let records: Vec<Record> = (next..next + batch).map(record).collect();
             let t = Instant::now();
@@ -141,42 +158,42 @@ fn main() {
             next += batch;
             let ids: Vec<u64> = (oldest..oldest + batch).collect();
             oldest += batch;
-            let before = std::fs::metadata(&log).expect("log").len();
-            PEAK.store(HEAP.load(Ordering::Relaxed), Ordering::Relaxed);
             let t = Instant::now();
             col.delete_many(&ids).expect("delete_many");
-            let took = t.elapsed().as_secs_f64() * 1e3;
-            let peak_during = mb(PEAK.load(Ordering::Relaxed));
-            let after = std::fs::metadata(&log).expect("log").len();
-            delete_holds.push(took);
-            if after < before {
-                compactions.push((
-                    round,
-                    t.duration_since(epoch).as_secs_f64(),
-                    t.duration_since(epoch).as_secs_f64() + took / 1e3,
-                    took,
-                    peak_during,
-                ));
-            }
+            delete_holds.push(t.elapsed().as_secs_f64() * 1e3);
         }
         round_heap.push(mb(HEAP.load(Ordering::Relaxed)));
     }
     let wall = run_start.elapsed().as_secs_f64();
     stop.store(true, Ordering::Relaxed);
+    sampler_stop.store(true, Ordering::Relaxed);
+    let log_samples = sampler.join().expect("sampler");
+    // A build runs from the step where the temporary log appears to the step where it is gone; the swap is in
+    // that step, and the log shrinks there.
+    let mut builds: Vec<(f64, f64)> = Vec::new();
+    let mut swaps: Vec<(f64, u64)> = Vec::new();
+    let mut build_start: Option<f64> = None;
+    for pair in log_samples.windows(2) {
+        let (prev, cur) = (pair[0], pair[1]);
+        if cur.1 && !prev.1 {
+            build_start = Some(cur.0);
+        } else if prev.1 && !cur.1 {
+            builds.extend(build_start.take().map(|start| (start, cur.0)));
+        }
+        if cur.2 < prev.2 {
+            swaps.push((cur.0, prev.2 - cur.2));
+        }
+    }
     let samples: Vec<(f64, f64)> = reader_handles
         .into_iter()
         .flat_map(|h| h.join().expect("reader"))
         .collect();
     let mut search: Vec<f64> = samples.iter().map(|s| s.1).collect();
     let search_n = search.len();
-    // Searches that started during a compacting delete batch.
+    // Searches that started during a build.
     let mut during: Vec<f64> = samples
         .iter()
-        .filter(|(start, _)| {
-            compactions
-                .iter()
-                .any(|(_, cs, ce, _, _)| *start >= *cs && *start <= *ce)
-        })
+        .filter(|(start, _)| builds.iter().any(|(bs, be)| *start >= *bs && *start <= *be))
         .map(|s| s.1)
         .collect();
 
@@ -185,7 +202,12 @@ fn main() {
         "collection: {live} live at start, {} live at end, dim {DIM}, {rounds} rounds of +{per_round} / -{per_round}, {readers} readers",
         live_now
     );
-    println!("run: {wall:.1} s; compactions: {}", compactions.len());
+    println!(
+        "run: {wall:.1} s; builds: {}; swaps: {}; sampler ticks with a build in progress: {}",
+        builds.len(),
+        swaps.len(),
+        log_samples.iter().filter(|s| s.1).count()
+    );
     println!(
         "search: {:.0}/s  p50 {:.3}  p95 {:.3}  p99 {:.3} ms  (n = {search_n})",
         search_n as f64 / wall,
@@ -201,21 +223,22 @@ fn main() {
     );
     let mut holds = delete_holds.clone();
     println!(
-        "delete batches (lock held, includes compaction): p50 {:.1}  p95 {:.1}  max {:.1} ms",
+        "delete batches (call time): p50 {:.1}  p95 {:.1}  max {:.1} ms",
         pct(&mut holds.clone(), 0.50),
         pct(&mut holds.clone(), 0.95),
         pct(&mut holds, 1.0)
     );
     println!(
-        "searches that started during a compacting batch: n = {}, p50 {:.3}  p95 {:.3}  p99 {:.3} ms",
+        "searches that started during a build: n = {}, p50 {:.3}  p95 {:.3}  p99 {:.3} ms",
         during.len(),
         pct(&mut during.clone(), 0.50),
         pct(&mut during.clone(), 0.95),
         pct(&mut during, 0.99)
     );
-    for (round, _, _, took, peak) in &compactions {
+    for (at, dropped) in &swaps {
         println!(
-            "  compaction in round {round}: delete batch {took:.1} ms, peak heap during it {peak:.1} MB"
+            "  swap at {at:.2} s: log shrank by {:.1} MB",
+            *dropped as f64 / 1e6
         );
     }
     println!(
@@ -228,6 +251,14 @@ fn main() {
             .map(|h| format!("{h:.1}"))
             .collect::<Vec<_>>()
             .join(" ")
+    );
+    let stats = col.write_stats();
+    println!(
+        "write lock (whole run, includes the swap): holds {}  mean {:.2} ms  max {:.2} ms; readers waited max {:.3} ms",
+        stats.write_holds,
+        stats.write_hold_total_ns as f64 / stats.write_holds.max(1) as f64 / 1e6,
+        stats.write_hold_max_ns as f64 / 1e6,
+        stats.read_wait_max_ns as f64 / 1e6,
     );
     drop(col);
     drop(db);

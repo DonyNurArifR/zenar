@@ -35,11 +35,15 @@ On open, the log is replayed from the start:
 | Zeros from the last valid frame to the end | Torn tail. Truncated. (A file system may extend a file before writing data.) |
 | A bad CRC or undecodable frame followed by more data | `RecoveryError`. The database does not open. Later records are never dropped silently. |
 
-Compaction runs when dead records outnumber live ones and there are more than 4096 dead. It reads the log once, from the
-front, and writes the live records to a temporary file, syncs it, releases the log's file handle (Windows refuses to rename over an open file), renames the
-temporary file over the log, syncs the directory, and reopens the log. If the rename fails, the old log is reopened and
-nothing changes. Any other error in compaction poisons the collection (see below). The safe course is a reopen, which
-replays whichever log is on disk.
+Compaction runs when dead records outnumber live ones and there are more than 4096 dead. It runs in the background:
+a thread reads the log up to a snapshot, writes the live records to a temporary file, syncs it, and replays that file into
+a new row table. It then copies the frames written since the snapshot. Only the swap holds the collection lock: it copies
+the last tail, syncs, records the pending lengths in the catalog, releases the log's file handle (Windows refuses to
+rename over an open file), renames the temporary file over the log, syncs the directory, and swaps in the new row table.
+The old row table is freed after the lock is released. A failed build removes its temporary file. A failure before the
+rename undoes itself, and the collection stays usable. A failure after the rename poisons the collection, and a reopen
+settles it by the rules in `docs/R3.md`, section 5. Deletes made during a build remain as dead rows until the next
+compaction (`docs/R3.md`, section 14).
 
 `drop_collection` deletes the collection's files. On Windows that fails while a Python object still holds the collection
 open. Drop the handle first, then drop the collection.
