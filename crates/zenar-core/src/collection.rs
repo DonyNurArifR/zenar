@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex, RwLock, RwLockReadGuard, RwLockWriteGuard};
+use std::sync::{Arc, Mutex, MutexGuard, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 use crate::catalog::Catalog;
 use crate::docstore::{DocRef, DocStore, DocumentRow, FieldStats};
@@ -78,6 +78,10 @@ struct State {
     docs: DocStore,
     /// Vectors added since the index was last synced.
     unsynced: usize,
+    /// Vectors added to the index whose documents are not committed yet. Non-zero only between
+    /// the index sync and the commit of a write. Unfiltered search asks for this many extra results
+    /// and drops the uncommitted ones.
+    pending: usize,
     /// Set when an in-memory change could not be made durable or undone. Every
     /// operation then fails until the database is reopened, which replays the
     /// durable state.
@@ -100,7 +104,15 @@ pub struct Collection {
     catalog: Arc<Catalog>,
     /// Sync the document log on every commit, not only at sync boundaries.
     durable: bool,
+    /// Serializes writes. Taken before `state`, never after it.
+    writers: Mutex<()>,
     state: RwLock<State>,
+    /// Test hook that runs while a write has released `state` and is syncing its log.
+    #[cfg(test)]
+    window_hook: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
+    /// Test hook: the next log sync fails with an injected error.
+    #[cfg(test)]
+    fail_log_sync: std::sync::atomic::AtomicBool,
 }
 
 impl Collection {
@@ -119,13 +131,19 @@ impl Collection {
             index_path,
             catalog,
             durable,
+            writers: Mutex::new(()),
             state: RwLock::new(State {
                 closed: false,
                 store,
                 docs,
                 unsynced: 0,
+                pending: 0,
                 poisoned: None,
             }),
+            #[cfg(test)]
+            window_hook: Mutex::new(None),
+            #[cfg(test)]
+            fail_log_sync: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -143,9 +161,10 @@ impl Collection {
 
     /// Adds one document.
     ///
-    /// Order: stage the document write, add the vector in memory, and at a sync boundary
-    /// sync the index and the log. Only then make the document visible. A crash before the
-    /// boundary can lose the newest adds, and reconciliation removes the rest (docs/STORAGE.md).
+    /// Order: stage the document write, add the vector in memory, and at a sync boundary sync the
+    /// index under the write lock and the log with the lock released. The document becomes visible
+    /// only after both syncs. A crash before the boundary can lose the newest adds, and reconciliation
+    /// removes the rest (docs/STORAGE.md).
     pub fn add(
         &self,
         id: u64,
@@ -154,6 +173,7 @@ impl Collection {
         metadata: Vec<(String, MetaValue)>,
     ) -> Result<(), ZenarError> {
         check_id(id)?;
+        let _gate = self.write_gate()?;
         let mut state = self.write_state()?;
         healthy(&state)?;
         validate_vector(vector, state.store.dim())?;
@@ -176,16 +196,18 @@ impl Collection {
             return Err(undo_or_poison(&mut state, staged, e));
         }
         if self.durable || state.unsynced + 1 >= SYNC_INTERVAL {
-            if let Err(e) = self.sync_both(&mut state) {
-                let _ = state.store.remove(id);
-                return Err(undo_or_poison(&mut state, staged, e));
+            state.pending = 1;
+            let (mut state, staged) = self.sync_batch(state, &[id], staged)?;
+            state.docs.commit(staged);
+            if first_vector {
+                self.record_dimension(&state)?;
             }
         } else {
             state.unsynced += 1;
-        }
-        state.docs.commit(staged);
-        if first_vector {
-            self.record_dimension(&state)?;
+            state.docs.commit(staged);
+            if first_vector {
+                self.record_dimension(&state)?;
+            }
         }
         Ok(())
     }
@@ -198,7 +220,7 @@ impl Collection {
     ///    within the batch and against stored documents.
     /// 2. Extend the metadata schema if the batch introduces fields.
     /// 3. Write all documents to the log and all vectors to the index.
-    /// 4. Sync the index and the log once.
+    /// 4. Sync the index under the write lock, then the log with the lock released.
     /// 5. Make the documents visible.
     ///
     /// Any failure in 3 or 4 undoes the batch. The schema change in step 2 stays, which is
@@ -207,6 +229,7 @@ impl Collection {
         if records.is_empty() {
             return Ok(0);
         }
+        let _gate = self.write_gate()?;
         let mut state = self.write_state()?;
         healthy(&state)?;
         let first_vector = state.store.dim().is_none();
@@ -258,10 +281,9 @@ impl Collection {
             added.push(record.id);
         }
 
-        // 4. One sync for the whole batch.
-        if let Err(e) = self.sync_both(&mut state) {
-            return Err(self.rollback(&mut state, &added, staged, e));
-        }
+        // 4. Index under the lock, log after it.
+        state.pending = added.len();
+        let (mut state, staged) = self.sync_batch(state, &added, staged)?;
 
         // 5. Visible.
         state.docs.commit(staged);
@@ -271,29 +293,103 @@ impl Collection {
         Ok(records.len())
     }
 
+    /// Makes an added batch durable. The index is synced while the write lock is held, because
+    /// TurboVec syncs from its in-memory state. The log is then synced with the lock released, so
+    /// readers run during the log's fsync. The lock is taken again before the caller commits the
+    /// documents. A failure rolls the batch back (see `rollback`) and returns the cause.
+    fn sync_batch<'a>(
+        &'a self,
+        mut state: RwLockWriteGuard<'a, State>,
+        added: &[u64],
+        staged: crate::docstore::Staged,
+    ) -> Result<(RwLockWriteGuard<'a, State>, crate::docstore::Staged), ZenarError> {
+        if let Err(e) = state.store.sync(&self.index_path) {
+            return Err(self.rollback(&mut state, added, staged, e));
+        }
+        let log = match state.docs.sync_handle() {
+            Ok(log) => log,
+            Err(e) => return Err(self.rollback(&mut state, added, staged, e)),
+        };
+        drop(state);
+        #[cfg(test)]
+        self.run_window_hook();
+        let synced = self.sync_log(&log);
+        let mut state = self.write_state()?;
+        if let Err(e) = synced {
+            return Err(self.rollback(&mut state, added, staged, e));
+        }
+        state.pending = 0;
+        state.unsynced = 0;
+        Ok((state, staged))
+    }
+
     /// Deletes one document. The vector leaves the index and the index is synced before the
     /// delete is logged, so a deleted vector is gone from disk once `delete` returns (spec section 67).
     pub fn delete(&self, id: u64) -> Result<(), ZenarError> {
-        let mut state = self.write_state()?;
+        let _gate = self.write_gate()?;
+        let state = self.write_state()?;
         healthy(&state)?;
         if !state.docs.contains(id) {
             return Err(ZenarError::VectorNotFound(id));
         }
-        // From here on the in-memory state is ahead of the durable state until the delete is
-        // logged and synced. Any failure poisons the collection, since it cannot be undone safely.
-        let compacting = state.docs.compaction_due_after(1);
-        self.lower_recorded_lengths(1, compacting)?;
-        if !state.store.remove(id) {
-            return Err(ZenarError::VectorNotFound(id));
+        self.delete_ids(state, &[id])
+    }
+
+    /// Deletes many documents with one index sync and one log sync. Either all of them are
+    /// deleted or none is: every id must exist and be unique, or nothing changes.
+    pub fn delete_many(&self, ids: &[u64]) -> Result<usize, ZenarError> {
+        if ids.is_empty() {
+            return Ok(0);
+        }
+        let _gate = self.write_gate()?;
+        let state = self.write_state()?;
+        healthy(&state)?;
+        let mut seen = HashSet::with_capacity(ids.len());
+        for &id in ids {
+            if !seen.insert(id) {
+                return Err(ZenarError::InvalidArgument(format!(
+                    "id {id} appears twice in the batch"
+                )));
+            }
+            if !state.docs.contains(id) {
+                return Err(ZenarError::VectorNotFound(id));
+            }
+        }
+        self.delete_ids(state, ids)?;
+        Ok(ids.len())
+    }
+
+    /// Deletes documents whose ids exist and are unique. The index change is synced under the
+    /// write lock before the tombstones are logged, so a deleted vector leaves the disk first. The
+    /// log is synced with the lock released. Any failure from the index sync on poisons the
+    /// collection, as `delete` documents (docs/STORAGE.md).
+    fn delete_ids<'a>(
+        &'a self,
+        mut state: RwLockWriteGuard<'a, State>,
+        ids: &[u64],
+    ) -> Result<(), ZenarError> {
+        let compacting = state.docs.compaction_due_after(ids.len());
+        self.lower_recorded_lengths(ids.len(), compacting)?;
+        for &id in ids {
+            state.store.remove(id);
         }
         if let Err(e) = state.store.sync(&self.index_path) {
             return Err(poison(&mut state, e));
         }
-        let staged = match state.docs.stage_delete(id) {
+        let staged = match state.docs.stage_deletes(ids) {
             Ok(staged) => staged,
             Err(e) => return Err(poison(&mut state, e)),
         };
-        if let Err(e) = state.docs.sync() {
+        let log = match state.docs.sync_handle() {
+            Ok(log) => log,
+            Err(e) => return Err(poison(&mut state, e)),
+        };
+        drop(state);
+        #[cfg(test)]
+        self.run_window_hook();
+        let synced = self.sync_log(&log);
+        let mut state = self.write_state()?;
+        if let Err(e) = synced {
             return Err(poison(&mut state, e));
         }
         state.docs.commit(staged);
@@ -311,56 +407,10 @@ impl Collection {
         Ok(())
     }
 
-    /// Deletes many documents with one index sync and one log sync. Either all of them are
-    /// deleted or none is: every id must exist and be unique, or nothing changes.
-    pub fn delete_many(&self, ids: &[u64]) -> Result<usize, ZenarError> {
-        if ids.is_empty() {
-            return Ok(0);
-        }
-        let mut state = self.write_state()?;
-        healthy(&state)?;
-        let mut seen = HashSet::with_capacity(ids.len());
-        for &id in ids {
-            if !seen.insert(id) {
-                return Err(ZenarError::InvalidArgument(format!(
-                    "id {id} appears twice in the batch"
-                )));
-            }
-            if !state.docs.contains(id) {
-                return Err(ZenarError::VectorNotFound(id));
-            }
-        }
-        // From here, see `delete`: any failure poisons the collection.
-        let compacting = state.docs.compaction_due_after(ids.len());
-        self.lower_recorded_lengths(ids.len(), compacting)?;
-        for &id in ids {
-            state.store.remove(id);
-        }
-        if let Err(e) = state.store.sync(&self.index_path) {
-            return Err(poison(&mut state, e));
-        }
-        let staged = match state.docs.stage_deletes(ids) {
-            Ok(staged) => staged,
-            Err(e) => return Err(poison(&mut state, e)),
-        };
-        if let Err(e) = state.docs.sync() {
-            return Err(poison(&mut state, e));
-        }
-        state.docs.commit(staged);
-        state.unsynced = 0;
-        if state.docs.should_compact()
-            && let Err(e) = state.docs.compact()
-        {
-            return Err(poison(&mut state, e));
-        }
-        if let Err(e) = self.record_durable(&state) {
-            return Err(poison(&mut state, e));
-        }
-        Ok(ids.len())
-    }
-
-    /// Makes every add so far durable: the index and the document log are synced.
+    /// Makes every add so far durable: the index and the document log are synced. Holds the write
+    /// lock throughout, so readers wait for these two fsyncs.
     pub fn flush(&self) -> Result<(), ZenarError> {
+        let _gate = self.write_gate()?;
         let mut state = self.write_state()?;
         healthy(&state)?;
         if state.unsynced > 0 || self.durable {
@@ -375,12 +425,44 @@ impl Collection {
 
     /// Fits the TQ+ calibration from a sample (spec section 88).
     pub fn calibrate(&self, sample: &[f32]) -> Result<(), ZenarError> {
+        let _gate = self.write_gate()?;
         let mut state = self.write_state()?;
         healthy(&state)?;
         state.store.calibrate(sample)?;
         state.store.sync(&self.index_path)?;
         state.unsynced = 0;
         Ok(())
+    }
+
+    /// Serializes writers of this collection. Always taken before the state lock, never after it.
+    /// Readers do not take it.
+    fn write_gate(&self) -> Result<MutexGuard<'_, ()>, ZenarError> {
+        self.writers
+            .lock()
+            .map_err(|_| ZenarError::VectorStoreError("collection writer lock poisoned".into()))
+    }
+
+    /// Syncs the log through a handle taken under the lock. Test builds can inject a failure here.
+    fn sync_log(&self, log: &std::fs::File) -> Result<(), ZenarError> {
+        #[cfg(test)]
+        if self
+            .fail_log_sync
+            .swap(false, std::sync::atomic::Ordering::SeqCst)
+        {
+            return Err(ZenarError::PersistenceError(
+                "injected log sync failure".into(),
+            ));
+        }
+        log.sync_data().map_err(crate::docstore::io_err)
+    }
+
+    /// Test hook: runs in the window where the write lock is released and the log is syncing.
+    #[cfg(test)]
+    fn run_window_hook(&self) {
+        let hook = self.window_hook.lock().ok().and_then(|h| h.clone());
+        if let Some(hook) = hook {
+            hook();
+        }
     }
 
     pub fn get(&self, id: u64) -> Result<Option<DocumentRow>, ZenarError> {
@@ -443,7 +525,10 @@ impl Collection {
                 if state.store.is_empty() {
                     return Ok((Vec::new(), 0));
                 }
-                let k = top_k.min(state.store.len());
+                // Vectors whose documents are not committed yet can rank in the top results. Ask for
+                // as many extra as there are of them, and drop the uncommitted hits below. Then at
+                // least `top_k` committed results come back whenever that many exist.
+                let k = top_k.saturating_add(state.pending).min(state.store.len());
                 let (scores, ids) = state.store.search(query, k, None)?;
                 (scores, ids, matched)
             }
@@ -483,6 +568,7 @@ impl Collection {
                     metadata: doc.metadata,
                 })
             })
+            .take(top_k)
             .collect();
         Ok((hits, matched))
     }
@@ -807,11 +893,14 @@ impl Collection {
         staged: crate::docstore::Staged,
         cause: ZenarError,
     ) -> ZenarError {
+        state.pending = 0;
         for id in added {
             state.store.remove(*id);
         }
-        if !added.is_empty() {
-            let _ = state.store.sync(&self.index_path);
+        if !added.is_empty()
+            && let Err(e) = state.store.sync(&self.index_path)
+        {
+            poison(state, e);
         }
         undo_or_poison(state, staged, cause)
     }
@@ -1055,6 +1144,7 @@ mod recovery_tests {
     use crate::database::VectorDB;
     use std::fs;
     use std::path::Path;
+    use std::thread;
 
     fn temp_dir(tag: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("zenar-rec-{tag}-{}", std::process::id()));
@@ -1204,11 +1294,12 @@ mod recovery_tests {
         fs::remove_dir_all(&dir).ok();
     }
 
-    /// A durable add whose sync fails is undone in memory and on disk. The collection is not
-    /// poisoned, so later writes work, and the failed document never appears after reopen.
+    /// A durable add whose index sync fails is rolled back. The rollback cannot sync the index either,
+    /// so the collection is poisoned: it refuses reads and writes until it is reopened. The reopen
+    /// finds the failed document nowhere.
     #[cfg(unix)]
     #[test]
-    fn failed_add_leaves_no_trace_and_the_collection_stays_usable() {
+    fn failed_add_with_failing_index_poisons_and_reopen_leaves_no_trace() {
         let dir = temp_dir("fail-add");
         let index = dir.join("vectors").join("fa.zvec");
         {
@@ -1219,26 +1310,27 @@ mod recovery_tests {
             fail_index_syncs(&index, true);
             assert_index_refuses_writes(&index);
             assert!(c.add(2, &v(2.0), "two", vec![]).is_err());
+            assert!(matches!(c.get(1), Err(ZenarError::PersistenceError(_))));
+            assert!(matches!(c.count(), Err(ZenarError::PersistenceError(_))));
             fail_index_syncs(&index, false);
-
-            assert!(c.get(2).unwrap().is_none());
-            assert_eq!(c.count().unwrap(), 1);
-            c.add(3, &v(3.0), "three", vec![]).unwrap();
         }
         let db = VectorDB::open(&dir).unwrap();
-        assert!(db.recovery_report().is_clean());
         let c = db.get_collection("fa").unwrap();
-        assert_eq!(c.count().unwrap(), 2);
+        assert_eq!(c.count().unwrap(), 1);
         assert!(c.get(2).unwrap().is_none());
-        assert!(c.get(3).unwrap().is_some());
+        c.add(3, &v(3.0), "three", vec![]).unwrap();
+        drop(c);
+        drop(db);
+        let db = VectorDB::open(&dir).unwrap();
+        assert_eq!(db.get_collection("fa").unwrap().count().unwrap(), 2);
         fs::remove_dir_all(&dir).ok();
     }
 
-    /// A batch whose sync fails is rolled back: none of its ids is stored, and the same ids can
-    /// be added again afterwards.
+    /// A batch whose index sync fails is rolled back, and the rollback cannot sync the index. The
+    /// collection is poisoned. After a reopen none of the batch's ids is stored, and they can be added.
     #[cfg(unix)]
     #[test]
-    fn failed_add_many_is_all_or_nothing_across_reopen() {
+    fn failed_add_many_with_failing_index_poisons_and_reopen_is_all_or_nothing() {
         let dir = temp_dir("fail-batch");
         let index = dir.join("vectors").join("fb.zvec");
         let batch = || {
@@ -1266,13 +1358,16 @@ mod recovery_tests {
             fail_index_syncs(&index, true);
             assert_index_refuses_writes(&index);
             assert!(c.add_many(&batch()).is_err());
+            assert!(matches!(c.count(), Err(ZenarError::PersistenceError(_))));
             fail_index_syncs(&index, false);
-
-            assert_eq!(c.count().unwrap(), 1);
-            assert_eq!(c.add_many(&batch()).unwrap(), 2);
         }
         let db = VectorDB::open(&dir).unwrap();
-        assert!(db.recovery_report().is_clean());
+        assert_eq!(db.get_collection("fb").unwrap().count().unwrap(), 1);
+        let c = db.get_collection("fb").unwrap();
+        assert_eq!(c.add_many(&batch()).unwrap(), 2);
+        drop(c);
+        drop(db);
+        let db = VectorDB::open(&dir).unwrap();
         assert_eq!(db.get_collection("fb").unwrap().count().unwrap(), 3);
         fs::remove_dir_all(&dir).ok();
     }
@@ -1428,5 +1523,592 @@ mod recovery_tests {
             Some(ZenarError::RecoveryError(_))
         ));
         fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Releases a writer parked in the window when dropped. A failing assertion unwinds through
+    /// it, so the writer is never left waiting on a barrier that the test will not reach.
+    struct Release<'a>(&'a std::sync::Barrier);
+
+    impl Drop for Release<'_> {
+        fn drop(&mut self) {
+            self.0.wait();
+        }
+    }
+
+    /// Sets the hook that runs while a write is between its index sync and its commit.
+    fn set_window_hook(c: &Collection, hook: impl Fn() + Send + Sync + 'static) {
+        *c.window_hook.lock().unwrap() = Some(Arc::new(hook));
+    }
+
+    /// A vector with `x` in the first coordinate, so that a query along that axis ranks by `x`.
+    fn along(x: f32, i: u64) -> Vec<f32> {
+        let mut out = vec![0.0f32; 8];
+        out[0] = x + 0.001 * i as f32;
+        out
+    }
+
+    /// Ten committed documents, then a batch of twenty added in the window. The batch ranks first for
+    /// the query. A search during the window must still return five committed results.
+    #[test]
+    fn search_in_window_returns_full_top_k_from_committed_documents() {
+        let dir = temp_dir("window-topk");
+        let db = VectorDB::open(&dir).unwrap();
+        let c = db.create_collection("wt", Some(8), 4).unwrap();
+        let committed: Vec<Record> = (0..10)
+            .map(|i| Record {
+                id: i,
+                vector: along(0.1, i),
+                text: format!("committed {i}"),
+                metadata: vec![],
+            })
+            .collect();
+        c.add_many(&committed).unwrap();
+
+        let pending: Vec<Record> = (100..120)
+            .map(|i| Record {
+                id: i,
+                vector: along(1.0, i),
+                text: format!("pending {i}"),
+                metadata: vec![],
+            })
+            .collect();
+        let barrier = Arc::new(std::sync::Barrier::new(2));
+        let inside = Arc::clone(&barrier);
+        set_window_hook(&c, move || {
+            inside.wait();
+            inside.wait();
+        });
+        let writer = {
+            let c = Arc::clone(&c);
+            thread::spawn(move || c.add_many(&pending).unwrap())
+        };
+        barrier.wait();
+        let release = Release(&barrier);
+        let query = along(1.0, 0);
+        let hits = c.search(&query, 5, None).unwrap();
+        assert_eq!(
+            hits.len(),
+            5,
+            "uncommitted vectors must not shrink the result"
+        );
+        assert!(hits.iter().all(|h| h.id < 10), "{hits:?}");
+        assert!(hits.iter().all(|h| c.get(h.id).unwrap().is_some()));
+        drop(release);
+        assert_eq!(writer.join().unwrap(), 20);
+
+        *c.window_hook.lock().unwrap() = None;
+        let after = c.search(&query, 5, None).unwrap();
+        assert!(after.iter().all(|h| h.id >= 100), "{after:?}");
+        assert_eq!(c.count().unwrap(), 30);
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A filtered search in the window only sees committed documents, whatever the filter matches.
+    #[test]
+    fn filtered_search_in_window_never_returns_uncommitted_documents() {
+        use crate::filter::Filter;
+        use crate::value::MetaValue;
+        let dir = temp_dir("window-filter");
+        let db = VectorDB::open(&dir).unwrap();
+        let c = db.create_collection("wf", Some(8), 4).unwrap();
+        let committed: Vec<Record> = (0..4)
+            .map(|i| Record {
+                id: i,
+                vector: along(0.1, i),
+                text: "a".into(),
+                metadata: vec![("tenant".into(), MetaValue::Text("A".into()))],
+            })
+            .collect();
+        c.add_many(&committed).unwrap();
+        let pending: Vec<Record> = (100..110)
+            .map(|i| Record {
+                id: i,
+                vector: along(1.0, i),
+                text: "b".into(),
+                metadata: vec![("tenant".into(), MetaValue::Text("A".into()))],
+            })
+            .collect();
+        let barrier = Arc::new(std::sync::Barrier::new(2));
+        let inside = Arc::clone(&barrier);
+        set_window_hook(&c, move || {
+            inside.wait();
+            inside.wait();
+        });
+        let writer = {
+            let c = Arc::clone(&c);
+            thread::spawn(move || c.add_many(&pending).unwrap())
+        };
+        barrier.wait();
+        let release = Release(&barrier);
+        let filter = Filter::Eq {
+            field: "tenant".into(),
+            value: MetaValue::Text("A".into()),
+        };
+        let hits = c.search(&along(1.0, 0), 10, Some(&filter)).unwrap();
+        assert_eq!(hits.len(), 4);
+        assert!(hits.iter().all(|h| h.id < 4), "{hits:?}");
+        drop(release);
+        writer.join().unwrap();
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A delete that has removed its vector and is syncing its log: the removed vector is not
+    /// returned, and the top results are still full.
+    #[test]
+    fn search_in_delete_window_skips_the_removed_vector_and_stays_full() {
+        let dir = temp_dir("window-delete");
+        let db = VectorDB::open(&dir).unwrap();
+        let c = db.create_collection("wd", Some(8), 4).unwrap();
+        let committed: Vec<Record> = (0..10)
+            .map(|i| Record {
+                id: i,
+                vector: along(0.1 * (10 - i) as f32, i),
+                text: "x".into(),
+                metadata: vec![],
+            })
+            .collect();
+        c.add_many(&committed).unwrap();
+        let barrier = Arc::new(std::sync::Barrier::new(2));
+        let inside = Arc::clone(&barrier);
+        set_window_hook(&c, move || {
+            inside.wait();
+            inside.wait();
+        });
+        let writer = {
+            let c = Arc::clone(&c);
+            thread::spawn(move || c.delete(0).unwrap())
+        };
+        barrier.wait();
+        let release = Release(&barrier);
+        let hits = c.search(&along(1.0, 0), 5, None).unwrap();
+        assert_eq!(hits.len(), 5);
+        assert!(hits.iter().all(|h| h.id != 0), "{hits:?}");
+        drop(release);
+        writer.join().unwrap();
+        assert!(c.get(0).unwrap().is_none());
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A log sync that fails in the window rolls the batch back: nothing is visible, the collection
+    /// stays usable, and a reopen does not see the batch.
+    #[cfg(unix)]
+    #[test]
+    fn failed_log_sync_in_window_rolls_back_and_stays_usable() {
+        let dir = temp_dir("window-fail-add");
+        {
+            let db = VectorDB::open_with(&dir, crate::database::MetadataSync::Full).unwrap();
+            let c = db.create_collection("fw", Some(8), 4).unwrap();
+            c.add(1, &along(0.5, 1), "one", vec![]).unwrap();
+            c.fail_log_sync
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            assert!(c.add(2, &along(0.9, 2), "two", vec![]).is_err());
+            assert!(c.get(2).unwrap().is_none());
+            assert_eq!(c.count().unwrap(), 1);
+            let hits = c.search(&along(1.0, 0), 5, None).unwrap();
+            assert!(hits.iter().all(|h| h.id != 2), "{hits:?}");
+            c.add(3, &along(0.7, 3), "three", vec![]).unwrap();
+        }
+        let db = VectorDB::open(&dir).unwrap();
+        let c = db.get_collection("fw").unwrap();
+        assert_eq!(c.count().unwrap(), 2);
+        assert!(c.get(2).unwrap().is_none());
+        assert!(c.get(3).unwrap().is_some());
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A log sync that fails after a delete has removed the vector poisons the collection, as before.
+    /// Reopening then finds the document without its vector and removes it.
+    #[cfg(unix)]
+    #[test]
+    fn failed_log_sync_in_delete_window_poisons_and_reopen_completes_the_delete() {
+        let dir = temp_dir("window-fail-delete");
+        {
+            let db = VectorDB::open_with(&dir, crate::database::MetadataSync::Full).unwrap();
+            let c = db.create_collection("fd2", Some(8), 4).unwrap();
+            c.add(1, &along(0.5, 1), "one", vec![]).unwrap();
+            c.add(2, &along(0.6, 2), "two", vec![]).unwrap();
+            c.fail_log_sync
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            assert!(c.delete(1).is_err());
+            assert!(matches!(c.get(2), Err(ZenarError::PersistenceError(_))));
+        }
+        let db = VectorDB::open(&dir).unwrap();
+        let c = db.get_collection("fd2").unwrap();
+        assert_eq!(c.count().unwrap(), 1);
+        assert!(c.get(1).unwrap().is_none());
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Concurrent writers and readers on one collection. Every committed document stays findable,
+    /// no result repeats an id, and every search returns as many results as the committed documents
+    /// it could rank, up to `top_k`.
+    #[test]
+    fn concurrent_inserts_and_searches_return_committed_full_results() {
+        use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+        let dir = temp_dir("concurrent");
+        let db = VectorDB::open(&dir).unwrap();
+        let c = db.create_collection("cc", Some(8), 4).unwrap();
+        c.add_many(
+            &(0..50)
+                .map(|i| Record {
+                    id: 1_000 + i,
+                    vector: along(0.2, i),
+                    text: "seed".into(),
+                    metadata: vec![],
+                })
+                .collect::<Vec<_>>(),
+        )
+        .unwrap();
+        let stop = Arc::new(AtomicBool::new(false));
+        let next_id = Arc::new(AtomicU64::new(0));
+        let mut writers = Vec::new();
+        for _ in 0..3 {
+            let (c, next_id) = (Arc::clone(&c), Arc::clone(&next_id));
+            writers.push(thread::spawn(move || {
+                for _ in 0..60 {
+                    let first = next_id.fetch_add(5, Ordering::SeqCst);
+                    let batch: Vec<Record> = (first..first + 5)
+                        .map(|i| Record {
+                            id: i,
+                            vector: along(1.0 - (i % 7) as f32 * 0.05, i),
+                            text: "w".into(),
+                            metadata: vec![],
+                        })
+                        .collect();
+                    c.add_many(&batch).unwrap();
+                }
+            }));
+        }
+        let mut readers = Vec::new();
+        for r in 0..3 {
+            let (c, stop) = (Arc::clone(&c), Arc::clone(&stop));
+            readers.push(thread::spawn(move || {
+                let mut searches = 0usize;
+                while !stop.load(Ordering::SeqCst) {
+                    let before = c.count().unwrap();
+                    let query = along(1.0, r as u64);
+                    let hits = c.search(&query, 10, None).unwrap();
+                    let expected = 10.min(before);
+                    assert!(
+                        hits.len() >= expected,
+                        "{} results, expected at least {expected}",
+                        hits.len()
+                    );
+                    let mut ids: Vec<u64> = hits.iter().map(|h| h.id).collect();
+                    ids.sort_unstable();
+                    ids.dedup();
+                    assert_eq!(ids.len(), hits.len(), "repeated id in results");
+                    for h in &hits {
+                        assert!(
+                            c.get(h.id).unwrap().is_some(),
+                            "result {} is not committed",
+                            h.id
+                        );
+                    }
+                    searches += 1;
+                }
+                searches
+            }));
+        }
+        for w in writers {
+            w.join().unwrap();
+        }
+        stop.store(true, Ordering::SeqCst);
+        let searches: usize = readers.into_iter().map(|h| h.join().unwrap()).sum();
+        assert!(searches > 0);
+        assert_eq!(c.count().unwrap(), 50 + 3 * 60 * 5);
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Copies a directory tree, as a crash would leave it on disk.
+    fn copy_tree(src: &Path, dst: &Path) {
+        fs::create_dir_all(dst).unwrap();
+        for entry in fs::read_dir(src).unwrap() {
+            let entry = entry.unwrap();
+            let target = dst.join(entry.file_name());
+            if entry.file_type().unwrap().is_dir() {
+                copy_tree(&entry.path(), &target);
+            } else {
+                fs::copy(entry.path(), target).unwrap();
+            }
+        }
+    }
+
+    /// A pending document, added in the window, is invisible to `get`, `count` and every kind of search.
+    #[test]
+    fn pending_documents_are_invisible_to_get_count_and_search() {
+        let dir = temp_dir("pending-invisible");
+        let db = VectorDB::open(&dir).unwrap();
+        let c = db.create_collection("pi", Some(8), 4).unwrap();
+        c.add_many(
+            &(0..5)
+                .map(|i| Record {
+                    id: i,
+                    vector: along(0.1, i),
+                    text: "c".into(),
+                    metadata: vec![],
+                })
+                .collect::<Vec<_>>(),
+        )
+        .unwrap();
+        let barrier = Arc::new(std::sync::Barrier::new(2));
+        let inside = Arc::clone(&barrier);
+        set_window_hook(&c, move || {
+            inside.wait();
+            inside.wait();
+        });
+        let writer = {
+            let c = Arc::clone(&c);
+            thread::spawn(move || {
+                c.add_many(&[Record {
+                    id: 100,
+                    vector: along(1.0, 100),
+                    text: "p".into(),
+                    metadata: vec![],
+                }])
+            })
+        };
+        barrier.wait();
+        let release = Release(&barrier);
+        let got = c.get(100).unwrap();
+        let count = c.count().unwrap();
+        let hits = c.search(&along(1.0, 0), 10, None).unwrap();
+        drop(release);
+        assert!(got.is_none());
+        assert_eq!(count, 5);
+        assert!(hits.iter().all(|h| h.id != 100), "{hits:?}");
+        assert_eq!(writer.join().unwrap().unwrap(), 1);
+        assert_eq!(c.count().unwrap(), 6);
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// `add_many` returns only after its log sync. While the batch is in the window, its caller has not
+    /// returned, so an acknowledgement cannot precede the sync.
+    #[test]
+    fn acknowledgement_comes_after_the_log_sync() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let dir = temp_dir("ack-after-sync");
+        let db = VectorDB::open_with(&dir, crate::database::MetadataSync::Full).unwrap();
+        let c = db.create_collection("ak", Some(8), 4).unwrap();
+        c.add(0, &along(0.1, 0), "seed", vec![]).unwrap();
+        let barrier = Arc::new(std::sync::Barrier::new(2));
+        let inside = Arc::clone(&barrier);
+        set_window_hook(&c, move || {
+            inside.wait();
+            inside.wait();
+        });
+        let returned = Arc::new(AtomicBool::new(false));
+        let writer = {
+            let (c, returned) = (Arc::clone(&c), Arc::clone(&returned));
+            thread::spawn(move || {
+                let result = c.add_many(&[Record {
+                    id: 1,
+                    vector: along(0.5, 1),
+                    text: "a".into(),
+                    metadata: vec![],
+                }]);
+                returned.store(true, Ordering::SeqCst);
+                result
+            })
+        };
+        barrier.wait();
+        let release = Release(&barrier);
+        let acknowledged_early = returned.load(Ordering::SeqCst);
+        drop(release);
+        assert!(!acknowledged_early, "add_many returned before its log sync");
+        assert_eq!(writer.join().unwrap().unwrap(), 1);
+        assert!(returned.load(Ordering::SeqCst));
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A process crash between a group's index sync and its log sync keeps the whole group. The crash
+    /// is simulated by copying the database directory from inside the window: the index is synced,
+    /// the log bytes are written but not synced, and the copy is reopened.
+    #[test]
+    fn crash_after_group_index_sync_keeps_the_whole_group() {
+        let dir = temp_dir("crash-in-group");
+        let snapshot = temp_dir("crash-in-group-snapshot");
+        let db = VectorDB::open(&dir).unwrap();
+        let c = db.create_collection("cg", Some(8), 4).unwrap();
+        c.add(0, &along(0.1, 0), "seed", vec![]).unwrap();
+        let (src, dst) = (dir.clone(), snapshot.clone());
+        set_window_hook(&c, move || {
+            let _ = fs::remove_dir_all(&dst);
+            copy_tree(&src, &dst);
+        });
+        let batch: Vec<Record> = (1..=5)
+            .map(|i| Record {
+                id: i,
+                vector: along(0.2 * i as f32, i),
+                text: "g".into(),
+                metadata: vec![],
+            })
+            .collect();
+        assert_eq!(c.add_many(&batch).unwrap(), 5);
+        drop(c);
+        drop(db);
+
+        let recovered = VectorDB::open(&snapshot).unwrap();
+        assert!(
+            recovered.recovery_report().is_clean(),
+            "{:?}",
+            recovered.recovery_report()
+        );
+        let rc = recovered.get_collection("cg").unwrap();
+        assert_eq!(rc.count().unwrap(), 6);
+        for i in 1..=5 {
+            assert!(rc.get(i).unwrap().is_some());
+        }
+        fs::remove_dir_all(&dir).ok();
+        fs::remove_dir_all(&snapshot).ok();
+    }
+
+    /// Writes and reads from several threads on one collection: an acknowledged add is returned by a
+    /// later filtered search, and an acknowledged delete is not returned by a later search.
+    #[test]
+    fn acknowledged_writes_are_seen_and_acknowledged_deletes_are_not() {
+        use crate::filter::Filter;
+        use crate::value::MetaValue;
+        use std::collections::HashSet;
+        use std::sync::Mutex;
+        let dir = temp_dir("linearizable");
+        let db = VectorDB::open(&dir).unwrap();
+        let c = db.create_collection("lz", Some(8), 4).unwrap();
+        c.add_many(
+            &(0..200)
+                .map(|i| Record {
+                    id: i,
+                    vector: along(0.3, i),
+                    text: "s".into(),
+                    metadata: vec![("tag".into(), MetaValue::Text("s".into()))],
+                })
+                .collect::<Vec<_>>(),
+        )
+        .unwrap();
+        let acked = Arc::new(Mutex::new(Vec::<u64>::new()));
+        let deleted = Arc::new(Mutex::new(Vec::<u64>::new()));
+        let mut threads = Vec::new();
+        for w in 0..2u64 {
+            let (c, acked) = (Arc::clone(&c), Arc::clone(&acked));
+            threads.push(thread::spawn(move || {
+                for b in 0..20u64 {
+                    let ids: Vec<u64> = (0..5).map(|i| 1_000 + w * 1_000 + b * 5 + i).collect();
+                    let records: Vec<Record> = ids
+                        .iter()
+                        .map(|&id| Record {
+                            id,
+                            vector: along(0.6, id),
+                            text: "w".into(),
+                            metadata: vec![("tag".into(), MetaValue::Text("w".into()))],
+                        })
+                        .collect();
+                    c.add_many(&records).unwrap();
+                    acked.lock().unwrap().extend(ids);
+                }
+            }));
+        }
+        {
+            let (c, deleted) = (Arc::clone(&c), Arc::clone(&deleted));
+            threads.push(thread::spawn(move || {
+                for id in 0..200u64 {
+                    c.delete(id).unwrap();
+                    deleted.lock().unwrap().push(id);
+                }
+            }));
+        }
+        for _ in 0..2 {
+            let (c, acked, deleted) = (Arc::clone(&c), Arc::clone(&acked), Arc::clone(&deleted));
+            threads.push(thread::spawn(move || {
+                let query = along(1.0, 0);
+                let w_filter = Filter::Eq {
+                    field: "tag".into(),
+                    value: MetaValue::Text("w".into()),
+                };
+                for _ in 0..60 {
+                    // Snapshot the acknowledgements first: each one was made before its search starts.
+                    let acked_now: Vec<u64> = acked.lock().unwrap().clone();
+                    let deleted_now: Vec<u64> = deleted.lock().unwrap().clone();
+                    let all: HashSet<u64> = c
+                        .search(&query, 10_000, None)
+                        .unwrap()
+                        .iter()
+                        .map(|h| h.id)
+                        .collect();
+                    for id in &deleted_now {
+                        assert!(!all.contains(id), "deleted id {id} returned");
+                    }
+                    let tagged: HashSet<u64> = c
+                        .search(&query, 10_000, Some(&w_filter))
+                        .unwrap()
+                        .iter()
+                        .map(|h| h.id)
+                        .collect();
+                    for id in &acked_now {
+                        assert!(tagged.contains(id), "acknowledged id {id} missing");
+                    }
+                }
+            }));
+        }
+        for t in threads {
+            t.join().unwrap();
+        }
+        assert_eq!(c.count().unwrap(), 2 * 20 * 5);
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A power loss in the middle of a group's log write leaves a prefix of the batch in the log, while
+    /// the index was synced in full. Reopening keeps the prefix and removes the stray vectors, as
+    /// STORAGE.md describes for power loss. The copy is cut inside the batch's frames.
+    #[test]
+    fn torn_group_log_keeps_a_prefix_and_removes_stray_vectors() {
+        let dir = temp_dir("torn-group");
+        let snapshot = temp_dir("torn-group-snapshot");
+        let db = VectorDB::open(&dir).unwrap();
+        let c = db.create_collection("tg", Some(8), 4).unwrap();
+        c.add(0, &along(0.1, 0), "seed", vec![]).unwrap();
+        let (src, dst) = (dir.clone(), snapshot.clone());
+        set_window_hook(&c, move || {
+            let _ = fs::remove_dir_all(&dst);
+            copy_tree(&src, &dst);
+        });
+        let batch: Vec<Record> = (1..=5)
+            .map(|i| Record {
+                id: i,
+                vector: along(0.2 * i as f32, i),
+                text: "g".into(),
+                metadata: vec![],
+            })
+            .collect();
+        c.add_many(&batch).unwrap();
+        drop(c);
+        drop(db);
+
+        // Cut the copy's log a few bytes into the batch's frames: the seed document and the first
+        // document of the batch survive, the rest is torn.
+        let log = snapshot.join("docs").join("tg.zdocs");
+        let full = fs::metadata(&log).unwrap().len();
+        let seed_frame_len = fs::metadata(&log).unwrap().len() / 6;
+        let cut = seed_frame_len * 2 + 9;
+        assert!(cut < full);
+        fs::OpenOptions::new()
+            .write(true)
+            .open(&log)
+            .unwrap()
+            .set_len(cut)
+            .unwrap();
+
+        let recovered = VectorDB::open(&snapshot).unwrap();
+        let report = recovered.recovery_report();
+        let rc = recovered.get_collection("tg").unwrap();
+        assert_eq!(
+            rc.count().unwrap(),
+            2,
+            "the seed and the first document of the batch"
+        );
+        assert!(rc.get(1).unwrap().is_some());
+        assert!(rc.get(2).unwrap().is_none());
+        assert_eq!(report.orphaned_vectors_removed, 4, "{report:?}");
+        fs::remove_dir_all(&dir).ok();
+        fs::remove_dir_all(&snapshot).ok();
     }
 }

@@ -508,6 +508,12 @@ impl DocStore {
         self.handle()?.sync_data().map_err(io_err)
     }
 
+    /// A second handle to the log, for syncing it without holding the collection lock. Syncing
+    /// through it flushes every write made through the log, since both handles refer to one file.
+    pub fn sync_handle(&self) -> Result<File, ZenarError> {
+        self.handle()?.try_clone().map_err(io_err)
+    }
+
     /// True when dead rows are worth reclaiming: more dead than live, and enough to matter.
     pub fn should_compact(&self) -> bool {
         self.compaction_due_after(0)
