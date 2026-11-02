@@ -72,3 +72,49 @@ jobs:
           name: windows-lock-probe-${{ github.run_id }}
           path: lock-probe.jsonl
           if-no-files-found: error
+
+  # The unmodified test, repeated on the same runner image. Diagnostic only: it reports the test's own pass or fail
+  # per run, so the harness can be compared with the real test on the same machine type.
+  real-test-repeat:
+    name: Original test, repeated (Windows)
+    runs-on: windows-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+      - uses: dtolnay/rust-toolchain@v1
+        with:
+          toolchain: stable
+      - run: pip install maturin
+      - run: maturin build --release --locked --out dist
+      - name: Install the built wheel and test dependencies in a fresh venv
+        shell: bash
+        run: |
+          python -m venv .venv-repeat
+          if [ -d .venv-repeat/Scripts ]; then PY=.venv-repeat/Scripts/python; else PY=.venv-repeat/bin/python; fi
+          "$PY" -m pip install --quiet dist/*.whl pytest numpy jsonschema
+      - name: Run the original test ten times (six trials each)
+        shell: bash
+        run: |
+          if [ -d .venv-repeat/Scripts ]; then PY=.venv-repeat/Scripts/python; else PY=.venv-repeat/bin/python; fi
+          mkdir -p repeat-logs
+          : > repeat-results.jsonl
+          for i in 1 2 3 4 5 6 7 8 9 10; do
+            set +e
+            "$PY" -m pytest -q tests/test_compaction_crash.py -k kill_during -p no:cacheprovider > "repeat-logs/run-$i.log" 2>&1
+            rc=$?
+            set -e
+            echo "{\"run\": $i, \"pytest_exit\": $rc}" >> repeat-results.jsonl
+          done
+          cat repeat-results.jsonl
+      - name: Upload the repeated-test results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: original-test-repeat-${{ github.run_id }}
+          path: |
+            repeat-results.jsonl
+            repeat-logs/
+          if-no-files-found: warn

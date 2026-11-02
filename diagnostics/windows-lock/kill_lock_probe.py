@@ -6,9 +6,10 @@ database is reopened. The ordering matches the test:
 
     proc.kill()  -> kill returned  -> proc.wait()  -> wait returned  -> VectorDB(path)   (first open)
 
-Between wait returned and the first open there is no subprocess call, no sleep, and no logging. Only a monotonic
-clock reading is taken, into memory. External diagnostics (tasklist, the Sysinternals handle tool) run only after a
-first open has failed, and the bounded retry polls the open every millisecond until it succeeds or 30 s pass.
+Between wait returned and the first open there is no subprocess call, no sleep, and no logging. After a failed
+first open, retries start at once and poll every millisecond for at most 30 s, recording each attempt by its offset
+from wait() in perf_counter_ns. External diagnostics (tasklist, the Sysinternals handle tool, the LOCK file) run only
+if the lock is still unavailable at the end of the bound.
 
 Every trial writes one JSON line. A trial counts as ok only when the database opened and every integrity check
 passed. A failed open, a persistent lock, a failed integrity check, or a harness exception is recorded as such,
@@ -86,7 +87,7 @@ def try_open(path):
 
 
 def process_status(pid):
-    """External check, run only after a failed first open. On Windows it asks tasklist."""
+    """External check, run only after the bound has expired. On Windows it asks tasklist."""
     if sys.platform == "win32":
         out = subprocess.run(["tasklist", "/FI", f"PID eq {pid}", "/FO", "CSV", "/NH"],
                              capture_output=True, text=True, timeout=60).stdout.strip()
@@ -188,63 +189,63 @@ def run_trial(n, work, bound_s, snapshots_taken):
 
     # Same random delay as the test, so the kill lands at an unscheduled point.
     time.sleep(random.uniform(0.0, 0.03))
-    rec["running_before_kill"] = proc.poll() is None
     t_kill_call = time.perf_counter_ns()
     proc.kill()
     t_kill_returned = time.perf_counter_ns()
     rc = proc.wait()
-    t_wait_returned = time.perf_counter_ns()
-    # ---- Critical window: wait() has returned. Nothing but the first open runs until t_open_start. ----
+    t_wait = time.perf_counter_ns()
+
+    # ---- Critical window. From wait() returning, the only work is the first open attempt, and the
+    # ---- retry loop that follows it. No external process, no file operation, no logging, no sleep
+    # ---- before the first attempt. Times are kept as integer nanoseconds in memory.
     t_open_start = time.perf_counter_ns()
     db, err_type, err_msg = try_open(path)
     t_open_end = time.perf_counter_ns()
-    # ---- End of critical window. Everything below is recorded from values already in memory. ----
-    rec["child_exit_code"] = rc
-    rec["kill_call_to_return_ms"] = ms(t_kill_returned - t_kill_call)
-    rec["wait_return_after_kill_return_ms"] = ms(t_wait_returned - t_kill_returned)
-    rec["wait_return_to_first_open_start_ms"] = ms(t_open_start - t_wait_returned)
-    rec["first_open_duration_ms"] = ms(t_open_end - t_open_start)
-    rec["first_open_result"] = "open" if db is not None else err_type
+    first_result = "open" if db is not None else err_type
+    first_message = None if db is None else err_msg
+    attempts = []   # (offset from wait in ns, outcome), every retry attempt
+    t_success = None
     if db is None:
-        rec["first_open_message"] = err_msg
-
-    if db is not None:
-        rec["first_open_ok"] = True
-        rec["time_to_successful_open_ms"] = rec["wait_return_to_first_open_start_ms"]
-        rec["retries"] = 0
-    else:
-        rec["first_open_ok"] = False
-        # External diagnostics: only now, after the first open has failed.
-        rec["process_status_at_first_failure"] = process_status(proc.pid)
-        rec["lock_file_at_first_failure"] = lock_file_info(path)
-        if snapshots_taken[0] < HANDLE_SNAPSHOTS:
-            snapshots_taken[0] += 1
-            rec["handle_owner_at_first_failure"] = handle_owner(os.path.join(path, "LOCK"))
-        # Bounded retry, polling every RETRY_POLL_S. Each attempt is recorded in memory with its offset from wait().
-        attempts = []
-        bound_ns = t_wait_returned + int(bound_s * 1e9)
+        bound_ns = t_wait + int(bound_s * 1e9)
         while db is None and time.perf_counter_ns() < bound_ns and len(attempts) < ATTEMPT_LOG_LIMIT:
             time.sleep(RETRY_POLL_S)
             t_a = time.perf_counter_ns()
-            db, a_type, a_msg = try_open(path)
-            attempts.append((ms(t_a - t_wait_returned), "open" if db is not None else a_type))
-        rec["retry_attempts"] = len(attempts)
-        rec["retry_attempts_log"] = attempts[:200] + attempts[-50:] if len(attempts) > 250 else attempts
-        rec["retries"] = len(attempts)
-        if db is not None:
-            rec["time_to_successful_open_ms"] = attempts[-1][0]
-        else:
-            rec["time_to_successful_open_ms"] = None
-            rec["lock_available"] = False
-            rec["process_status_at_bound"] = process_status(proc.pid)
-            rec["trial_status"] = f"lock_not_available_within_{bound_s:g}s"
-            return rec
+            db, a_type, _ = try_open(path)
+            attempts.append((t_a - t_wait, "open" if db is not None else a_type))
+            if db is not None:
+                t_success = t_a
+                break
+    # ---- End of the critical window. Everything below works from values already held in memory. ----
+    rec["child_exit_code"] = rc
+    rec["kill_call_to_return_ms"] = ms(t_kill_returned - t_kill_call)
+    rec["wait_to_first_open_start_ms"] = ms(t_open_start - t_wait)
+    rec["first_open_duration_ms"] = ms(t_open_end - t_open_start)
+    rec["first_open_result"] = first_result
+    rec["first_open_ok"] = db is not None and first_result == "open"
+    if first_message is not None:
+        rec["first_open_message"] = first_message
+    rec["retries"] = len(attempts)
+    rec["retry_attempts_ms_from_wait"] = [[ms(off), outcome] for off, outcome in attempts]
+    if t_success is not None:
+        rec["time_to_first_successful_retry_ms"] = ms(t_success - t_wait)
 
-    if rec["first_open_ok"]:
-        rec["lock_available"] = True
+    if db is None:
+        # The lock stayed unavailable for the whole bound. Only now are external diagnostics collected.
+        rec["lock_available"] = False
+        rec["trial_status"] = f"lock_not_available_within_{bound_s:g}s"
+        rec["process_status_at_bound"] = process_status(proc.pid)
+        rec["lock_file_at_bound"] = lock_file_info(path)
+        if snapshots_taken[0] < HANDLE_SNAPSHOTS:
+            snapshots_taken[0] += 1
+            rec["handle_owner_at_bound"] = handle_owner(os.path.join(path, "LOCK"))
+        rec["stderr_tail"] = stderr_tail(stderr_log)
+        return rec
+
+    rec["lock_available"] = True
     integrity = integrity_checks(db, path, flushed)
     rec["integrity"] = integrity
     rec["trial_status"] = "ok" if integrity["all_passed"] else "integrity_failed"
+    rec["stderr_tail"] = stderr_tail(stderr_log)
     return rec
 
 
@@ -271,7 +272,8 @@ def main():
             out.write(json.dumps(rec, default=str) + "\n")
             out.flush()
             print(json.dumps({k: rec.get(k) for k in ("trial", "trial_status", "first_open_result",
-                                                      "child_exit_code", "time_to_successful_open_ms")},
+                                                      "child_exit_code", "retries",
+                                                      "time_to_first_successful_retry_ms")},
                              default=str), flush=True)
         # Summary from the file, so it reflects what was recorded.
         with open(args.out, encoding="utf-8") as f:
@@ -279,8 +281,8 @@ def main():
         statuses = {}
         for t in trials:
             statuses[t.get("trial_status")] = statuses.get(t.get("trial_status"), 0) + 1
-        firsts = sorted(t["wait_return_to_first_open_start_ms"] for t in trials if "wait_return_to_first_open_start_ms" in t)
-        times = sorted(t["time_to_successful_open_ms"] for t in trials if t.get("time_to_successful_open_ms") is not None)
+        firsts = sorted(t["wait_to_first_open_start_ms"] for t in trials if "wait_to_first_open_start_ms" in t)
+        times = sorted(t["time_to_first_successful_retry_ms"] for t in trials if "time_to_first_successful_retry_ms" in t)
         summary = {
             "type": "summary", "trials": len(trials), "trial_status_counts": statuses,
             "first_open_ok": sum(1 for t in trials if t.get("first_open_ok")),
@@ -293,7 +295,7 @@ def main():
         if firsts:
             summary["wait_to_first_open_ms"] = {"min": firsts[0], "median": firsts[len(firsts) // 2], "max": firsts[-1]}
         if times:
-            summary["time_to_successful_open_ms"] = {"min": times[0], "median": times[len(times) // 2], "max": times[-1]}
+            summary["time_to_first_successful_retry_ms"] = {"min": times[0], "median": times[len(times) // 2], "max": times[-1]}
         out.write(json.dumps(summary, default=str) + "\n")
     print(json.dumps(summary, default=str), flush=True)
     shutil.rmtree(work, ignore_errors=True)
