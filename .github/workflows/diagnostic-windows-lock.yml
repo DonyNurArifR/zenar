@@ -13,7 +13,7 @@ on:
       trials:
         description: "Kill-and-reopen trials"
         required: false
-        default: "60"
+        default: "100"
   push:
     branches: [diag/windows-lock-release]
 
@@ -48,11 +48,20 @@ jobs:
       - name: Install handle.exe (best effort)
         continue-on-error: true
         shell: pwsh
-        run: choco install handle -y --no-progress
+        run: |
+          choco install handle -y --no-progress
+          $exe = Get-ChildItem -Path C:\ProgramData\chocolatey -Recurse -Filter "handle*.exe" -ErrorAction SilentlyContinue | Select-Object -First 1
+          if ($exe) {
+            Add-Content -Path $env:GITHUB_PATH -Value $exe.DirectoryName
+            Add-Content -Path $env:GITHUB_ENV -Value "HANDLE_EXE=$($exe.FullName)"
+            Write-Output "handle tool: $($exe.FullName)"
+          } else {
+            Write-Output "handle tool not found; the probe runs without it"
+          }
       - name: Run the probe
         shell: bash
         env:
-          TRIALS: ${{ inputs.trials || '60' }}
+          TRIALS: ${{ inputs.trials || '100' }}
         run: |
           if [ -d .venv-diag/Scripts ]; then PY=.venv-diag/Scripts/python; else PY=.venv-diag/bin/python; fi
           "$PY" diagnostics/windows-lock/kill_lock_probe.py --trials "$TRIALS" --bound-seconds 30 --out lock-probe.jsonl
