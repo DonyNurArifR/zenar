@@ -35,16 +35,28 @@ On open, the log is replayed from the start:
 | Zeros from the last valid frame to the end | Torn tail. Truncated. (A file system may extend a file before writing data.) |
 | A bad CRC or undecodable frame followed by more data | `RecoveryError`. The database does not open. Later records are never dropped silently. |
 
-Compaction runs when dead records outnumber live ones and there are more than 4096 dead. It writes the live records to a
-temporary file, syncs it, releases the log's file handle (Windows refuses to rename over an open file), renames the
-temporary file over the log, syncs the directory, and reopens the log. If the rename fails, the old log is reopened and
-nothing changes. Any other error in compaction poisons the collection (see below). The safe course is a reopen, which
-replays whichever log is on disk.
+Compaction runs when dead records outnumber live ones and there are more than 4096 dead. It runs in the background:
+a thread reads the log up to a snapshot, writes the live records to a temporary file, syncs it, and replays that file into
+a new row table. It then copies the frames written since the snapshot. Only the swap holds the collection lock: it copies
+the last tail, syncs, records the pending lengths in the catalog, releases the log's file handle (Windows refuses to
+rename over an open file), renames the temporary file over the log, syncs the directory, and swaps in the new row table.
+The old row table is freed after the lock is released. A failed build removes its temporary file. A failure before the
+rename undoes itself, and the collection stays usable. A failure after the rename poisons the collection, and a reopen
+settles it by the rules in `docs/R3.md`, section 5. Deletes made during a build remain as dead rows until the next
+compaction (`docs/R3.md`, section 14). When a swap succeeds and the threshold is still crossed (the deletes made during
+the build were enough), the next compaction starts at once. A failed compaction is not retried by itself: the next
+delete starts the next attempt. Dead records below the threshold are kept until the threshold is crossed, which is the
+policy, not a defect. On Windows the directory sync that makes the rename durable is not performed (`sync_parent`
+does nothing outside Unix), and the swap there is untested (`docs/R3.md`, section 15).
 
 `drop_collection` deletes the collection's files. On Windows that fails while a Python object still holds the collection
 open. Drop the handle first, then drop the collection.
 
 ## Ingest order
+
+Writes to a collection are queued. One leader at a time runs a group of them, so a group's syncs and rollback never
+overlap another group's. Readers do not take the queue. The steps below describe one write. A group shares the index sync
+and the log sync among its writes, and a failure rolls back the whole group (docs/CONCURRENCY.md, "Group commit").
 
 ### `add`
 
@@ -52,9 +64,13 @@ open. Drop the handle first, then drop the collection.
    is written first, so a record that uses a new field never reaches the log before the catalog knows the field.
 2. Write the PUT frame to the log (not yet visible to readers).
 3. Add the vector to the in-memory index.
-4. At a sync boundary (every 1000 adds, or every add with `durable=True`), sync the index file and the log. If that
-   fails, the vector is removed and the log is truncated back.
-5. Make the document visible.
+4. At a sync boundary (every 1000 adds, or every add with `durable=True`), sync the index file under the lock. Then
+   release the lock, sync the log, take the lock again, and make the document visible. If either sync fails, the vector
+   is removed, the index is synced again, and the log is truncated back. If the re-sync or the truncation fails, the
+   collection is poisoned.
+   Between the index sync and the commit, the vector is in the index and its document is not committed. Searches
+   exclude such documents, and ask for up to 64 extra results to make up for them, retrying with all of the pending count
+   only when that is not enough (see the search rule in ARCHITECTURE.md).
 
 ### `add_many`
 
@@ -67,13 +83,15 @@ A batch is all-or-nothing:
 4. Sync the index file, then the log.
 5. Make the documents visible.
 
-If step 2, 3 or 4 fails, the vectors added so far are removed, the index is synced again (best effort), and the log is
-truncated to its length before the batch.
+Step 4 syncs the index under the lock, then the log with the lock released, then commits under the lock. If step 2, 3 or
+4 fails, the vectors added so far are removed, the index is synced again, and the log is truncated to its
+length before the batch. If the truncation fails, the collection is poisoned: the batch's bytes would
+otherwise stay in the log in front of later writes.
 
 ## Deletes
 
 `delete_many` does the same steps for a batch, with one index sync and one log sync. Every id must exist and be unique,
-or nothing changes.
+or nothing changes. The log sync runs with the collection lock released, as for adds.
 
 `delete` (one id):
 
@@ -100,11 +118,95 @@ Both kinds of repair are durable after reconciliation. `db.recovery_report()` re
 crash is expected when adds were not flushed. It means the unsynced window was discarded, not that data was corrupted.
 
 Reconciliation only repairs the unsynced tail. The catalog also records the log length and the vector count at each flush and close, and at each delete.
-If the log or the index is found shorter than that, something outside Zenar truncated or removed it. Opening then fails
-with `RecoveryError` and changes nothing, instead of dropping the documents that were already synced. A file that is
-damaged in its middle fails the same way, with its own named error. Databases created before this rule have no recorded
-lengths, so the check does not apply to them. A delete clears the recorded lengths before it changes anything on disk, and records them again once it is
-synced, so a crash in the middle of a delete cannot leave a recorded length larger than the file.
+If a file is found shorter than that, something outside Zenar truncated or removed it. Opening then fails with
+`RecoveryError` and changes nothing, instead of dropping the documents that were already synced. This covers:
+
+- a log shorter than its recorded length, checked before the log is read, so a torn tail is not cut back first;
+- a log whose synced part is damaged at its end (the bytes are kept, the open is refused);
+- a missing log, which is refused and not recreated empty, while the catalog says it held synced bytes;
+- a vector index shorter than its recorded count, or missing.
+
+A compaction that was interrupted is settled on open by the catalog's pending record (docs/R3.md, section 5): the log is
+either the compacted length or the length before the compaction, and anything else refuses to open. A file damaged in its
+middle fails the same way, with its own named error. Databases created before this rule have no
+recorded lengths, so the check does not apply to them.
+
+A delete lowers the recorded lengths before it changes anything on disk. The index loses one vector per deleted document
+when it is synced, and the log shrinks only when compaction runs. So the vector count is lowered by the number of
+documents deleted, and the log length is zeroed only when compaction is due. A crash in the middle of a delete can then
+leave each file no shorter than its recorded length less that amount, and the check stays on. The lengths are recorded
+again once the delete is synced.
+
+## Consistency across the two files
+
+A write changes two files: the vector index and the document log. Zenar does not make them one atomic transaction. No
+journal covers both files, and the operating system does not offer a transaction across two files. Each operation
+instead follows a fixed order of durable steps, and the rules on open decide what a crash can leave behind.
+
+### Order of durable steps
+
+| Operation | Steps, in order |
+|---|---|
+| `add`, `add_many` | Write the log bytes. Add the vectors in memory. At a sync boundary: sync the index file, then the log. Make the documents visible. |
+| `delete`, `delete_many` | Lower the recorded lengths. Remove the vectors in memory. Sync the index file. Write the tombstones. Sync the log. Compact if due. Record the lengths. |
+| `flush()` | Sync the index file, then the log, for each collection. Record the lengths. |
+
+Adds sync the index first. So once a log sync has returned, every document it covers has its vector on disk too.
+Deletes sync the index before they write tombstones. So once the index sync returns, the vector is gone for good. The
+document is then removed on the next open, whether or not its tombstone reached the disk.
+
+### What a failure leaves behind
+
+The error column is what the call returns. The last column is what the next open produces, at the level of one
+document. "Poisoned" is defined in the section above.
+
+| Failure | Error returned | Collection afterwards | After reopen |
+|---|---|---|---|
+| `add` or `add_many` is rejected by the index before the log is synced (for example, `store.add` fails) | Yes | Undone in memory and in the log. Usable. | Absent. |
+| `add` or `add_many`: writing the log bytes fails | Yes | Poisoned. The write is not trusted to have been truncated. | The leftover bytes are unsynced documents. Those without a vector are removed. |
+| `add` or `add_many`: index sync succeeds, log sync fails | Yes | Undone, and usable, if the index re-sync and the truncation succeed. Poisoned if either fails. | Can be present. The vector is on disk, so reconciliation keeps the document if its bytes survived. An error can still have been applied. |
+| `add` or `add_many`: truncating the log back fails | Yes | Poisoned. | Leftover bytes are unsynced documents. Those without a vector are removed. |
+| `delete` fails at the index sync | Yes | Poisoned. | Present, with its vector. The delete was not applied. |
+| `delete` fails after the index sync (tombstone or log sync) | Yes | Poisoned. | Absent. The vector is gone, so the document is removed. |
+| Compaction fails after the rename | Yes | Poisoned. | The log on disk is replayed. Its live documents are the same either way. |
+| `flush()` fails | Yes | Usable. Nothing already synced is undone. | Whatever reached the disk. |
+| A panic in the group's leader, after the index sync | Yes, for every write in the group (the panicking thread unwinds) | Poisoned. | The index was synced and the log bytes were written, so the group's writes may be present. Reconciliation keeps them if both files hold them. |
+| Power loss during `add_many` | No error (the process did not return) | Not applicable | A prefix of the batch can survive. The index is synced first, and the log bytes may be partly on disk. A process crash gives all or nothing. |
+
+With group commit, one failure affects a whole group. An `add` or `add_many` that is in a group whose log sync fails gets
+the error and is rolled back with the group, and nothing in the group is visible. A write that the group rejects on its
+own (a duplicate id, a bad vector) gets its own error and does not affect the others. A write returns only after its
+sync, or after its rollback.
+
+After an error, check with `get()` or `count()` before retrying. An error means the write may or may not have been
+applied. Retrying an add that was applied returns `DuplicateId`.
+
+### What reopen guarantees
+
+- Synced data is never dropped silently. A file shorter than its last sync, a missing file, or a synced record damaged
+  at its end fails the open with `RecoveryError`, and the file is left as it was (tested).
+- A document without a vector, and a vector without a document, are both removed. The counts are in
+  `db.recovery_report()`. A count above zero after a crash is expected for adds that were not synced.
+- A poisoned collection refuses every operation until the database is reopened.
+- A reopen is only accepted when the index and the log agree after reconciliation.
+
+### What users can expect
+
+- After `flush()` returns, or after an add with `durable=True` or an `add_many` returns, the data survives a process
+  crash and a power loss, as far as the platform's `fsync` holds. Power loss has not been tested on hardware.
+- After `delete` returns `Ok`, the deletion survives, with the same caveat.
+- `add_many` is all or nothing across a process crash and across errors Zenar reports. A power loss during it can leave
+  a prefix of the batch.
+- Each collection is separate. `db.flush()` syncs the collections one after another. There is no transaction across
+  collections, and none across several calls.
+
+### Limits
+
+- Adds that were not synced are lost on a crash, by design. The default `Normal` syncs every 1000 adds.
+- A vector index that is lost cannot be rebuilt from the log, because the log holds no vectors. Opening refuses, and the
+  vectors have to be added again from the source data.
+- Each collection's index and log are checked against each other only on open. A file changed by another process while
+  Zenar is open is not detected until the next open.
 
 ## Durability policy
 
@@ -128,6 +230,30 @@ synced, so a crash in the middle of a delete cannot leave a recorded length larg
   `corruption_in_the_middle_is_an_error_not_a_silent_drop` (Rust, log level).
 - `document_without_vector_is_removed_on_reopen`, `vector_without_document_is_removed_on_reopen` (Rust, collection level).
 - `poisoned_collection_refuses_every_operation` (Rust).
+- `failed_delete_poisons_and_reopen_keeps_the_document`, `failed_add_with_failing_index_poisons_and_reopen_leaves_no_trace`,
+  `failed_add_many_with_failing_index_poisons_and_reopen_is_all_or_nothing` (Rust): real index-write failures, injected by making the index file
+  refuse writes (Unix only; the tests refuse to run as root).
+- `failed_undo_poisons_and_reopen_removes_the_orphan_frames` (Rust): a failing truncation poisons the collection, and the
+  orphan frames do not produce a duplicate id on the next open.
+- `missing_vector_index_is_refused_without_changes`, `missing_document_log_is_refused_and_not_recreated`,
+  `log_cut_short_after_sync_is_refused_without_changing_the_file`, `damaged_synced_record_is_refused_without_truncation`
+  (Rust): refusals on open.
+- `crash_during_delete_does_not_hide_a_missing_index` (Rust): a crash inside a delete's window still refuses a missing index.
+- `search_in_window_returns_full_top_k_from_committed_documents`, `filtered_search_in_window_never_returns_uncommitted_documents`,
+  `search_in_delete_window_skips_the_removed_vector_and_stays_full` (Rust): searches while a write is between its index sync
+  and its commit. A barrier holds the write there.
+- `failed_log_sync_in_window_rolls_back_and_stays_usable`, `failed_log_sync_in_delete_window_poisons_and_reopen_completes_the_delete`,
+  `pending_documents_are_invisible_to_get_count_and_search`, `acknowledgement_comes_after_the_log_sync`,
+  `crash_after_group_index_sync_keeps_the_whole_group` (a copy of the directory taken inside the window is reopened),
+  `torn_group_log_keeps_a_prefix_and_removes_stray_vectors` (a copy cut inside the batch's frames),
+  `acknowledged_writes_are_seen_and_acknowledged_deletes_are_not` (Rust): concurrent writers, deleters and searchers.
+  (Rust): a log sync that fails with the lock released.
+- `concurrent_inserts_and_searches_return_committed_full_results` (Rust): writers and readers on one collection. Every
+  result is committed, has no repeat, and the result is full.
+- `group_that_fails_its_log_sync_rolls_back_every_member`, `grouped_writes_fail_individually_and_the_rest_commit` (Rust):
+  writes queued behind a leader run as one group. A failing log sync rolls back every member. A rejected member fails
+  alone.
+- `tests/test_concurrency.py` (Python): several threads write through the API, then the database is reopened.
 
 Power loss is not tested here. The `fsync` guarantees come from the platform, and they have not been checked on real
 hardware.

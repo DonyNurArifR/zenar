@@ -13,8 +13,11 @@ this is measured, not yet judged. See [Project Status](#project-status).
 ## Why Zenar
 
 - **Embedded, serverless** — no Docker, no external service, just a Python import.
-- **Fast and light** — TurboVec's quantized vector index compresses roughly
-  16x versus raw float32 (e.g. ~31GB → ~4GB at 10M vectors), with
+- **Fast and light** — TurboVec's quantized vector index stores 4 bits per
+  dimension by default, about 8x less than raw float32. For 768-dimensional
+  vectors that is 384 bytes instead of 3,072 (~31GB → ~4GB at 10M vectors).
+  `bit_width` can be 2, 3 or 4; 2 bits is about 16x and 3 bits about 10.7x.
+  These ratios count the packed vectors only, not per-vector overhead.
   SIMD-accelerated search.
 - **Correct metadata filtering** — filters resolve to an exact candidate-ID
   set *before* vector search runs, not a post-hoc pass over results. A

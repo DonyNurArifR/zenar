@@ -3,6 +3,92 @@
 All notable changes to Zenar. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the
 project follows [semantic versioning](https://semver.org/) while it is pre-1.0.
 
+## Unreleased
+
+### Added
+- `Collection::set_lock_trace` and `take_lock_trace` record every exclusive hold of the collection lock: the operation,
+  the wait, the hold and the filesystem time inside it (`LockEvent`). A diagnostic; off by default.
+- Tests for background compaction: a swap waits for a group in flight, a row or an id deleted or re-added during a build
+  keeps its state through the swap and a reopen, a rolled-back group in a build window is absent after the swap,
+  reopen rules for the pending record (old and new lengths), a stale temporary log is removed on open, the old
+  structure is dropped at the swap, filtered search is the same during the build and after it, and a random run with
+  compactions agrees with a reference model. A Python test kills a process during a compaction and checks the reopened
+  database.
+
+### Fixed
+- A failed compaction no longer starts another build by itself. The check that a finished build may be due again ran after
+  a failed swap too, so while the threshold stayed crossed a failing swap started a new build. It now runs only after a
+  successful swap, and the next delete starts the next attempt.
+
+### Changed
+- Writers have preference for the state lock. A writer announces itself before it waits for the lock, and new readers
+  wait at that point, so one continuous reader no longer starves writers. With one reader and a continuous writer the
+  writer went from about 1 batch per second to about 116, and the background swap now runs during the load. Reader
+  throughput with one writer falls, because readers wait behind writes; with eight to sixteen readers, reader
+  throughput rises 13 to 25% and writer throughput falls 6 to 12%. See docs/CONCURRENCY.md and docs/BENCHMARKS.md.
+- Unfiltered search over-fetches at most 64 extra candidates for uncommitted writes on its first pass, and retries with
+  the full extra only when that leaves fewer than `top_k` committed results and more than 64 are pending. The collector
+  buffers TurboVec allocates per search scale with `k`, so this cuts the transient allocation of concurrent search and
+  write from about 94 MB to about 11 MB at 8 readers, batch 1,000 and 200,000 documents. Visibility and availability of
+  results are unchanged; the approximate ranking can differ slightly under load.
+- Compaction runs in the background. A build writes the live documents without the collection lock, and only the swap
+  holds it, for about 20 ms at 200,000 live documents. Searches during a build keep their latency: p95 12.6 ms against
+  74 ms for the blocking compaction it replaces. Peak heap during a build rises, because the old and new row tables both
+  exist until the swap. Deletes made during a build stay as dead rows until the next compaction (docs/R3.md, section 14).
+- Unfiltered search returns `top_k` committed results when that many exist, even while a write is between its index sync
+  and its commit. Documents of a write that has not returned yet are not returned.
+- A failed write to the document log poisons the collection, and so does a failed truncation after one. Before, the
+  leftover bytes stayed in the log, and a later add of the same id could make the database refuse to open.
+- A delete no longer turns off the shortened-file check while it runs. A crash inside a delete cannot hide a missing
+  vector index.
+- `RecoveryError` on open is raised before any file is truncated, and a missing document log is refused instead of
+  recreated empty while the catalog says it held synced bytes.
+- Compaction records its new log length and the old length in the catalog before it renames the log, and clears that record
+  after the directory sync (the pending record, docs/R3.md). Opening settles an interrupted compaction by the rules in
+  docs/R3.md, section 5. Catalogs without the record read and write as before. A database with a pending record opened by an
+  older build would not know the record; the record exists only during a compaction.
+- A failed directory sync after a catalog rename keeps the new catalog in memory and reports the error.
+
+### Testing
+- Crash tests at each compaction transition (copied directories), failure injection at each transition, a mutation check on
+  the reopen rules, and catalog failure injection before and after the rename.
+- Fault injection for staging: a failed `stage_puts` poisons the collection, and a reopen drops the staged documents.
+- A stress test: rejected group members (repeated ids) among valid writes, under concurrent readers. Valid writes commit,
+  rejected ones fail alone, and no search returns a repeated or uncommitted id.
+
+### Documentation
+- COMPACTION.md: memory of dead rows (about 105 bytes each), the reclamation options, the analysis of every stage of a swap
+  and of crashes and power loss, and the Rust test plan. The background swap is not implemented.
+- CONCURRENCY.md: the staging breakdown and the decision not to move validation and encoding out of the lock.
+- ARCHITECTURE.md describes the metadata indexes: structures, lookup and update costs, memory, the alternatives that
+  were measured and those that were not.
+- STORAGE.md states that the vector index and the document log are not one transaction. It covers the order of durable
+  steps, the outcome of each failure, the poisoning rule, and reconciliation on open.
+- ROADMAP.md lists the open production-readiness items in priority order.
+- CONCURRENCY.md describes the write lock, the measured costs, and the locking change in Phase 1.
+- BENCHMARKS.md corrects the delete cost (about 25 ms, not 8 ms) and adds the concurrency and write-cost measurements.
+
+### Performance
+- Compaction reads the log once, from the front, instead of one read per live row. A compacting delete batch at a million
+  rows falls from about 260 ms to about 130 ms, and the compaction in `DocStore::compact` from about 370 ms to about 190 ms
+  (the reopen replay is most of the rest). The file format is unchanged.
+- A write syncs its document log with the collection lock released. The index is still synced under the lock. With
+  8 readers and one continuous writer, search throughput rises from about 700 to about 6,200 per second, and p99 falls
+  from about 30 ms to about 6 ms. Single-writer write costs are unchanged within noise.
+- Writes from several threads to one collection share syncs (group commit). Writes queue; a leader syncs the queued
+  writes as one group, with one index sync and one log sync. Writes alone, four writers reach about 420 batches per second,
+  against about 130 before, and about 3.2 times the Phase 1 build. With 8 readers, search throughput at four writers
+  falls to about 2,600 per second, against about 5,900 for Phase 1: group commit trades reader throughput for writer
+  throughput. See BENCHMARKS.md, "Readers and writers".
+- A group's failure rolls back the whole group, and every write in it gets the error. A write the group rejects on its own
+  (a duplicate id, a bad vector) gets its own error, and the others commit.
+- Writes to one collection are queued (no per-collection writer gate). Readers do not take the queue.
+- A failed re-sync of the index during a rollback poisons the collection, as a failed truncation already did. Before, the
+  disk could hold vectors that the log did not have, and the collection stayed usable.
+- `Collection::write_stats` (Rust API) returns counters for group sizes, lock holds, and readers' waits for the state lock.
+  It is a diagnostic and is not in the Python API.
+
+
 ## 0.2.0
 
 First release since 0.1.1. It changes the on-disk format, so databases written by 0.1.x cannot be opened and must

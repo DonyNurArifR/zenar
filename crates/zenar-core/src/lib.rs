@@ -14,7 +14,13 @@ pub mod names;
 pub mod storage;
 pub mod value;
 
-pub use collection::{Collection, Hit, Record, RecoveryReport, Retrieval};
+/// Test-only workload benchmarks of concurrent search and write (ignored by default).
+#[cfg(test)]
+mod bench_search;
+
+pub use collection::{
+    Collection, GROUP_BUCKETS, Hit, LockEvent, Record, RecoveryReport, Retrieval, WriteStats,
+};
 pub use database::{MetadataSync, VectorDB};
 pub use docstore::{DocumentRow, FieldStats};
 pub use error::ZenarError;
