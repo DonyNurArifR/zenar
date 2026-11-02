@@ -14,7 +14,7 @@ import time
 import numpy as np
 import pytest
 
-from zenar import VectorDB
+from zenar import DatabaseLockedError, VectorDB
 
 DIM = 16
 DELETED = 6000
@@ -77,12 +77,35 @@ def _run_until_killed(path):
     return flushed
 
 
+# On Windows, the killed writer's LOCK can stay held for a few milliseconds after proc.wait() returns, so the first
+# reopen can fail with DatabaseLockedError. Measured on windows-latest, the lock was free 2 to 32 ms after the exit,
+# so 5 s is a wide margin. Elsewhere the timeout is zero, and the first failure is raised at once, as before.
+OPEN_RETRY_SECONDS = 5.0 if sys.platform == "win32" else 0.0
+
+
+def _open_after_writer_exit(path):
+    """Opens the database once the killed writer has released its lock.
+
+    The first attempt is immediate. Only DatabaseLockedError is retried, every millisecond, until OPEN_RETRY_SECONDS
+    have passed. Then the last DatabaseLockedError is raised, so a lock that never clears still fails the test. Other
+    exceptions are not caught.
+    """
+    deadline = time.monotonic() + OPEN_RETRY_SECONDS
+    while True:
+        try:
+            return VectorDB(path)
+        except DatabaseLockedError:
+            if time.monotonic() >= deadline:
+                raise
+            time.sleep(0.001)
+
+
 @pytest.mark.parametrize("trial", range(6))
 def test_kill_during_a_background_compaction_keeps_every_flushed_row(tmp_path, trial):
     path = str(tmp_path / f"crash-{trial}")
     flushed = _run_until_killed(path)
 
-    db = VectorDB(path)
+    db = _open_after_writer_exit(path)
     c = db.get_collection("cp")
     count = c.count()
     # Every row the writer flushed before the kill is there, and the deleted rows are not.
