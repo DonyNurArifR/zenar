@@ -5569,12 +5569,14 @@ mod admission_tests {
 #[cfg(test)]
 mod lock_architecture_tests {
     /// The production code of this file: everything before the test module.
-    fn production_source() -> &'static str {
-        let src = include_str!("collection.rs");
+    /// Git on Windows can check this file out with CRLF line endings. The searches below use LF, so the text is
+    /// normalised first. Every search and `block` then sees LF on every platform.
+    fn production_source() -> String {
+        let src = include_str!("collection.rs").replace("\r\n", "\n");
         let end = src
             .find("#[cfg(test)]\nmod tests {")
             .expect("the test module starts after the production code");
-        &src[..end]
+        src[..end].to_string()
     }
 
     /// Whether `line` names the type `word`, as a whole word.
@@ -5689,13 +5691,13 @@ mod lock_architecture_tests {
     #[test]
     fn core_holds_no_route_to_the_lock() {
         let src = production_source();
-        assert_eq!(core_problem(src), None);
+        assert_eq!(core_problem(&src), None);
     }
 
     #[test]
     fn only_the_lock_helpers_take_the_lock() {
         let src = production_source();
-        assert_eq!(unexpected_lockers(src), Vec::<String>::new());
+        assert_eq!(unexpected_lockers(&src), Vec::<String>::new());
     }
 
     /// The checks above must catch a violation. Each case plants one in a copy of the source.
