@@ -1,0 +1,65 @@
+# TEMPORARY diagnostic. Not part of CI, and not a product dependency. It records how long the database LOCK file
+# takes to become available after a killed writer process exits, on Windows (see diagnostics/windows-lock/).
+# Remove this file, and the diagnostics/windows-lock directory, once the investigation is closed.
+#
+# Triggers: a manual run (Actions > "Diagnostic - Windows lock release" > Run workflow), or a push to the throwaway
+# branch diag/windows-lock-release. GitHub only offers manual runs for workflows on the default branch, so the push
+# trigger is the way to run it from this branch before it is merged. Do not merge this file to main.
+name: Diagnostic - Windows lock release
+
+on:
+  workflow_dispatch:
+    inputs:
+      trials:
+        description: "Kill-and-reopen trials"
+        required: false
+        default: "60"
+  push:
+    branches: [diag/windows-lock-release]
+
+permissions:
+  contents: read
+
+jobs:
+  lock-probe:
+    name: Windows lock-release probe
+    runs-on: windows-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+      - uses: dtolnay/rust-toolchain@v1
+        with:
+          toolchain: stable
+      # Same build as the Python job in ci.yml: maturin, --locked, then the wheel installed in a fresh venv.
+      - run: pip install maturin
+      - run: maturin build --release --locked --out dist
+      - name: Install the built wheel in a fresh venv
+        shell: bash
+        run: |
+          python -m venv .venv-diag
+          if [ -d .venv-diag/Scripts ]; then PY=.venv-diag/Scripts/python; else PY=.venv-diag/bin/python; fi
+          "$PY" -m pip install --quiet dist/*.whl numpy
+          "$PY" -c "import zenar, sys; print(zenar.__file__, sys.version)"
+      # Best effort: the Sysinternals handle tool names the process that holds LOCK if the probe cannot open it.
+      # The probe runs without it if this step fails.
+      - name: Install handle.exe (best effort)
+        continue-on-error: true
+        shell: pwsh
+        run: choco install handle -y --no-progress
+      - name: Run the probe
+        shell: bash
+        env:
+          TRIALS: ${{ inputs.trials || '60' }}
+        run: |
+          if [ -d .venv-diag/Scripts ]; then PY=.venv-diag/Scripts/python; else PY=.venv-diag/bin/python; fi
+          "$PY" diagnostics/windows-lock/kill_lock_probe.py --trials "$TRIALS" --bound-seconds 30 --out lock-probe.jsonl
+      - name: Upload the results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-lock-probe-${{ github.run_id }}
+          path: lock-probe.jsonl
+          if-no-files-found: error
